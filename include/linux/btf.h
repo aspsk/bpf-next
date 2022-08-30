@@ -571,4 +571,24 @@ static inline bool btf_type_is_struct_ptr(struct btf *btf, const struct btf_type
 	return btf_type_is_struct(t);
 }
 
+static inline int btf_get_int(const struct btf *btf,
+			      const struct btf_member *m,
+			      u32 *res)
+{
+	const struct btf_type *t, *arr_t;
+
+	t = btf_type_skip_modifiers(btf, m->type, NULL);
+	if (!btf_is_ptr(t))
+		return -EINVAL;
+
+	arr_t = btf_type_by_id(btf, t->type);
+	if (!arr_t || !btf_is_array(arr_t))
+		return -EINVAL;
+
+	if (res)
+		*res = btf_array(arr_t)->nelems;
+
+	return 0;
+}
+
 #endif

@@ -118,6 +118,95 @@ union bpf_iter_link_info {
 	} task;
 };
 
+enum {
+        BPF_WILDCARD_RULE_PREFIX = 0,
+        BPF_WILDCARD_RULE_RANGE,
+        BPF_WILDCARD_RULE_MATCH,
+        BPF_WILDCARD_RULE_WILDCARD_MATCH,
+};
+
+struct wildcard_rule_desc {
+        __u32 type;	/* WILDCARD_RULE_{PREFIX,RANGE,MATCH} */
+        __u32 size;	/* the size of the field in bytes */
+};
+
+struct wildcard_desc {
+        __u32 n_rules;
+        struct wildcard_rule_desc rule_desc[];
+};
+
+enum {
+	BPF_WILDCARD_KEY_MATCH = 0,
+	BPF_WILDCARD_KEY_RULE,
+};
+
+struct wildcard_key {
+	__u32 type;	/* WILDCARD_KEY_{RULE,ELEM} */
+	__u32 priority;	/* priority, 0 is the top */
+	__u8 data[];
+};
+
+#define __BPF_WILDCARD_DATA__BPF_WILDCARD_RULE_PREFIX(T, FIELD)	\
+	T FIELD;						\
+	__u32 FIELD ## _prefix
+
+#define __BPF_WILDCARD_DATA__BPF_WILDCARD_RULE_RANGE(T, FIELD)	\
+	T FIELD ## _min;					\
+	T FIELD ## _max
+
+#define __BPF_WILDCARD_DATA__BPF_WILDCARD_RULE_MATCH(T, FIELD)	\
+	T FIELD
+
+#define __BPF_WILDCARD_DATA__BPF_WILDCARD_RULE_WILDCARD_MATCH(T, FIELD)	\
+	T FIELD
+
+#define __BPF_WILDCARD_DATA_RULE_1(TYPE, T, FIELD, ...) __BPF_WILDCARD_DATA__ ## TYPE (T, FIELD)
+#define __BPF_WILDCARD_DATA_RULE_2(TYPE, T, FIELD, ...) __BPF_WILDCARD_DATA__ ## TYPE (T, FIELD); __BPF_WILDCARD_DATA_RULE_1(__VA_ARGS__)
+#define __BPF_WILDCARD_DATA_RULE_3(TYPE, T, FIELD, ...) __BPF_WILDCARD_DATA__ ## TYPE (T, FIELD); __BPF_WILDCARD_DATA_RULE_2(__VA_ARGS__)
+#define __BPF_WILDCARD_DATA_RULE_4(TYPE, T, FIELD, ...) __BPF_WILDCARD_DATA__ ## TYPE (T, FIELD); __BPF_WILDCARD_DATA_RULE_3(__VA_ARGS__)
+#define __BPF_WILDCARD_DATA_RULE_5(TYPE, T, FIELD, ...) __BPF_WILDCARD_DATA__ ## TYPE (T, FIELD); __BPF_WILDCARD_DATA_RULE_4(__VA_ARGS__)
+
+#define __BPF_WILDCARD_DATA_ELEM_1(TYPE, T, FIELD, ...) T FIELD
+#define __BPF_WILDCARD_DATA_ELEM_2(TYPE, T, FIELD, ...) T FIELD; __BPF_WILDCARD_DATA_ELEM_1(__VA_ARGS__)
+#define __BPF_WILDCARD_DATA_ELEM_3(TYPE, T, FIELD, ...) T FIELD; __BPF_WILDCARD_DATA_ELEM_2(__VA_ARGS__)
+#define __BPF_WILDCARD_DATA_ELEM_4(TYPE, T, FIELD, ...) T FIELD; __BPF_WILDCARD_DATA_ELEM_3(__VA_ARGS__)
+#define __BPF_WILDCARD_DATA_ELEM_5(TYPE, T, FIELD, ...) T FIELD; __BPF_WILDCARD_DATA_ELEM_4(__VA_ARGS__)
+
+#define __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD, ...) __uint(FIELD, (TYPE) << 8 | sizeof(T))
+
+#define __BPF_WILDCARD_RULE_DESC_1(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD)
+#define __BPF_WILDCARD_RULE_DESC_2(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD); __BPF_WILDCARD_RULE_DESC_1(__VA_ARGS__)
+#define __BPF_WILDCARD_RULE_DESC_3(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD); __BPF_WILDCARD_RULE_DESC_2(__VA_ARGS__)
+#define __BPF_WILDCARD_RULE_DESC_4(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD); __BPF_WILDCARD_RULE_DESC_3(__VA_ARGS__)
+#define __BPF_WILDCARD_RULE_DESC_5(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD); __BPF_WILDCARD_RULE_DESC_4(__VA_ARGS__)
+
+#define BPF_WILDCARD_DESC_x(x, NAME, ...)						\
+											\
+	struct NAME ## _desc {								\
+		__uint(n_rules, x);							\
+		__BPF_WILDCARD_RULE_DESC_ ## x(__VA_ARGS__);				\
+	};										\
+											\
+	struct NAME ## _key {								\
+		struct NAME ## _desc desc[0];						\
+		__u32 type;								\
+		__u32 priority;								\
+		union {									\
+			struct {							\
+				__BPF_WILDCARD_DATA_RULE_ ## x(__VA_ARGS__);		\
+			} __attribute__((packed)) rule;					\
+			struct {							\
+				__BPF_WILDCARD_DATA_ELEM_ ## x(__VA_ARGS__);		\
+			} __attribute__((packed));					\
+		};									\
+	} __attribute__((packed))
+
+#define BPF_WILDCARD_DESC_1(...) BPF_WILDCARD_DESC_x(1, __VA_ARGS__)
+#define BPF_WILDCARD_DESC_2(...) BPF_WILDCARD_DESC_x(2, __VA_ARGS__)
+#define BPF_WILDCARD_DESC_3(...) BPF_WILDCARD_DESC_x(3, __VA_ARGS__)
+#define BPF_WILDCARD_DESC_4(...) BPF_WILDCARD_DESC_x(4, __VA_ARGS__)
+#define BPF_WILDCARD_DESC_5(...) BPF_WILDCARD_DESC_x(5, __VA_ARGS__)
+
 /* BPF syscall commands, see bpf(2) man-page for more details. */
 /**
  * DOC: eBPF Syscall Preamble
@@ -943,6 +1032,7 @@ enum bpf_map_type {
 	BPF_MAP_TYPE_BLOOM_FILTER,
 	BPF_MAP_TYPE_USER_RINGBUF,
 	BPF_MAP_TYPE_CGRP_STORAGE,
+	BPF_MAP_TYPE_WILDCARD,
 };
 
 /* Note that tracing related programs such as
@@ -1332,6 +1422,7 @@ union bpf_attr {
 						   * struct stored as the
 						   * map value
 						   */
+
 		/* Any per-map-type extra fields
 		 *
 		 * BPF_MAP_TYPE_BLOOM_FILTER - the lowest 4 bits indicate the
