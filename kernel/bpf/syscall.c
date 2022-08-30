@@ -1005,7 +1005,8 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
 	/* Some maps allow key to be unspecified. */
 	if (btf_key_id) {
 		key_type = btf_type_id_size(btf, &btf_key_id, &key_size);
-		if (!key_type || key_size != map->key_size)
+		if (!key_type || (key_size != map->key_size &&
+				  map->map_type != BPF_MAP_TYPE_WILDCARD)) /* XXX */
 			return -EINVAL;
 	} else {
 		key_type = btf_type_by_id(btf, 0);
@@ -1107,7 +1108,7 @@ free_map_tab:
 
 #define BPF_MAP_CREATE_LAST_FIELD map_extra
 /* called via syscall */
-static int map_create(union bpf_attr *attr)
+static int map_create(union bpf_attr *attr, bool is_kernel)
 {
 	int numa_node = bpf_map_attr_numa_node(attr);
 	struct btf_field_offs *foffs;
@@ -1128,6 +1129,7 @@ static int map_create(union bpf_attr *attr)
 	}
 
 	if (attr->map_type != BPF_MAP_TYPE_BLOOM_FILTER &&
+	    attr->map_type != BPF_MAP_TYPE_WILDCARD &&
 	    attr->map_extra != 0)
 		return -EINVAL;
 
@@ -4977,7 +4979,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 
 	switch (cmd) {
 	case BPF_MAP_CREATE:
-		err = map_create(&attr);
+		err = map_create(&attr, bpfptr_is_kernel(uattr));
 		break;
 	case BPF_MAP_LOOKUP_ELEM:
 		err = map_lookup_elem(&attr);
