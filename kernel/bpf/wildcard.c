@@ -16,7 +16,7 @@
 #include <asm/unaligned.h>
 
 typedef struct {
-	u64 lo, hi;
+	u64 hi, lo;
 } u128;
 
 /* TYPE is one of u8, u16, u32 or u64 */
@@ -43,14 +43,14 @@ __match_prefix(u32 size, const void *prule, const void *pprefix, const void *pel
 
 		rule.lo = get_unaligned((u64 *)prule);
 		rule.hi = get_unaligned((u64 *)(prule+8));
-		elem.lo = get_unaligned_be64((u64 *)pelem);
-		elem.hi = get_unaligned_be64((u64 *)(pelem+8));
+		elem.hi = get_unaligned_be64((u64 *)pelem);
+		elem.lo = get_unaligned_be64((u64 *)(pelem+8));
 
 		if (prefix <= 64) {
-			return ____match_prefix(u64, &rule.lo, prefix, &elem.lo);
+			return ____match_prefix(u64, &rule.hi, prefix, &elem.hi);
 		} else {
-			return (rule.lo == elem.lo &&
-				____match_prefix(u64, &rule.hi, prefix-64, &elem.hi));
+			return (rule.hi == elem.hi &&
+				____match_prefix(u64, &rule.lo, prefix-64, &elem.lo));
 		}
 	} else if (size == 4) {
 		u32 rule = get_unaligned((u32 *) prule);
@@ -152,6 +152,42 @@ static inline int __match(const struct wildcard_desc *wc_desc,
 		off_elem += size;
 	}
 	return 1;
+}
+
+static void patch_endianness(u8 *x, size_t size)
+{
+	size_t i;
+	u8 t;
+
+	for (i = 0; i < size/2; i++) {
+		t = x[i];
+		x[i] = x[size - 1 - i];
+		x[size - 1 - i] = t;
+	}
+}
+
+static void patch_key(struct wildcard_desc *wc_desc, void *key)
+{
+	u32 off = 0;
+	u32 i, size;
+
+	for (i = 0; i < wc_desc->n_rules; i++) {
+		size = wc_desc->rule_desc[i].size;
+		switch (wc_desc->rule_desc[i].type) {
+		case BPF_WILDCARD_RULE_PREFIX:
+			patch_endianness(key + 8 + off, size);
+			off += size + sizeof(u32);
+			break;
+		case BPF_WILDCARD_RULE_RANGE:
+			patch_endianness(key + 8 + off, size);
+			patch_endianness(key + 8 + off + size, size);
+			off += 2 * size;
+			break;
+		case BPF_WILDCARD_RULE_MATCH:
+			off += size;
+			break;
+		}
+	}
 }
 
 struct wildcard_ops;
@@ -381,10 +417,10 @@ static void __tm_copy_masked_rule(void *dst, const void *data, u32 size, u32 pre
 		 * part in any case, otherwise we won't mask out any bits from
 		 * the higher part; in any case, first we copy the lower part */
 		if (prefix <= 64) {
-			x.hi = 0;
-			x.lo = __mask_prefix(u64, &x.lo, prefix);
+			x.lo = 0;
+			x.hi = __mask_prefix(u64, &x.hi, prefix);
 		} else {
-			x.hi = __mask_prefix(u64, &x.hi, prefix-64);
+			x.lo = __mask_prefix(u64, &x.lo, prefix-64);
 		}
 		memcpy(dst, &x, 16);
 	}
@@ -411,17 +447,17 @@ static void __tm_copy_masked_elem(void *dst, const void *data, u32 size, u32 pre
 	} else if (size == 16) {
 		u128 x;
 
-		x.lo = get_unaligned_be64(data);
-		x.hi = get_unaligned_be64(data+8);
+		x.hi = get_unaligned_be64(data);
+		x.lo = get_unaligned_be64(data+8);
 
 		/* if prefix is less than 64, then we will zero out the lower
 		 * part in any case, otherwise we won't mask out any bits from
 		 * the higher part; in any case, first we copy the lower part */
 		if (prefix <= 64) {
-			x.lo = __mask_prefix(u64, &x.lo, prefix);
-			x.hi = 0;
+			x.hi = __mask_prefix(u64, &x.hi, prefix);
+			x.lo = 0;
 		} else {
-			x.hi = __mask_prefix(u64, &x.hi, prefix-64);
+			x.lo = __mask_prefix(u64, &x.lo, prefix-64);
 		}
 		memcpy(dst, &x, 16);
 	}
@@ -1289,6 +1325,9 @@ static void *wildcard_map_lookup_elem(struct bpf_map *map, void *key)
 
 	switch (((struct wildcard_key *)key)->type) {
 	case BPF_WILDCARD_KEY_RULE:
+		/* Store prefixes and ranges in host byte order */
+		patch_key(wcard->desc, key);
+
 		switch (wcard->algorithm) {
 		case BPF_WILDCARD_F_ALGORITHM_TM:
 			l = tm_lookup(wcard, key);
@@ -1324,6 +1363,8 @@ static int wildcard_map_update_elem(struct bpf_map *map, void *key,
 
 	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held() &&
 		     !rcu_read_lock_bh_held());
+
+	patch_key(wcard->desc, key);
 
 	return wcard->ops->update_elem(wcard, key, value, map_flags);
 }
