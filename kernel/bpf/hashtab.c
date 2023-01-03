@@ -619,10 +619,12 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 		}
 	}
 
-	if ((htab->map.map_flags & BPF_F_FAST_HASH) && (htab->map.key_size == 4 || htab->map.key_size == 8 || htab->map.key_size == 12))
+	if ((htab->map.map_flags & BPF_F_FAST_HASH) && (htab->map.key_size <= 12 && (htab->map.key_size % 4 == 0))) {
 		htab->hash_size = htab->map.key_size / 4;
-	else
-		htab->hash_size = htab->map.key_size;
+		htab->hashrnd += JHASH_INITVAL + htab->map.key_size;
+	} else {
+		htab->hash_size = 0;
+	}
 
 	return &htab->map;
 
@@ -640,56 +642,17 @@ free_htab:
 	return ERR_PTR(err);
 }
 
-static inline u32 Jhash2(const void *key, u32 key_len, u32 hashrnd, const char *sff)
+static inline u32 htab_map_hash(const void *key, u32 key_len, u32 size4, u32 hashrnd, bool fast)
 {
-#if 0
-	u32 ret;
-	const u8 *x = key;
-	ret = jhash2(key, key_len, hashrnd);
-	pr_info("Jhash2[%s]: key_len=%u hashrnd=%08x key={%02x,%02x,%02x,%02x,...} ret=%08x\n", sff, key_len, hashrnd, x[0], x[1], x[2], x[3], ret);
-	return ret;
-#endif
-	return jhash2(key, key_len, hashrnd);
-}
-
-static inline u32 htab_map_hash(const void *key, u32 key_len, u32 hashrnd)
-{
-	return jhash(key, key_len, hashrnd);
-}
-
-static inline u32 htab_map_hash_1_to_3(const void *key, u32 key_len, u32 hashrnd)
-{
-	return xxh3_1_to_3(key, key_len, hashrnd);
-}
-
-static inline u32 htab_map_hash_4_to_8(const void *key, u32 key_len, u32 hashrnd)
-{
-	return xxh3_4_to_8(key, key_len, hashrnd);
-}
-
-static inline u32 htab_map_hash_9_to_16(const void *key, u32 key_len, u32 hashrnd)
-{
-	return xxh3_9_to_16(key, key_len, hashrnd);
-}
-
-static inline u32 htab_map_hash_17_to_128(const void *key, u32 key_len, u32 hashrnd)
-{
-	return xxh3_17_to_128(key, key_len, hashrnd);
-}
-
-static inline u32 htab_map_hash_129_to_240(const void *key, u32 key_len, u32 hashrnd)
-{
-	return xxh3_129_to_240(key, key_len, hashrnd);
-}
-
-static inline u32 htab_map_hash_241_to_infty(const void *key, u32 key_len, u32 hashrnd)
-{
-	return xxhash(key, key_len, hashrnd);
-}
-
-static inline u32 htab_map_hash_4_or_8_or_12(const void *key, u32 key_len, u32 hashrnd)
-{
-	return Jhash2(key, key_len, hashrnd, "lkp");
+	if (fast) {
+		if (size4)
+			return jhash12(key, size4, hashrnd);
+		else if (key_len <= 240)
+			return xxh3_240(key, key_len, hashrnd);
+		return xxhash(key, key_len, hashrnd);
+	} else {
+		return jhash(key, key_len, hashrnd);
+	}
 }
 
 static inline struct bucket *__select_bucket(struct bpf_htab *htab, u32 hash)
@@ -744,123 +707,57 @@ again:
  * in htab_map_gen_lookup().
  */
 
-#define DEFINE___htab_map_lookup_elem(KEY_SIZE) \
-static void *___htab_map_lookup_elem ## KEY_SIZE(struct bpf_map *map, void *key)	\
-{											\
-	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);		\
-	struct hlist_nulls_head *head;							\
-	struct htab_elem *l;								\
-	u32 hash, key_size;								\
-	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held() &&		\
-		     !rcu_read_lock_bh_held());						\
-											\
-	key_size = map->key_size;							\
-	hash = htab_map_hash ## KEY_SIZE(key, htab->hash_size, htab->hashrnd);		\
-	head = select_bucket(htab, hash);						\
-	l = lookup_nulls_elem_raw(head, hash, key, key_size, htab->n_buckets);		\
-	return l;									\
-}									\
-									\
-static void *__htab_map_lookup_elem ## KEY_SIZE(struct bpf_map *map, void *key)		\
-{											\
-	struct htab_elem *l;									\
-	unsigned long flags;									\
-	u64 start, end;									\
-									\
-	preempt_disable();									\
-	local_irq_save(flags);									\
-									\
-	start = get_cycles();									\
-	l = ___htab_map_lookup_elem ## KEY_SIZE(map, key);		\
-	end = get_cycles();									\
-									\
-	if (IS_ERR(l)) {									\
-		atomic64_inc(&map->stats_lookup_fail);									\
-		atomic64_add(end - start, &map->stats_lookup_fail_time);									\
-	} else {									\
-		atomic64_inc(&map->stats_lookup_ok);									\
-		atomic64_add(end - start, &map->stats_lookup_ok_time);									\
-	}									\
-									\
-	local_irq_restore(flags);									\
-	preempt_enable();									\
-									\
-	return l;									\
-}
 
-#define DEFINE_htab_map_lookup_elem(KEY_SIZE) \
-static void *htab_map_lookup_elem ## KEY_SIZE(struct bpf_map *map, void *key)		\
-{											\
-	struct htab_elem *l = __htab_map_lookup_elem ## KEY_SIZE(map, key);		\
-											\
-	if (l)										\
-		return l->key + round_up(map->key_size, 8);				\
-	return NULL;									\
-}
-
-DEFINE___htab_map_lookup_elem();
-DEFINE___htab_map_lookup_elem(_1_to_3);
-DEFINE___htab_map_lookup_elem(_4_to_8);
-DEFINE___htab_map_lookup_elem(_9_to_16);
-DEFINE___htab_map_lookup_elem(_17_to_128);
-DEFINE___htab_map_lookup_elem(_129_to_240);
-DEFINE___htab_map_lookup_elem(_241_to_infty);
-DEFINE___htab_map_lookup_elem(_4_or_8_or_12);
-
-DEFINE_htab_map_lookup_elem();
-DEFINE_htab_map_lookup_elem(_1_to_3);
-DEFINE_htab_map_lookup_elem(_4_to_8);
-DEFINE_htab_map_lookup_elem(_9_to_16);
-DEFINE_htab_map_lookup_elem(_17_to_128);
-DEFINE_htab_map_lookup_elem(_129_to_240);
-DEFINE_htab_map_lookup_elem(_241_to_infty);
-DEFINE_htab_map_lookup_elem(_4_or_8_or_12);
-
-static void *htab_map_lookup_func(struct bpf_map *map)
+static void *__htab_map_lookup_elem(struct bpf_map *map, void *key)
 {
-	if (!(map->map_flags & BPF_F_FAST_HASH))
-		return __htab_map_lookup_elem;
+	struct bpf_htab *htab = container_of(map, struct bpf_htab, map);
+	struct hlist_nulls_head *head;
+	struct htab_elem *l;
+	u32 hash, key_size;
+	u64 start, end;
+	unsigned long flags;									
 
-	if (map->key_size == 4 || map->key_size == 8 || map->key_size == 12)
-		return htab_map_lookup_elem_4_or_8_or_12;
-	else if (map->key_size < 4)
-		return htab_map_lookup_elem_1_to_3;
-	else if (map->key_size < 8)
-		return htab_map_lookup_elem_4_to_8;
-	else if (map->key_size <= 16)
-		return htab_map_lookup_elem_9_to_16;
-	else if (map->key_size <= 128)
-		return htab_map_lookup_elem_17_to_128;
-	else if (map->key_size <= 240)
-		return htab_map_lookup_elem_129_to_240;
+	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held() &&
+		     !rcu_read_lock_bh_held());
 
-	return htab_map_lookup_elem_241_to_infty;
+	preempt_disable();									
+	local_irq_save(flags);									
+
+	start = get_cycles();									
+
+	key_size = map->key_size;
+
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
+
+	head = select_bucket(htab, hash);
+
+	l = lookup_nulls_elem_raw(head, hash, key, key_size, htab->n_buckets);
+
+	end = get_cycles();									
+									
+	if (IS_ERR(l)) {									
+		atomic64_inc(&map->stats_lookup_fail);									
+		atomic64_add(end - start, &map->stats_lookup_fail_time);									
+	} else {									
+		atomic64_inc(&map->stats_lookup_ok);									
+		atomic64_add(end - start, &map->stats_lookup_ok_time);									
+	}									
+									
+	local_irq_restore(flags);									
+	preempt_enable();									
+
+	return l;
 }
 
-static void htab_map_post_alloc(struct bpf_map *map)
+static void *htab_map_lookup_elem(struct bpf_map *map, void *key)
 {
-	if (map->map_flags & BPF_F_FAST_HASH) {
+	struct htab_elem *l = __htab_map_lookup_elem(map, key);
 
-		struct bpf_map_ops *new_ops;
-		size_t size = sizeof(struct bpf_map_ops);
+	if (l)
+		return l->key + round_up(map->key_size, 8);
 
-		pr_info("replacing hash lookup function\n");
-
-		size = roundup_pow_of_two(size);
-
-		new_ops = kmalloc(size, GFP_USER | __GFP_NOWARN);
-		if (!new_ops)
-			return;
-
-		memcpy(new_ops, map->ops, sizeof(struct bpf_map_ops));
-		new_ops->map_lookup_elem = htab_map_lookup_func(map);
-		map->ops = new_ops;
-	}
+	return NULL;
 }
-
-/*
- * XXX here we can easily instrument a proper hash function, hehe
- */
 
 /* inline bpf_map_lookup_elem() call.
  * Instead of:
@@ -880,7 +777,7 @@ static int htab_map_gen_lookup(struct bpf_map *map, struct bpf_insn *insn_buf)
 
 	BUILD_BUG_ON(!__same_type(&__htab_map_lookup_elem,
 		     (void *(*)(struct bpf_map *map, void *key))NULL));
-	*insn++ = BPF_EMIT_CALL(htab_map_lookup_func(map));
+	*insn++ = BPF_EMIT_CALL(__htab_map_lookup_elem);
 	*insn++ = BPF_JMP_IMM(BPF_JEQ, ret, 0, 1);
 	*insn++ = BPF_ALU64_IMM(BPF_ADD, ret,
 				offsetof(struct htab_elem, key) +
@@ -997,7 +894,7 @@ static int htab_map_get_next_key(struct bpf_map *map, void *key, void *next_key)
 	if (!key)
 		goto find_first_elem;
 
-	hash = htab_map_hash(key, key_size, htab->hashrnd);
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
 
 	head = select_bucket(htab, hash);
 
@@ -1263,20 +1160,7 @@ static int htab_map_update_elem(struct bpf_map *map, void *key, void *value,
 
 	key_size = map->key_size;
 
-	if (map->map_flags & BPF_F_FAST_HASH) {
-		if (likely(key_size <= 240)) {
-			if (key_size == 4 || key_size == 8 || key_size == 12)
-				hash = Jhash2(key, htab->hash_size, htab->hashrnd, "upd");
-			else
-				hash = xxh3_240(key, key_size, htab->hashrnd);
-		} else {
-			hash = xxhash(key, key_size, htab->hashrnd);
-		}
-	} else {
-		hash = htab_map_hash(key, key_size, htab->hashrnd);
-	}
-
-	//pr_info("got hash=%08x\n", hash);
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
 
 	b = __select_bucket(htab, hash);
 	head = &b->head;
@@ -1378,7 +1262,7 @@ static int htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value,
 
 	key_size = map->key_size;
 
-	hash = htab_map_hash(key, key_size, htab->hashrnd);
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
 
 	b = __select_bucket(htab, hash);
 	head = &b->head;
@@ -1446,7 +1330,7 @@ static int __htab_percpu_map_update_elem(struct bpf_map *map, void *key,
 
 	key_size = map->key_size;
 
-	hash = htab_map_hash(key, key_size, htab->hashrnd);
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
 
 	b = __select_bucket(htab, hash);
 	head = &b->head;
@@ -1501,7 +1385,7 @@ static int __htab_lru_percpu_map_update_elem(struct bpf_map *map, void *key,
 
 	key_size = map->key_size;
 
-	hash = htab_map_hash(key, key_size, htab->hashrnd);
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
 
 	b = __select_bucket(htab, hash);
 	head = &b->head;
@@ -1576,7 +1460,7 @@ static int htab_map_delete_elem(struct bpf_map *map, void *key)
 
 	key_size = map->key_size;
 
-	hash = htab_map_hash(key, key_size, htab->hashrnd);
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
 	b = __select_bucket(htab, hash);
 	head = &b->head;
 
@@ -1612,7 +1496,7 @@ static int htab_lru_map_delete_elem(struct bpf_map *map, void *key)
 
 	key_size = map->key_size;
 
-	hash = htab_map_hash(key, key_size, htab->hashrnd);
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
 	b = __select_bucket(htab, hash);
 	head = &b->head;
 
@@ -1760,7 +1644,7 @@ static int __htab_map_lookup_and_delete_elem(struct bpf_map *map, void *key,
 
 	key_size = map->key_size;
 
-	hash = htab_map_hash(key, key_size, htab->hashrnd);
+	hash = htab_map_hash(key, key_size, htab->hash_size, htab->hashrnd, htab->map.map_flags & BPF_F_FAST_HASH);
 	b = __select_bucket(htab, hash);
 	head = &b->head;
 
@@ -2382,7 +2266,6 @@ const struct bpf_map_ops htab_map_ops = {
 	.map_meta_equal = bpf_map_meta_equal,
 	.map_alloc_check = htab_map_alloc_check,
 	.map_alloc = htab_map_alloc,
-	.map_post_alloc = htab_map_post_alloc,
 	.map_free = htab_map_free,
 	.map_get_next_key = htab_map_get_next_key,
 	.map_release_uref = htab_map_free_timers,

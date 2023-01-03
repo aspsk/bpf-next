@@ -134,9 +134,6 @@ static struct bpf_map *find_and_alloc_map(union bpf_attr *attr)
 	map->ops = ops;
 	map->map_type = type;
 
-	if (map->ops->map_post_alloc)
-		map->ops->map_post_alloc(map);
-
 	atomic64_set(&map->stats_lookup_ok, 0);
 	atomic64_set(&map->stats_lookup_ok_time, 0);
 	atomic64_set(&map->stats_lookup_fail, 0);

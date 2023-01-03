@@ -173,4 +173,26 @@ static inline u32 jhash_1word(u32 a, u32 initval)
 	return __jhash_nwords(a, 0, 0, initval + JHASH_INITVAL + (1 << 2));
 }
 
+//
+// You need to precompute `initval <- JHASH_INITVAL + (length<<2) + initval`
+//
+static inline u32 jhash12(const u32 *k, u32 length, u32 initval)
+{
+	u32 a, b, c;
+
+	/* Set up the internal state */
+	a = b = c = initval;
+
+	/* Handle the last 3 u32's */
+	switch (length) {
+	case 3: c += k[2];	fallthrough;
+	case 2: b += k[1];	fallthrough;
+	case 1: a += k[0];
+		__jhash_final(a, b, c);
+		break;
+	}
+
+	return c;
+}
+
 #endif /* _LINUX_JHASH_H */
