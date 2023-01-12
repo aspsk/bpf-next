@@ -121,6 +121,10 @@ uint64_t xxh64(const void *input, size_t length, uint64_t seed);
  */
 uint64_t xxh3_240(const void *input, size_t length, uint64_t seed);
 
+uint64_t xxh3_9_to_16(const void *input, size_t length, uint64_t seed);
+uint64_t xxh3_17_to_128(const void *input, size_t length, uint64_t seed);
+uint64_t xxh3_129_to_240(const void *input, size_t length, uint64_t seed);
+
 /**
  * xxhash() - calculate wordsize hash of the input with a given seed
  * @input:  The data to hash.

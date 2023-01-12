@@ -107,6 +107,31 @@ static inline u32 jhash(const void *key, u32 length, u32 initval)
 	return c;
 }
 
+static inline u32 jhash_1_to_7(const void *key, u32 length, u32 initval)
+{
+	u32 a, b, c;
+	const u8 *k = key;
+
+	/* Set up the internal state */
+	a = b = c = JHASH_INITVAL + length + initval;
+
+	switch (length) {
+	case 7:  b += (u32)k[6]<<16;	fallthrough;
+	case 6:  b += (u32)k[5]<<8;	fallthrough;
+	case 5:  b += k[4];		fallthrough;
+	case 4:  a += (u32)k[3]<<24;	fallthrough;
+	case 3:  a += (u32)k[2]<<16;	fallthrough;
+	case 2:  a += (u32)k[1]<<8;	fallthrough;
+	case 1:  a += k[0];
+		 __jhash_final(a, b, c);
+		 break;
+	case 0: /* Nothing left to add */
+		break;
+	}
+
+	return c;
+}
+
 /* jhash2 - hash an array of u32's
  * @k: the key which must be an array of u32's
  * @length: the number of u32's in the key
@@ -171,28 +196,6 @@ static inline u32 jhash_2words(u32 a, u32 b, u32 initval)
 static inline u32 jhash_1word(u32 a, u32 initval)
 {
 	return __jhash_nwords(a, 0, 0, initval + JHASH_INITVAL + (1 << 2));
-}
-
-//
-// You need to precompute `initval <- JHASH_INITVAL + (length<<2) + initval`
-//
-static inline u32 jhash12(const u32 *k, u32 length, u32 initval)
-{
-	u32 a, b, c;
-
-	/* Set up the internal state */
-	a = b = c = initval;
-
-	/* Handle the last 3 u32's */
-	switch (length) {
-	case 3: c += k[2];	fallthrough;
-	case 2: b += k[1];	fallthrough;
-	case 1: a += k[0];
-		__jhash_final(a, b, c);
-		break;
-	}
-
-	return c;
 }
 
 #endif /* _LINUX_JHASH_H */

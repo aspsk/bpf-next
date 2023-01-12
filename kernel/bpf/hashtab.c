@@ -645,10 +645,18 @@ free_htab:
 static inline u32 htab_map_hash(const void *key, u32 key_len, u32 size4, u32 hashrnd, bool fast)
 {
 	if (fast) {
-		if (size4)
-			return jhash12(key, size4, hashrnd);
-		else if (key_len <= 240)
-			return xxh3_240(key, key_len, hashrnd);
+		if (likely((key_len % 4 == 0) && key_len <= 12))
+			return jhash2(key, key_len / 4, hashrnd);
+		else if (key_len <= 240) {
+			if (key_len <= 16) {
+				if (key_len > 8)
+					return xxh3_9_to_16(key, key_len, hashrnd);
+				return jhash_1_to_7(key, key_len, hashrnd);
+			}
+			if (key_len <= 128)
+				return xxh3_17_to_128(key, key_len, hashrnd);
+			return xxh3_129_to_240(key, key_len, hashrnd);
+		}
 		return xxhash(key, key_len, hashrnd);
 	} else {
 		return jhash(key, key_len, hashrnd);
