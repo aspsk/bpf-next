@@ -249,11 +249,6 @@ const char argp_program_doc[] =
 "    # run 'count-local' with 16 producer and 8 consumer thread, pinned to CPUs\n"
 "    benchmark -p16 -c8 -a count-local\n";
 
-enum {
-	ARG_PROD_AFFINITY_SET = 1000,
-	ARG_CONS_AFFINITY_SET = 1001,
-};
-
 static const struct argp_option opts[] = {
 	{ "list", 'l', NULL, 0, "List available benchmarks"},
 	{ "duration", 'd', "SEC", 0, "Duration of benchmark, seconds"},
