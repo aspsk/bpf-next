@@ -56,6 +56,8 @@
 #define get_unaligned_le32(x) (*(u32 *)(x))
 #define get_unaligned_le64(x) (*(u64 *)(x))
 
+#define xxh_xorshift64(v64, shift) (v64 ^ (v64 >> shift))
+
 /*-*************************************
  * Constants
  **************************************/
@@ -506,6 +508,28 @@ u64 xxh3_17_to_128(const void *input, size_t len, u64 seed)
 	return xxh3_avalanche(acc);
 }
 
+u64 xxh3_33_to_128(const void *input, size_t len, u64 seed)
+{
+	const u8 *s = __xxh3_def_secret;
+	u64 acc = len * PRIME64_1;
+
+	if (len > 64) {
+		if (len > 96) {
+			acc += xxh3_mix16b(input + 48, s + 96, seed);
+			acc += xxh3_mix16b(input + len - 64, s + 112, seed);
+		}
+		acc += xxh3_mix16b(input + 32, s + 64, seed);
+		acc += xxh3_mix16b(input + len - 48, s + 80, seed);
+	}
+	acc += xxh3_mix16b(input + 16, s + 32, seed);
+	acc += xxh3_mix16b(input + len - 32, s + 48, seed);
+	acc += xxh3_mix16b(input + 0, s + 0, seed);
+	acc += xxh3_mix16b(input + len - 16, s + 16, seed);
+
+	return xxh3_avalanche(acc);
+}
+EXPORT_SYMBOL(xxh3_33_to_128);
+
 u64 xxh3_129_to_240(const void* input, size_t len, u64 seed)
 {
 	const size_t start = 3, last = 136 - 7;
@@ -540,6 +564,203 @@ uint64_t xxh3_240(const void *input, size_t len, uint64_t seed)
 	return 0;
 }
 EXPORT_SYMBOL(xxh3_240);
+
+// XXX
+
+#define XXH_STRIPE_LEN 64
+#define XXH_SECRET_CONSUME_RATE 8   /* nb of secret bytes consumed at each accumulation */
+#define XXH_ACC_NB (XXH_STRIPE_LEN / sizeof(u64))
+
+#define XXH3_INIT_ACC { PRIME32_3, PRIME64_1, PRIME64_2, PRIME64_3, \
+                        PRIME64_4, PRIME32_2, PRIME64_5, PRIME32_1 }
+
+static __always_inline u64 xxh3_mix2accs(const u64 *acc, const u8 *secret)
+{
+    return xxh_64x64_fold(acc[0] ^ get_unaligned_le64(secret),
+		          acc[1] ^ get_unaligned_le64(secret+8));
+}
+
+// XXX
+static u64 XXH3_mergeAccs(const u64 *acc, const u8 *secret, u64 start)
+{
+	u64 result64 = start;
+	size_t i = 0;
+
+	for (i = 0; i < 4; i++) {
+		result64 += xxh3_mix2accs(acc+2*i, secret + 16*i);
+#if defined(__clang__)                                /* Clang */ \
+		&& (defined(__arm__) || defined(__thumb__))       /* ARMv7 */ \
+		&& (defined(__ARM_NEON) || defined(__ARM_NEON__)) /* NEON */  \
+		&& !defined(XXH_ENABLE_AUTOVECTORIZE)             /* Define to disable */
+		/*
+		 * UGLY HACK:
+		 * Prevent autovectorization on Clang ARMv7-a. Exact same problem as
+		 * the one in XXH3_len_129to240_64b. Speeds up shorter keys > 240b.
+		 * XXH3_64bits, len == 256, Snapdragon 835:
+		 *   without hack: 2063.7 MB/s
+		 *   with hack:    2560.7 MB/s
+		 */
+		XXH_COMPILER_GUARD(result64);
+#endif
+	}
+
+	return xxh3_avalanche(result64);
+}
+
+static __always_inline void
+XXH3_scalarRound(void *acc,
+                 void const *input,
+                 void const *secret,
+                 size_t lane)
+{
+	u64* xacc = (u64*) acc;
+	u8 const* xinput  = (u8 const*) input;
+	u8 const* xsecret = (u8 const*) secret;
+	//XXH_ASSERT(lane < XXH_ACC_NB);
+	//XXH_ASSERT(((size_t)acc & (XXH_ACC_ALIGN-1)) == 0);
+	{
+		u64 const data_val = get_unaligned_le64(xinput + lane * 8);
+		u64 const data_key = data_val ^ get_unaligned_le64(xsecret + lane * 8);
+		xacc[lane ^ 1] += data_val; /* swap adjacent lanes */
+		xacc[lane] += xxh_32x32(data_key, data_key >> 32);
+	}
+}
+
+
+static __always_inline void
+XXH3_accumulate_512_scalar(void *acc, const void *input, const void *secret)
+{
+	size_t i;
+
+	/* ARM GCC refuses to unroll this loop, resulting in a 24% slowdown on ARMv6. */
+#if defined(__GNUC__) && !defined(__clang__) \
+	&& (defined(__arm__) || defined(__thumb2__)) \
+	&& defined(__ARM_FEATURE_UNALIGNED) /* no unaligned access just wastes bytes */ \
+	&& XXH_SIZE_OPT <= 0
+#  pragma GCC unroll 8
+#endif
+	for (i=0; i < XXH_ACC_NB; i++)
+		XXH3_scalarRound(acc, input, secret, i);
+}
+
+#ifndef XXH_PREFETCH_DIST
+#  ifdef __clang__
+#    define XXH_PREFETCH_DIST 320
+#  else
+#    define XXH_PREFETCH_DIST 384
+#  endif  /* __clang__ */
+#endif  /* XXH_PREFETCH_DIST */
+
+#    define XXH_PREFETCH(ptr)  __builtin_prefetch((ptr), 0 /* rw==read */, 3 /* locality */)
+
+static __always_inline void XXH3_accumulate(u64 *acc, const u8 *input, const u8 *secret, size_t nb_stripes)
+{
+	size_t n;
+
+	for (n = 0; n < nb_stripes; n++) {
+		const u8 *const in = input + n*XXH_STRIPE_LEN;
+		XXH_PREFETCH(in + XXH_PREFETCH_DIST);
+		XXH3_accumulate_512_scalar(acc, in, secret + n*XXH_SECRET_CONSUME_RATE);
+	}
+}
+
+/*!
+ * @internal
+ * @brief Scalar scramble step for @ref XXH3_scrambleAcc_scalar().
+ *
+ * This is extracted to its own function because the NEON path uses a combination
+ * of NEON and scalar.
+ */
+static __always_inline void
+XXH3_scalarScrambleRound(void *acc, void const *secret, size_t lane)
+{
+	u64 *const xacc = (u64*)acc; /* presumed aligned */
+	const u8 *const xsecret = (const u8*)secret; /* no alignment restriction */
+	//XXH_ASSERT((((size_t)acc) & (XXH_ACC_ALIGN-1)) == 0);
+	//XXH_ASSERT(lane < XXH_ACC_NB);
+	{
+		u64 const key64 = get_unaligned_le64(xsecret + lane * 8);
+		u64 acc64 = xacc[lane];
+		acc64 = xxh_xorshift64(acc64, 47);
+		acc64 ^= key64;
+		acc64 *= PRIME32_1;
+		xacc[lane] = acc64;
+	}
+}
+
+/*!
+ * @internal
+ * @brief Scrambles the accumulators after a large chunk has been read
+ */
+static __always_inline void
+XXH3_scrambleAcc_scalar(void *acc, const void *secret)
+{
+	size_t i;
+
+	for (i = 0; i < XXH_ACC_NB; i++)
+		XXH3_scalarScrambleRound(acc, secret, i);
+}
+
+static __always_inline __u64 __xxh3_241_to_infty(const u8 *input, size_t len, u64 seed, const u8 *secret, size_t secret_size)
+{
+	__aligned(8) u64 acc[XXH_ACC_NB] = XXH3_INIT_ACC;
+
+	{
+		size_t const nbStripesPerBlock = (secret_size - XXH_STRIPE_LEN) / XXH_SECRET_CONSUME_RATE;
+		size_t const block_len = XXH_STRIPE_LEN * nbStripesPerBlock;
+		size_t const nb_blocks = (len - 1) / block_len;
+
+		size_t n;
+
+		// XXX XXH_ASSERT(secretSize >= XXH3_SECRET_SIZE_MIN);
+
+		for (n = 0; n < nb_blocks; n++) {
+			XXH3_accumulate(acc, input + n*block_len, secret, nbStripesPerBlock);
+			XXH3_scrambleAcc_scalar(acc, secret + secret_size - XXH_STRIPE_LEN);
+		}
+
+		/* last partial block */
+		//XXH_ASSERT(len > XXH_STRIPE_LEN);
+		{   size_t const nbStripes = ((len - 1) - (block_len * nb_blocks)) / XXH_STRIPE_LEN;
+			//XXH_ASSERT(nbStripes <= (secretSize / XXH_SECRET_CONSUME_RATE));
+			XXH3_accumulate(acc, input + nb_blocks*block_len, secret, nbStripes);
+
+			/* last stripe */
+#define XXH_SECRET_LASTACC_START 7  /* not aligned on 8, last secret is different from acc & scrambler */
+				XXH3_accumulate_512_scalar(acc, input + len - XXH_STRIPE_LEN, secret + secret_size - XXH_STRIPE_LEN - XXH_SECRET_LASTACC_START);
+		}
+	}
+
+	/* do not align on 8, so that the secret is different from the accumulator */
+#define XXH_SECRET_MERGEACCS_START 11
+	// TBD XXX XXH_ASSERT(secretSize >= sizeof(acc) + XXH_SECRET_MERGEACCS_START);
+	return XXH3_mergeAccs(acc, secret + XXH_SECRET_MERGEACCS_START, (u64)len * PRIME64_1);
+}
+
+// // XXH3_hashLong_64b_withSeed
+static noinline u64 xxh3_241_to_infty(const void *input, size_t len, __u64 seed)
+{
+	// TBD: init secret from seed if seed != 0 using XXH3_initCustomSecret_scalar
+	const void *secret = __xxh3_def_secret;
+	size_t secret_size = sizeof(__xxh3_def_secret);
+
+	return __xxh3_241_to_infty(input, len, seed, secret, secret_size);
+}
+
+__u64 xxh3(const void *input, size_t len, __u64 seed)
+{
+	if (len <= 16)
+		return xxh3_0_16(input, len, seed);
+
+	if (len <= 128)
+		return xxh3_17_to_128(input, len, seed);
+
+	if (len <= 240)
+		return xxh3_129_to_240(input, len, seed);
+
+	return xxh3_241_to_infty(input, len, seed);
+}
+EXPORT_SYMBOL(xxh3);
 
 EXPORT_SYMBOL(xxh3_1_to_3);
 EXPORT_SYMBOL(xxh3_4_to_8);

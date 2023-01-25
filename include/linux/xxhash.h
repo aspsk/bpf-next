@@ -119,11 +119,12 @@ uint64_t xxh64(const void *input, size_t length, uint64_t seed);
  *
  * Return:  The 64-bit hash of the data.
  */
+uint64_t xxh3(const void *input, size_t length, uint64_t seed);
 uint64_t xxh3_240(const void *input, size_t length, uint64_t seed);
-
 uint64_t xxh3_9_to_16(const void *input, size_t length, uint64_t seed);
 uint64_t xxh3_17_to_128(const void *input, size_t length, uint64_t seed);
 uint64_t xxh3_129_to_240(const void *input, size_t length, uint64_t seed);
+u64 xxh3_33_to_128(const void *input, size_t len, u64 seed);
 
 /**
  * xxhash() - calculate wordsize hash of the input with a given seed

@@ -28,20 +28,35 @@ struct bpf_bloom_filter {
 	unsigned long bitset[];
 };
 
-static inline u32 fast_hash(void *value, u32 value_size, u32 seed)
+#if 0
+static inline u32 fast_hash(void *value, u32 value_size, u32 seed, u32 count4)
 {
+	if (likely(((value_size & 3) == 0) && value_size <= 8))
+		return jhash2(value, value_size >> 2, seed);
+	if (likely(value_size <= 16)) {
+		if (value_size > 8)
+			return xxh3_9_to_16(value, value_size, seed);
+		return jhash_1_to_7(value, value_size, seed);
+	}
 	if (value_size <= 240)
 		return xxh3_240(value, value_size, seed);
-	return xxh64(value, value_size, seed);
+	return xxhash(value, value_size, seed);
 }
+#endif
 
 static u32 hash(struct bpf_bloom_filter *bloom, void *value,
 		u32 value_size, u32 index)
 {
 	u32 h;
 
-	if (bloom->map.map_flags & BPF_F_FAST_HASH) {
-		h = fast_hash(value, value_size, bloom->hash_seed + index);
+	if (likely(bloom->map.map_flags & BPF_F_FAST_HASH)) {
+		if (likely(bloom->aligned_u32_count))
+			h = jhash2(value, bloom->aligned_u32_count, bloom->hash_seed + index);
+		else
+#if 0
+		h = fast_hash(value, value_size, bloom->hash_seed + index, bloom->aligned_u32_count);
+#endif
+			h = xxh3(value, value_size, bloom->hash_seed + index);
 	} else {
 		if (bloom->aligned_u32_count)
 			h = jhash2(value, bloom->aligned_u32_count,
@@ -165,9 +180,12 @@ static struct bpf_map *bloom_map_alloc(union bpf_attr *attr)
 	bloom->bitset_mask = bitset_mask;
 
 	/* Check whether the value size is u32-aligned */
-	if ((attr->value_size & (sizeof(u32) - 1)) == 0)
+	if ((attr->value_size & (sizeof(u32) - 1)) == 0) {
 		bloom->aligned_u32_count =
 			attr->value_size / sizeof(u32);
+		if ((bloom->map.map_flags & BPF_F_FAST_HASH) && attr->value_size >= 40)
+			bloom->aligned_u32_count = 0;
+	}
 
 	if (!(attr->map_flags & BPF_F_ZERO_SEED))
 		bloom->hash_seed = get_random_int();

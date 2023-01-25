@@ -215,6 +215,9 @@ get_callchain_entry_for_task(struct task_struct *task, u32 max_depth)
 #endif
 }
 
+static u16 last_nr_buf[128];
+static u64 last_nr;
+
 static bool _stackid_fast = false;
 
 static ssize_t run_store(struct kobject *kobj,
@@ -230,6 +233,12 @@ static ssize_t run_store(struct kobject *kobj,
 		return ret;
 
 	_stackid_fast = res;
+
+	pr_info("last_nr: ");
+	for (int i = 0; i < 128; i++) {
+		pr_info("    last_nr[i]: %u, fast=%d", last_nr_buf[i], _stackid_fast);
+	}
+	pr_info("\n");
 
 	return n;
 }
@@ -270,7 +279,7 @@ static inline u32 ___hash(const void *key, u32 key_len)
 			return xxh3_240(key, key_len, 0);
 		return xxh64(key, key_len, 0);
 	}
-	return jhash2(key, key_len, 0);
+	return jhash2(key, key_len / sizeof(u32), 0);
 }
 
 static long ___bpf_get_stackid(struct bpf_map *map,
@@ -289,9 +298,11 @@ static long ___bpf_get_stackid(struct bpf_map *map,
 		return -EFAULT;
 
 	trace_nr = trace->nr - skip;
+	last_nr_buf[last_nr++ % 128] = trace_nr;
+
 	trace_len = trace_nr * sizeof(u64);
 	ips = trace->ip + skip;
-	hash = ___hash((u32 *)ips, trace_len / sizeof(u32));
+	hash = ___hash((u32 *)ips, trace_len);
 	id = hash & (smap->n_buckets - 1);
 	bucket = READ_ONCE(smap->buckets[id]);
 
@@ -357,7 +368,7 @@ static long __bpf_get_stackid(struct bpf_map *map,
 	ret = ___bpf_get_stackid(map, trace, flags);
 	end = get_cycles();
 
-	if (ret != 0) {
+	if (ret < 0) {
 		atomic64_inc(&map->stats_lookup_fail);
 		atomic64_add(end - start, &map->stats_lookup_fail_time);
 	} else {
@@ -371,15 +382,14 @@ static long __bpf_get_stackid(struct bpf_map *map,
 	return ret;
 }
 
-
-BPF_CALL_3(bpf_get_stackid, struct pt_regs *, regs, struct bpf_map *, map,
-	   u64, flags)
+static inline u64 _bpf_get_stackid(struct pt_regs *regs, struct bpf_map *map, u64 flags)
 {
 	u32 max_depth = map->value_size / stack_map_data_size(map);
 	u32 skip = flags & BPF_F_SKIP_FIELD_MASK;
 	bool user = flags & BPF_F_USER_STACK;
 	struct perf_callchain_entry *trace;
 	bool kernel = !user;
+	u64 start, end;
 
 	if (unlikely(flags & ~(BPF_F_SKIP_FIELD_MASK | BPF_F_USER_STACK |
 			       BPF_F_FAST_STACK_CMP | BPF_F_REUSE_STACKID)))
@@ -389,14 +399,41 @@ BPF_CALL_3(bpf_get_stackid, struct pt_regs *, regs, struct bpf_map *, map,
 	if (max_depth > sysctl_perf_event_max_stack)
 		max_depth = sysctl_perf_event_max_stack;
 
+	start = get_cycles();
 	trace = get_perf_callchain(regs, 0, kernel, user, max_depth,
 				   false, false);
+	end = get_cycles();
+	atomic64_inc(&map->stats_update);
+	atomic64_add(end - start, &map->stats_update_time);
 
 	if (unlikely(!trace))
 		/* couldn't fetch the stack trace */
 		return -EFAULT;
 
 	return __bpf_get_stackid(map, trace, flags);
+}
+
+BPF_CALL_3(bpf_get_stackid, struct pt_regs *, regs, struct bpf_map *, map,
+	   u64, flags)
+{
+	unsigned long irq_flags;
+	u64 start, end;
+	u64 ret;
+
+	preempt_disable();
+	local_irq_save(irq_flags);
+
+	start = get_cycles();
+	ret = _bpf_get_stackid(regs, map, flags);
+	end = get_cycles();
+
+	atomic64_inc(&map->stats_lookup_fail);
+	atomic64_add(end - start, &map->stats_lookup_fail_time);
+
+	local_irq_restore(irq_flags);
+	preempt_enable();
+
+	return ret;
 }
 
 const struct bpf_func_proto bpf_get_stackid_proto = {

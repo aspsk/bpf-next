@@ -619,9 +619,8 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 		}
 	}
 
-	if ((htab->map.map_flags & BPF_F_FAST_HASH) && (htab->map.key_size <= 12 && (htab->map.key_size % 4 == 0))) {
+	if ((htab->map.map_flags & BPF_F_FAST_HASH) && (htab->map.key_size <= 32 && (htab->map.key_size % 4 == 0))) {
 		htab->hash_size = htab->map.key_size / 4;
-		htab->hashrnd += JHASH_INITVAL + htab->map.key_size;
 	} else {
 		htab->hash_size = 0;
 	}
@@ -642,26 +641,34 @@ free_htab:
 	return ERR_PTR(err);
 }
 
+#if 0
 static inline u32 htab_map_hash(const void *key, u32 key_len, u32 size4, u32 hashrnd, bool fast)
 {
-	if (fast) {
-		if (likely((key_len % 4 == 0) && key_len <= 12))
-			return jhash2(key, key_len / 4, hashrnd);
-		else if (key_len <= 240) {
-			if (key_len <= 16) {
-				if (key_len > 8)
-					return xxh3_9_to_16(key, key_len, hashrnd);
-				return jhash_1_to_7(key, key_len, hashrnd);
-			}
-			if (key_len <= 128)
-				return xxh3_17_to_128(key, key_len, hashrnd);
-			return xxh3_129_to_240(key, key_len, hashrnd);
+	if (likely(fast)) {
+		if (likely(((key_len & 3) == 0) && key_len <= 8))
+			return jhash2(key, key_len >> 2, hashrnd);
+		if (key_len <= 16) {
+			if (key_len > 8)
+				return xxh3_9_to_16(key, key_len, hashrnd);
+			return jhash_1_to_7(key, key_len, hashrnd);
 		}
+		if (key_len <= 240)
+			return xxh3_240(key, key_len, hashrnd);
 		return xxhash(key, key_len, hashrnd);
-	} else {
-		return jhash(key, key_len, hashrnd);
 	}
+	return jhash(key, key_len, hashrnd);
 }
+#else
+static inline u32 htab_map_hash(const void *key, u32 key_len, u32 size4, u32 hashrnd, bool fast)
+{
+	if (likely(fast)) {
+		if (key_len <= 240)
+			return xxh3_240(key, key_len, hashrnd);
+		return xxhash(key, key_len, hashrnd);
+	}
+	return jhash(key, key_len, hashrnd);
+}
+#endif
 
 static inline struct bucket *__select_bucket(struct bpf_htab *htab, u32 hash)
 {
