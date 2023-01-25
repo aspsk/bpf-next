@@ -15,15 +15,14 @@ struct {
 /* The number of slots to store times */
 #define NR_SLOTS 32
 
-/* Filled by us */
-u64 __attribute__((__aligned__(256))) percpu_times_index[NR_SLOTS];
-u64 __attribute__((__aligned__(256))) percpu_times[256][NR_SLOTS];
-
 /* Configured by userspace */
 u64 nr_entries;
 u64 nr_loops;
-u64 key_size;
 u32 __attribute__((__aligned__(8))) key[256];
+
+/* Filled by us */
+u64 __attribute__((__aligned__(256))) percpu_times_index[NR_SLOTS];
+u64 __attribute__((__aligned__(256))) percpu_times[256][NR_SLOTS];
 
 static inline void patch_key(u32 i)
 {
@@ -38,14 +37,12 @@ static inline void patch_key(u32 i)
 static int lookup_callback(__u32 index, u32 *unused)
 {
 	patch_key(index);
-	bpf_map_lookup_elem(&hash_map_bench, key);
-	return 0;
+	return bpf_map_lookup_elem(&hash_map_bench, key) ? 0 : 1;
 }
 
 static int loop_lookup_callback(__u32 index, u32 *unused)
 {
-	bpf_loop(nr_entries, lookup_callback, NULL, 0);
-	return 0;
+	return bpf_loop(nr_entries, lookup_callback, NULL, 0) ? 0 : 1;
 }
 
 SEC("fentry/" SYS_PREFIX "sys_getpgid")

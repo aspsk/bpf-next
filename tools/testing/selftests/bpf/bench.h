@@ -24,6 +24,7 @@ struct env {
 	bool verbose;
 	bool list;
 	bool affinity;
+	bool silent;
 	int consumer_cnt;
 	int producer_cnt;
 	struct cpu_set prod_cpus;
@@ -123,4 +124,5 @@ enum {
 	ARG_KEY_SIZE,
 	ARG_MAP_FLAGS,
 	ARG_MAX_ENTRIES,
+	ARG_SHORT_OUTPUT,
 };

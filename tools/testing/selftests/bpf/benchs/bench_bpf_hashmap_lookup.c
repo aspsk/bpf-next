@@ -68,7 +68,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			fprintf(stderr, "invalid map_flags");
 			argp_usage(state);
 		}
-		args.map_flags = ret;
+		args.map_flags |= ret;
 		break;
 	case ARG_MAX_ENTRIES:
 		ret = strtol(arg, NULL, 10);
@@ -168,25 +168,18 @@ static void setup(void)
 	bpf_map__set_value_size(ctx.skel->maps.hash_map_bench, 8);
 	bpf_map__set_map_flags(ctx.skel->maps.hash_map_bench, args.map_flags);
 
-	ret = bpf_hashmap_lookup__load(ctx.skel);
-	if (ret) {
-		bpf_hashmap_lookup__destroy(ctx.skel);
-		fprintf(stderr, "failed to load map: %s", strerror(-ret));
-		exit(1);
-	}
-
 	ctx.skel->bss->nr_entries = args.nr_entries;
 	ctx.skel->bss->nr_loops = args.nr_loops / args.nr_entries;
-	ctx.skel->bss->key_size = args.key_size;
 
 	if (args.key_size > 4) {
 		for (i = 1; i < args.key_size/4; i++)
 			ctx.skel->bss->key[i] = 2654435761 * i;
 	}
 
-	link = bpf_program__attach(ctx.skel->progs.benchmark);
-	if (!link) {
-		fprintf(stderr, "failed to attach program!\n");
+	ret = bpf_hashmap_lookup__load(ctx.skel);
+	if (ret) {
+		bpf_hashmap_lookup__destroy(ctx.skel);
+		fprintf(stderr, "failed to load map: %s", strerror(-ret));
 		exit(1);
 	}
 
@@ -195,6 +188,12 @@ static void setup(void)
 	for (u64 i = 0; i < args.nr_entries; i++) {
 		patch_key(i, ctx.skel->bss->key);
 		bpf_map_update_elem(map_fd, ctx.skel->bss->key, &i, BPF_ANY);
+	}
+
+	link = bpf_program__attach(ctx.skel->progs.benchmark);
+	if (!link) {
+		fprintf(stderr, "failed to attach program!\n");
+		exit(1);
 	}
 }
 
@@ -250,8 +249,18 @@ static void hashmap_report_final(struct bench_res res[], int res_cnt)
 		if (n == 0)
 			continue;
 
-		printf("cpu%02d: hashmap_lookup %.3lfM ± %.3lfM events per sec (approximated from %d samples of ~%lums)\n",
-		       i, events_mean, 2*events_stddev, n, mean_time / 1000000);
+		if (env.silent) {
+			/* we expect only one cpu to be present */
+			if (env.affinity)
+				printf("%.3lf\n",events_mean);
+			else
+				printf("cpu%02d %.3lf\n", i, events_mean);
+		} else {
+			printf("cpu%02d: lookup %.3lfM ± %.3lfM events/sec"
+			       " (approximated from %d samples of ~%lums)\n",
+			       i, events_mean, 2*events_stddev,
+			       n, mean_time / 1000000);
+		}
 	}
 }
 
