@@ -266,6 +266,86 @@ static const struct argp_option opts[] = {
 	{},
 };
 
+extern const struct bench bench_count_global;
+extern const struct bench bench_count_local;
+extern const struct bench bench_rename_base;
+extern const struct bench bench_rename_kprobe;
+extern const struct bench bench_rename_kretprobe;
+extern const struct bench bench_rename_rawtp;
+extern const struct bench bench_rename_fentry;
+extern const struct bench bench_rename_fexit;
+extern const struct bench bench_trig_base;
+extern const struct bench bench_trig_tp;
+extern const struct bench bench_trig_rawtp;
+extern const struct bench bench_trig_kprobe;
+extern const struct bench bench_trig_fentry;
+extern const struct bench bench_trig_fentry_sleep;
+extern const struct bench bench_trig_fmodret;
+extern const struct bench bench_trig_uprobe_base;
+extern const struct bench bench_trig_uprobe_with_nop;
+extern const struct bench bench_trig_uretprobe_with_nop;
+extern const struct bench bench_trig_uprobe_without_nop;
+extern const struct bench bench_trig_uretprobe_without_nop;
+extern const struct bench bench_rb_libbpf;
+extern const struct bench bench_rb_custom;
+extern const struct bench bench_pb_libbpf;
+extern const struct bench bench_pb_custom;
+extern const struct bench bench_bloom_lookup;
+extern const struct bench bench_bloom_update;
+extern const struct bench bench_bloom_false_positive;
+extern const struct bench bench_hashmap_without_bloom;
+extern const struct bench bench_hashmap_with_bloom;
+extern const struct bench bench_bpf_loop;
+extern const struct bench bench_strncmp_no_helper;
+extern const struct bench bench_strncmp_helper;
+extern const struct bench bench_bpf_hashmap_full_update;
+extern const struct bench bench_local_storage_cache_seq_get;
+extern const struct bench bench_local_storage_cache_interleaved_get;
+extern const struct bench bench_local_storage_cache_hashmap_control;
+extern const struct bench bench_local_storage_tasks_trace;
+extern const struct bench bench_bpf_hashmap_lookup;
+
+static const struct bench *benchs[] = {
+	&bench_count_global,
+	&bench_count_local,
+	&bench_rename_base,
+	&bench_rename_kprobe,
+	&bench_rename_kretprobe,
+	&bench_rename_rawtp,
+	&bench_rename_fentry,
+	&bench_rename_fexit,
+	&bench_trig_base,
+	&bench_trig_tp,
+	&bench_trig_rawtp,
+	&bench_trig_kprobe,
+	&bench_trig_fentry,
+	&bench_trig_fentry_sleep,
+	&bench_trig_fmodret,
+	&bench_trig_uprobe_base,
+	&bench_trig_uprobe_with_nop,
+	&bench_trig_uretprobe_with_nop,
+	&bench_trig_uprobe_without_nop,
+	&bench_trig_uretprobe_without_nop,
+	&bench_rb_libbpf,
+	&bench_rb_custom,
+	&bench_pb_libbpf,
+	&bench_pb_custom,
+	&bench_bloom_lookup,
+	&bench_bloom_update,
+	&bench_bloom_false_positive,
+	&bench_hashmap_without_bloom,
+	&bench_hashmap_with_bloom,
+	&bench_bpf_loop,
+	&bench_strncmp_no_helper,
+	&bench_strncmp_helper,
+	&bench_bpf_hashmap_full_update,
+	&bench_local_storage_cache_seq_get,
+	&bench_local_storage_cache_interleaved_get,
+	&bench_local_storage_cache_hashmap_control,
+	&bench_local_storage_tasks_trace,
+	&bench_bpf_hashmap_lookup,
+};
+
 extern struct argp bench_ringbufs_argp;
 extern struct argp bench_bloom_map_argp;
 extern struct argp bench_bpf_loop_argp;
@@ -274,7 +354,7 @@ extern struct argp bench_local_storage_rcu_tasks_trace_argp;
 extern struct argp bench_strncmp_argp;
 extern struct argp bench_hashmap_lookup_argp;
 
-static struct argp_child bench_parsers[] = {
+static struct argp_child all_bench_parsers[] = {
 	{ &bench_ringbufs_argp, 0, "Ring buffers benchmark", 0 },
 	{ &bench_bloom_map_argp, 0, "Bloom filter map benchmark", 0 },
 	{ &bench_bpf_loop_argp, 0, "bpf_loop helper benchmark", 0 },
@@ -286,10 +366,9 @@ static struct argp_child bench_parsers[] = {
 	{},
 };
 
-static int pos_args;
-
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
+	static int pos_args;
 	long ret;
 
 	switch (key) {
@@ -372,108 +451,59 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	return 0;
 }
 
-struct argp *bench_name_to_argp(const char *bench_name)
+static char *parse_bench_name(int argc, char **argv)
 {
+	int i;
 
-#define _SCMP(NAME) (!strcmp(bench_name, NAME))
+	for (i = 1; i < argc; i++) {
+		if (argv[i][0] != '-')
+			return argv[i];
+	}
 
-	if (_SCMP("bloom-lookup") ||
-	    _SCMP("bloom-update") ||
-	    _SCMP("bloom-false-positive") ||
-	    _SCMP("hashmap-without-bloom") ||
-	    _SCMP("hashmap-with-bloom"))
-		return &bench_bloom_map_argp;
+	return NULL;
+}
 
-	if (_SCMP("rb-libbpf") ||
-	    _SCMP("rb-custom") ||
-	    _SCMP("pb-libbpf") ||
-	    _SCMP("pb-custom"))
-		return &bench_ringbufs_argp;
+static const struct argp *bench_name_to_argp(const char *bench_name)
+{
+	int i;
 
-	if (_SCMP("local-storage-cache-seq-get") ||
-	    _SCMP("local-storage-cache-int-get") ||
-	    _SCMP("local-storage-cache-hashmap-control"))
-		return &bench_local_storage_argp;
+	for (i = 0; i < ARRAY_SIZE(benchs); i++)
+		if (!strcmp(bench_name, benchs[i]->name))
+			return benchs[i]->argp;
 
-	if (_SCMP("local-storage-tasks-trace"))
-		return &bench_local_storage_rcu_tasks_trace_argp;
-
-	if (_SCMP("strncmp-no-helper") ||
-	    _SCMP("strncmp-helper"))
-		return &bench_strncmp_argp;
-
-	if (_SCMP("bpf-loop"))
-		return &bench_bpf_loop_argp;
-
-	if (_SCMP("bpf-hashmap-lookup"))
-		return &bench_hashmap_lookup_argp;
-
-	/* no extra arguments */
-	if (_SCMP("count-global") ||
-	    _SCMP("count-local") ||
-	    _SCMP("rename-base") ||
-	    _SCMP("rename-kprobe") ||
-	    _SCMP("rename-kretprobe") ||
-	    _SCMP("rename-rawtp") ||
-	    _SCMP("rename-fentry") ||
-	    _SCMP("rename-fexit") ||
-	    _SCMP("trig-base") ||
-	    _SCMP("trig-tp") ||
-	    _SCMP("trig-rawtp") ||
-	    _SCMP("trig-kprobe") ||
-	    _SCMP("trig-fentry") ||
-	    _SCMP("trig-fentry-sleep") ||
-	    _SCMP("trig-fmodret") ||
-	    _SCMP("trig-uprobe-base") ||
-	    _SCMP("trig-uprobe-with-nop") ||
-	    _SCMP("trig-uretprobe-with-nop") ||
-	    _SCMP("trig-uprobe-without-nop") ||
-	    _SCMP("trig-uretprobe-without-nop") ||
-	    _SCMP("bpf-hashmap-full-update"))
-		return NULL;
-
-#undef _SCMP
-
-	fprintf(stderr, "%s: bench %s is unknown\n", __func__, bench_name);
+	fprintf(stderr, "benchmark '%s' not found\n", bench_name);
 	exit(1);
 }
 
 static void parse_cmdline_args(int argc, char **argv)
 {
-	static const struct argp argp = {
+	struct argp_child bench_parsers[2] = {};
+	struct argp argp = {
 		.options = opts,
 		.parser = parse_arg,
 		.doc = argp_program_doc,
-		.children = bench_parsers,
+		.children = all_bench_parsers,
 	};
-	static struct argp *bench_argp;
+	const struct argp *bench_argp;
+	const char *bench_name;
 
-	/* Parse args for the first time to get bench name */
+	/* patch argp to only point to the right child */
+	bench_name = parse_bench_name(argc, argv);
+	if (bench_name) {
+		bench_argp = bench_name_to_argp(bench_name);
+		if (bench_argp) {
+			bench_parsers[0].argp = bench_argp;
+			bench_parsers[0].header = bench_name;
+			argp.children = bench_parsers;
+		}
+	}
+
 	if (argp_parse(&argp, argc, argv, 0, NULL, NULL))
 		exit(1);
 
-	if (env.list)
-		return;
-
-	if (!env.bench_name) {
+	if (!env.list && !env.bench_name) {
 		argp_help(&argp, stderr, ARGP_HELP_DOC, "bench");
 		exit(1);
-	}
-
-	/* Now check if there are custom options available. If not, then
-	 * everything is done, if yes, then we need to patch bench_parsers
-	 * so that bench_parsers[0] points to the right 'struct argp', and
-	 * bench_parsers[1] terminates the list.
-	 */
-	bench_argp = bench_name_to_argp(env.bench_name);
-	if (bench_argp) {
-		bench_parsers[0].argp = bench_argp;
-		bench_parsers[0].header = env.bench_name;
-		memset(&bench_parsers[1], 0, sizeof(bench_parsers[1]));
-
-		pos_args = 0;
-		if (argp_parse(&argp, argc, argv, 0, NULL, NULL))
-			exit(1);
 	}
 }
 
@@ -554,86 +584,6 @@ static struct bench_state {
 } state;
 
 const struct bench *bench = NULL;
-
-extern const struct bench bench_count_global;
-extern const struct bench bench_count_local;
-extern const struct bench bench_rename_base;
-extern const struct bench bench_rename_kprobe;
-extern const struct bench bench_rename_kretprobe;
-extern const struct bench bench_rename_rawtp;
-extern const struct bench bench_rename_fentry;
-extern const struct bench bench_rename_fexit;
-extern const struct bench bench_trig_base;
-extern const struct bench bench_trig_tp;
-extern const struct bench bench_trig_rawtp;
-extern const struct bench bench_trig_kprobe;
-extern const struct bench bench_trig_fentry;
-extern const struct bench bench_trig_fentry_sleep;
-extern const struct bench bench_trig_fmodret;
-extern const struct bench bench_trig_uprobe_base;
-extern const struct bench bench_trig_uprobe_with_nop;
-extern const struct bench bench_trig_uretprobe_with_nop;
-extern const struct bench bench_trig_uprobe_without_nop;
-extern const struct bench bench_trig_uretprobe_without_nop;
-extern const struct bench bench_rb_libbpf;
-extern const struct bench bench_rb_custom;
-extern const struct bench bench_pb_libbpf;
-extern const struct bench bench_pb_custom;
-extern const struct bench bench_bloom_lookup;
-extern const struct bench bench_bloom_update;
-extern const struct bench bench_bloom_false_positive;
-extern const struct bench bench_hashmap_without_bloom;
-extern const struct bench bench_hashmap_with_bloom;
-extern const struct bench bench_bpf_loop;
-extern const struct bench bench_strncmp_no_helper;
-extern const struct bench bench_strncmp_helper;
-extern const struct bench bench_bpf_hashmap_full_update;
-extern const struct bench bench_local_storage_cache_seq_get;
-extern const struct bench bench_local_storage_cache_interleaved_get;
-extern const struct bench bench_local_storage_cache_hashmap_control;
-extern const struct bench bench_local_storage_tasks_trace;
-extern const struct bench bench_bpf_hashmap_lookup;
-
-static const struct bench *benchs[] = {
-	&bench_count_global,
-	&bench_count_local,
-	&bench_rename_base,
-	&bench_rename_kprobe,
-	&bench_rename_kretprobe,
-	&bench_rename_rawtp,
-	&bench_rename_fentry,
-	&bench_rename_fexit,
-	&bench_trig_base,
-	&bench_trig_tp,
-	&bench_trig_rawtp,
-	&bench_trig_kprobe,
-	&bench_trig_fentry,
-	&bench_trig_fentry_sleep,
-	&bench_trig_fmodret,
-	&bench_trig_uprobe_base,
-	&bench_trig_uprobe_with_nop,
-	&bench_trig_uretprobe_with_nop,
-	&bench_trig_uprobe_without_nop,
-	&bench_trig_uretprobe_without_nop,
-	&bench_rb_libbpf,
-	&bench_rb_custom,
-	&bench_pb_libbpf,
-	&bench_pb_custom,
-	&bench_bloom_lookup,
-	&bench_bloom_update,
-	&bench_bloom_false_positive,
-	&bench_hashmap_without_bloom,
-	&bench_hashmap_with_bloom,
-	&bench_bpf_loop,
-	&bench_strncmp_no_helper,
-	&bench_strncmp_helper,
-	&bench_bpf_hashmap_full_update,
-	&bench_local_storage_cache_seq_get,
-	&bench_local_storage_cache_interleaved_get,
-	&bench_local_storage_cache_hashmap_control,
-	&bench_local_storage_tasks_trace,
-	&bench_bpf_hashmap_lookup,
-};
 
 static void setup_benchmark()
 {

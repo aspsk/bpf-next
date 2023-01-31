@@ -267,6 +267,7 @@ static void hashmap_report_final(struct bench_res res[], int res_cnt)
 
 const struct bench bench_bpf_hashmap_lookup = {
 	.name = "bpf-hashmap-lookup",
+	.argp = &bench_hashmap_lookup_argp,
 	.validate = validate,
 	.setup = setup,
 	.producer_thread = producer,
