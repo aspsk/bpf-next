@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) 2022 Isovalent, Inc.
+ * Copyright (c) 2023 Isovalent, Inc.
  */
 
 #include <linux/container_of.h>
@@ -15,8 +15,206 @@
 
 #include <asm/unaligned.h>
 
+#define BPF_WILDCARD_RULE_OFFSET 8
+
+#define BPF_WILDCARD_RULE(TYPE, SIZE) \
+	(BPF_WILDCARD_RULE_ ## TYPE << BPF_WILDCARD_RULE_OFFSET | (SIZE))
+
+#define BPF_WILDCARD_RULE_SIZE(X) ((X) & 0xff)
+#define BPF_WILDCARD_RULE_TYPE(X) (((X) >> BPF_WILDCARD_RULE_OFFSET) & 0xff)
+
+#if 1 /* from libbpf */
+static inline bool btf_is_mod(const struct btf_type *t)
+{
+	__u16 kind = btf_kind(t);
+
+	return kind == BTF_KIND_VOLATILE ||
+	       kind == BTF_KIND_CONST ||
+	       kind == BTF_KIND_RESTRICT ||
+	       kind == BTF_KIND_TYPE_TAG;
+}
+
+static inline bool btf_is_typedef(const struct btf_type *t)
+{
+	return btf_kind(t) == BTF_KIND_TYPEDEF;
+}
+
+const struct btf_type *
+skip_mods_and_typedefs(const struct btf *btf, __u32 id, __u32 *res_id)
+{
+	const struct btf_type *t = btf_type_by_id(btf, id);
+
+	if (res_id)
+		*res_id = id;
+
+	while (btf_is_mod(t) || btf_is_typedef(t)) {
+		if (res_id)
+			*res_id = t->type;
+		t = btf_type_by_id(btf, t->type);
+	}
+
+	return t;
+}
+
+static int btf_get_int(const struct btf *btf, const struct btf_member *m, u32 *res)
+{
+	const struct btf_type *t = skip_mods_and_typedefs(btf, m->type, NULL);
+	const struct btf_type *arr_t;
+
+	if (!btf_is_ptr(t))
+		return -EINVAL;
+
+	arr_t = btf_type_by_id(btf, t->type);
+	if (!arr_t || !btf_is_array(arr_t))
+		return -EINVAL;
+
+	*res = btf_array(arr_t)->nelems;
+	return 0;
+}
+#endif
+
+static bool validate_encoded_rule(u32 x)
+{
+	u32 size = BPF_WILDCARD_RULE_SIZE(x);
+
+	switch (BPF_WILDCARD_RULE_TYPE(x)) {
+	case BPF_WILDCARD_RULE_PREFIX:
+	case BPF_WILDCARD_RULE_MATCH:
+		switch (size) {
+		case 1: case 2: case 4: case 8: case 16:
+			return true;
+		}
+		break;
+	case BPF_WILDCARD_RULE_RANGE:
+		switch (size) {
+		case 1: case 2: case 4: case 8:
+			return true;
+		}
+		break;
+	}
+	return false;
+}
+
+/*
+ * The key BTF should have the following structure:
+ *
+ *     struct {
+ *             __uint(n_rules, N);
+ *             __uint(rule_1, TYPE_1 << 8 | SIZE_1);
+ *             __uint(rule_2, TYPE_2 << 8 | SIZE_2);
+ *             ...
+ *             __uint(rule_N, TYPE_N << 8 | SIZE_N);
+ *     };
+ *
+ * For example,
+ *
+ *     struct {
+ *             __uint(n_rules, 4);
+ *             __uint(saddr, BPF_WILDCARD_RULE_PREFIX << 8 | 4);
+ *             __uint(daddr, BPF_WILDCARD_RULE_PREFIX << 8 | 4);
+ *             __uint(daddr, BPF_WILDCARD_RULE_RANGE << 8 | 2);
+ *             __uint(daddr, BPF_WILDCARD_RULE_RANGE << 8 | 2);
+ *     };
+ *
+ * We parse it and allocate a new instance of 'struct wildcard_desc' which will
+ * be later used in all calls.
+ *
+ */
+static void *wildcard_desc(u32 btf_fd, u32 key_type_id, int numa_node)
+{
+	const struct btf_type *key_type;
+	const struct btf_member *m;
+	struct wildcard_desc *desc;
+	u32 btf_key_size;
+	const char *name;
+	struct btf *btf;
+	u32 n_rules, x;
+	u64 desc_size;
+	void *ret;
+	u16 vlen;
+	int i;
+
+	btf = btf_get_by_fd(btf_fd);
+	if (IS_ERR(btf))
+		return btf;
+	if (btf_is_kernel(btf)) {
+		btf_put(btf);
+		return ERR_PTR(-EACCES);
+	}
+
+	key_type = btf_type_id_size(btf, &key_type_id, &btf_key_size);
+	if (!key_type) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	m = btf_members(key_type);
+
+	name = btf_name_by_offset(btf, m->name_off);
+	if (!name || strcmp(name, "n_rules") || btf_get_int(btf, m, &n_rules)) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	vlen = btf_vlen(key_type);
+	if (vlen != n_rules + 1) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	desc_size = sizeof(*desc) + n_rules * sizeof(desc->rule_desc[0]);
+	desc = bpf_map_area_alloc(desc_size, numa_node);
+	if (!desc) {
+		ret = ERR_PTR(-ENOMEM);
+		goto put_btf;
+	}
+	desc->n_rules = n_rules;
+
+	for (i = 1; i < vlen; i += 1) {
+		m++;
+
+		if (btf_get_int(btf, m, &x) || !validate_encoded_rule(x)) {
+			bpf_map_area_free(desc);
+			ret = ERR_PTR(-EINVAL);
+			goto put_btf;
+		}
+
+		desc->rule_desc[i].type = BPF_WILDCARD_RULE_TYPE(x);
+		desc->rule_desc[i].size = BPF_WILDCARD_RULE_SIZE(x);
+	}
+
+	ret = desc;
+
+put_btf:
+	btf_put(btf);
+	return desc;
+}
+
+static u32 wildcard_key_size(const struct wildcard_desc *desc)
+{
+	u32 key_size = sizeof(struct wildcard_key);
+	int i;
+
+	for (i = 0; i < desc->n_rules; i++) {
+		switch (desc->rule_desc[i].type) {
+		case BPF_WILDCARD_RULE_PREFIX:
+			key_size += desc->rule_desc[i].size + sizeof(u32);
+			break;
+		case BPF_WILDCARD_RULE_RANGE:
+			key_size += 2 * desc->rule_desc[i].size;
+			break;
+		case BPF_WILDCARD_RULE_MATCH:
+			key_size += desc->rule_desc[i].size;
+			break;
+		}
+	}
+
+	return key_size;
+}
+
 typedef struct {
-	u64 hi, lo;
+	u64 hi;
+	u64 lo;
 } u128;
 
 /* TYPE is one of u8, u16, u32 or u64 */
@@ -154,6 +352,7 @@ static inline int __match(const struct wildcard_desc *wc_desc,
 	return 1;
 }
 
+// XXX?
 static void patch_endianness(u8 *x, size_t size)
 {
 	size_t i;
@@ -272,7 +471,6 @@ struct wildcard_ops {
 };
 
 struct wcard_elem {
-
 	struct bpf_wildcard *wcard;
 
 	struct hlist_node node;
@@ -312,7 +510,10 @@ static inline bool wcard_use_raw_lock(const struct bpf_wildcard *wcard)
 }
 
 static struct wcard_elem *
-wcard_elem_alloc(struct bpf_wildcard *wcard, const void *key, void *value, void *l_old)
+wcard_elem_alloc(struct bpf_wildcard *wcard,
+		 const void *key,
+		 void *value,
+		 void *l_old)
 {
 	struct bpf_map *map = &wcard->map;
 	u32 key_size = map->key_size;
@@ -1404,18 +1605,17 @@ static void wildcard_map_free(struct bpf_map *map)
 
 	lockdep_unregister_key(&wcard->lockdep_key);
 	wcard->ops->free(wcard);
+	if (wcard->desc)
+		bpf_map_area_free(wcard->desc);
 	bpf_map_area_free(wcard);
 }
 
 static int wildcard_map_alloc_check(union bpf_attr *attr)
 {
 	struct wildcard_desc *desc = attr->map_extra_data;
-	struct wildcard_rule_desc *rule_desc;
 	unsigned int algorithm;
-	unsigned int i, j;
 	u64 flags_mask;
 	bool prealloc;
-	u32 tot_size;
 
 	if (!bpf_capable())
 		return -EPERM;
@@ -1429,6 +1629,8 @@ static int wildcard_map_alloc_check(union bpf_attr *attr)
 	    attr->value_size == 0)
 		return -EINVAL;
 
+	/* XXX: I can't check this here, because we do not know the key_size, yet */
+#if 0
 	if ((u64)attr->key_size + attr->value_size >= KMALLOC_MAX_SIZE -
 	   sizeof(struct wcard_elem))
 		/* if key_size + value_size is bigger, the user space won't be
@@ -1437,6 +1639,8 @@ static int wildcard_map_alloc_check(union bpf_attr *attr)
 		 * kmalloc-able later in wildcard_map_update_elem()
 		 */
 		return -E2BIG;
+	key_size = PAGE_SIZE;
+#endif
 
 	algorithm = BPF_WILDCARD_ALGORITHM(attr->map_extra);
 	if (algorithm >= BPF_WILDCARD_F_ALGORITHM_MAX)
@@ -1455,43 +1659,6 @@ static int wildcard_map_alloc_check(union bpf_attr *attr)
 	if (!desc || !desc->n_rules)
 		return -EINVAL;
 
-	tot_size = 0;
-	for (i = 0; i < !desc->n_rules; i++) {
-		rule_desc = &desc->rule_desc[i];
-
-		switch (rule_desc->type) {
-			case BPF_WILDCARD_RULE_PREFIX:
-			case BPF_WILDCARD_RULE_RANGE:
-			case BPF_WILDCARD_RULE_MATCH:
-				break;
-			default:
-				return -EINVAL;
-		}
-
-		switch (rule_desc->size) {
-			case 1:
-			case 2:
-			case 4:
-			case 8:
-				break;
-			case 16:
-				if (rule_desc->type == BPF_WILDCARD_RULE_RANGE)
-					return -EINVAL;
-				break;
-			default:
-				return -EINVAL;
-		}
-
-		tot_size += rule_desc->size;
-
-		for (j = 0; j < rule_desc->n_prefixes; j++) {
-			if (rule_desc->prefixes[j] > rule_desc->size)
-				return -EINVAL;
-		}
-	}
-	if (tot_size > BPF_WILDCARD_MAX_TOTAL_RULE_SIZE)
-		return -EINVAL;
-
 	return 0;
 }
 
@@ -1499,19 +1666,19 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 {
 	int numa_node = bpf_map_attr_numa_node(attr);
 	struct bpf_wildcard *wcard;
-	u64 data_size;
+	struct wildcard_desc *desc;
 	int err;
 
-	data_size = sizeof(*wcard) + attr->map_extra_data_size;
-	wcard = bpf_map_area_alloc(data_size, numa_node);
+	wcard = bpf_map_area_alloc(sizeof(*wcard), numa_node);
 	if (!wcard)
 		return ERR_PTR(-ENOMEM);
 
-	/* Copy and release the map_extra_data field */
-	wcard->desc = (void *)(wcard + 1);
-	memcpy(wcard->desc, attr->map_extra_data, attr->map_extra_data_size);
-	kfree(attr->map_extra_data);
-	attr->map_extra_data = 0;
+	desc = wildcard_desc(attr->btf_fd, attr->btf_key_type_id, numa_node);
+	if (IS_ERR(desc)) {
+		err = PTR_ERR(desc);
+		goto free_wcard;
+	}
+	wcard->desc = desc;
 
 	lockdep_register_key(&wcard->lockdep_key);
 
@@ -1520,6 +1687,7 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 	wcard->prealloc = !(wcard->map.map_flags & BPF_F_NO_PREALLOC);
 	wcard->priority = !!(attr->map_extra & BPF_WILDCARD_F_PRIORITY);
 
+	wcard->map.key_size = wildcard_key_size(wcard->desc);
 	wcard->elem_size = sizeof(struct wcard_elem) +
 			  round_up(wcard->map.key_size, 8) +
 			  round_up(wcard->map.value_size, 8);
