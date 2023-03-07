@@ -1005,7 +1005,8 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
 	/* Some maps allow key to be unspecified. */
 	if (btf_key_id) {
 		key_type = btf_type_id_size(btf, &btf_key_id, &key_size);
-		if (!key_type || key_size != map->key_size)
+		if (!key_type || (key_size != map->key_size &&
+				  map->map_type != BPF_MAP_TYPE_WILDCARD)) /* XXX */
 			return -EINVAL;
 	} else {
 		key_type = btf_type_by_id(btf, 0);
@@ -1105,31 +1106,6 @@ free_map_tab:
 	return ret;
 }
 
-static int copy_map_extra_data(union bpf_attr *attr, bool is_kernel)
-{
-	u32 size = attr->map_extra_data_size;
-	void *old = attr->map_extra_data;
-	void *new;
-
-	if (!size || size > 1024)
-		return -EINVAL;
-
-	/* released by map */
-	new = kzalloc(size, unlikely(is_kernel) ? GFP_KERNEL : GFP_USER);
-	if (!new)
-		return -ENOMEM;
-
-	if (unlikely(is_kernel)) {
-		memcpy(new, old, size);
-	} else if (copy_from_user(new, old, size)) {
-		kfree(new);
-		return -EFAULT;
-	}
-
-	attr->map_extra_data = new;
-	return 0;
-}
-
 #define BPF_MAP_CREATE_LAST_FIELD map_extra
 /* called via syscall */
 static int map_create(union bpf_attr *attr, bool is_kernel)
@@ -1169,12 +1145,6 @@ static int map_create(union bpf_attr *attr, bool is_kernel)
 	    ((unsigned int)numa_node >= nr_node_ids ||
 	     !node_online(numa_node)))
 		return -EINVAL;
-
-	if (attr->map_extra_data) {
-		err = copy_map_extra_data(attr, is_kernel);
-		if (err)
-			return err;
-	}
 
 	/* find map type and init map: hashtable vs rbtree vs bloom vs ... */
 	map = find_and_alloc_map(attr);

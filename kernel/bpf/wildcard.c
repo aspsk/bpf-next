@@ -170,15 +170,12 @@ static void *wildcard_desc(u32 btf_fd, u32 key_type_id, int numa_node)
 	}
 	desc->n_rules = n_rules;
 
-	for (i = 1; i < vlen; i += 1) {
-		m++;
-
-		if (btf_get_int(btf, m, &x) || !validate_encoded_rule(x)) {
+	for (i = 0; i < vlen - 1; i += 1) {
+		if (btf_get_int(btf, ++m, &x) || !validate_encoded_rule(x)) {
 			bpf_map_area_free(desc);
 			ret = ERR_PTR(-EINVAL);
 			goto put_btf;
 		}
-
 		desc->rule_desc[i].type = BPF_WILDCARD_RULE_TYPE(x);
 		desc->rule_desc[i].size = BPF_WILDCARD_RULE_SIZE(x);
 	}
@@ -187,7 +184,7 @@ static void *wildcard_desc(u32 btf_fd, u32 key_type_id, int numa_node)
 
 put_btf:
 	btf_put(btf);
-	return desc;
+	return ret;
 }
 
 static u32 wildcard_key_size(const struct wildcard_desc *desc)
@@ -1504,6 +1501,14 @@ static void tm_debug(struct bpf_wildcard *wcard)
 #endif
 
 static struct wildcard_ops wildcard_algorithms[BPF_WILDCARD_F_ALGORITHM_MAX] = {
+	/*
+	 * The Tuple Merge algorithm is a simplified version of the algorithm
+	 * presented in the following paper: Daly, J., Bruschi, V.,
+	 * Linguaglossa, L., Pontarelli, S., Rossi, D., Tollet, J., Torng, E.,
+	 * and Yourtchenko, A.,  2019. "TupleMerge: Fast Software Packet
+	 * Processing for Online Packet Classification." IEEE/ACM Transactions
+	 * on Networking, https://dx.doi.org/10.1109/TNET.2019.2920718
+	 */
 	[BPF_WILDCARD_F_ALGORITHM_TM] = {
 		.alloc = tm_alloc,
 		.free = tm_free,
@@ -1612,7 +1617,6 @@ static void wildcard_map_free(struct bpf_map *map)
 
 static int wildcard_map_alloc_check(union bpf_attr *attr)
 {
-	struct wildcard_desc *desc = attr->map_extra_data;
 	unsigned int algorithm;
 	u64 flags_mask;
 	bool prealloc;
@@ -1656,9 +1660,6 @@ static int wildcard_map_alloc_check(union bpf_attr *attr)
 	if (attr->map_extra & ~BPF_WILDCARD_F_ALGORITHM_MASK & ~flags_mask)
 		return -EINVAL;
 
-	if (!desc || !desc->n_rules)
-		return -EINVAL;
-
 	return 0;
 }
 
@@ -1672,6 +1673,9 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 	wcard = bpf_map_area_alloc(sizeof(*wcard), numa_node);
 	if (!wcard)
 		return ERR_PTR(-ENOMEM);
+
+	if (!attr->btf_fd)
+		return ERR_PTR(-EINVAL);
 
 	desc = wildcard_desc(attr->btf_fd, attr->btf_key_type_id, numa_node);
 	if (IS_ERR(desc)) {

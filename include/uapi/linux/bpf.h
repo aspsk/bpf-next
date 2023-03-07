@@ -187,11 +187,7 @@ struct wildcard_key {
 #define __BPF_WILDCARD_DATA_ELEM_4(TYPE, T, FIELD, ...) T FIELD; __BPF_WILDCARD_DATA_ELEM_3(__VA_ARGS__)
 #define __BPF_WILDCARD_DATA_ELEM_5(TYPE, T, FIELD, ...) T FIELD; __BPF_WILDCARD_DATA_ELEM_4(__VA_ARGS__)
 
-#define __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD, ...)	\
-	struct {					\
-		__uint(type, TYPE);			\
-		__uint(size, sizeof(T)); 		\
-	} FIELD
+#define __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD, ...) __uint(FIELD, (TYPE) << 8 | sizeof(T))
 
 #define __BPF_WILDCARD_RULE_DESC_1(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD)
 #define __BPF_WILDCARD_RULE_DESC_2(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD); __BPF_WILDCARD_RULE_DESC_1(__VA_ARGS__)
