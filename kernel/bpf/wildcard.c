@@ -439,9 +439,6 @@ struct bpf_wildcard {
 			union wildcard_lock tm_lock; /* one global lock to rule them all */
 
 			struct list_head tables_list_head;
-
-			bool static_tables_pool;
-			struct list_head tables_pool_list_head;
 		};
 	};
 };
@@ -826,16 +823,10 @@ static bool __tm_table_id_exists(struct list_head *head, u32 id)
 
 static u32 tm_new_table_id(struct bpf_wildcard *wcard, bool dynamic)
 {
-	struct list_head *head;
+	struct list_head *head = &wcard->tables_list_head;
 	u32 id;
 
-	if (dynamic)
-		head = &wcard->tables_list_head;
-	else
-		head = &wcard->tables_pool_list_head;
-
-	do
-		id = get_random_u32();
+	do id = get_random_u32();
 	while (__tm_table_id_exists(head, id));
 
 	return id;
@@ -895,38 +886,6 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 	return table;
 }
 
-static struct tm_table *tm_new_table_from_mask(struct bpf_wildcard *wcard,
-					       const u8 *prefixes,
-					       u32 n_prefixes, bool dynamic)
-{
-	struct tm_table *table;
-	u32 size;
-
-	BUG_ON(wcard->desc->n_rules != n_prefixes);
-
-	/*
-	 * struct tm_table | struct tm_mask | u8 prefixes[n_rules]
-	 *        \             ^       \           ^
-	 *         -------------|        -----------|
-	 */
-	size = sizeof(*table) + sizeof(struct tm_mask) + wcard->desc->n_rules;
-
-	table = bpf_map_kmalloc_node(&wcard->map, size,
-				     GFP_ATOMIC | __GFP_NOWARN,
-				     wcard->map.numa_node);
-	if (!table)
-		return NULL;
-
-	table->id = tm_new_table_id(wcard, dynamic);
-	table->mask = (struct tm_mask *)(table + 1);
-	atomic_set(&table->n_elements, 0);
-
-	table->mask->n_prefixes = wcard->desc->n_rules;
-	memcpy(table->mask->prefix, prefixes, table->mask->n_prefixes);
-
-	return table;
-}
-
 static int tm_table_compatible(const struct bpf_wildcard *wcard,
 			       const struct tm_table *table,
 			       const struct wildcard_key *key)
@@ -961,12 +920,7 @@ static int tm_table_compatible(const struct bpf_wildcard *wcard,
 	return 1;
 }
 
-static void tm_add_new_table(struct bpf_wildcard *wcard, struct tm_table *table)
-{
-	list_add_tail_rcu(&table->list, &wcard->tables_list_head);
-}
-
-static struct tm_table *tm_get_dynamic_table(struct bpf_wildcard *wcard,
+static struct tm_table *tm_find_table(struct bpf_wildcard *wcard,
 					     const struct wildcard_key *key)
 {
 	struct tm_table *table;
@@ -979,54 +933,9 @@ static struct tm_table *tm_get_dynamic_table(struct bpf_wildcard *wcard,
 	if (!table)
 		return ERR_PTR(-ENOMEM);
 
-	tm_add_new_table(wcard, table);
+	list_add_tail_rcu(&table->list, &wcard->tables_list_head);
+
 	return table;
-}
-
-static bool tm_same_table(struct tm_table *a, struct tm_table *b)
-{
-	BUG_ON(a->mask->n_prefixes != b->mask->n_prefixes);
-	return !memcmp(a->mask->prefix, b->mask->prefix, a->mask->n_prefixes);
-}
-
-static struct tm_table *tm_get_static_table(struct bpf_wildcard *wcard,
-					    const struct wildcard_key *key)
-{
-	struct tm_table *static_table, *table;
-	bool found = false;
-
-	/* Find a static table which is compatible with the key. This is
-	 * possible that the key doesn't fit into any static tables */
-	list_for_each_entry(static_table, &wcard->tables_pool_list_head, list)
-		if (tm_table_compatible(wcard, static_table, key)) {
-			found = true;
-			break;
-		}
-	if (!found)
-		return ERR_PTR(-EINVAL);
-
-	/* Check if this static_table is listed alerady in the active list */
-	list_for_each_entry(table, &wcard->tables_list_head, list)
-		if (tm_same_table(table, static_table))
-			return table;
-
-	table = tm_new_table_from_mask(wcard, static_table->mask->prefix,
-				       static_table->mask->n_prefixes, true);
-	if (!table)
-		return ERR_PTR(-ENOMEM);
-
-	tm_add_new_table(wcard, table);
-	return table;
-}
-
-static struct tm_table *tm_compatible_table(struct bpf_wildcard *wcard,
-					    const struct wildcard_key *key)
-{
-	if (wcard->static_tables_pool) {
-		return tm_get_static_table(wcard, key);
-	} else {
-		return tm_get_dynamic_table(wcard, key);
-	}
 }
 
 static inline int tm_lock(struct bpf_wildcard *wcard, unsigned long *pflags)
@@ -1063,7 +972,7 @@ static int __tm_update_elem(struct bpf_wildcard *wcard,
 	if (IS_ERR(l))
 		return PTR_ERR(l);
 
-	table = tm_compatible_table(wcard, key);
+	table = tm_find_table(wcard, key);
 	if (IS_ERR(table)) {
 		__wcard_elem_free(l);
 		return PTR_ERR(table);
@@ -1107,148 +1016,6 @@ static int __tm_delete_elem(struct bpf_wildcard *wcard,
 	}
 
 	return 0;
-}
-
-static int __tm_cmp_u8_descending(const void *a, const void *b)
-{
-	return (int)*(u8*)b - (int)*(u8*)a;
-}
-
-#define lengths(I)	wcard->desc->rule_desc[I].n_prefixes
-#define prefix(I, J)	((u8)(lengths(I) ? wcard->desc->rule_desc[I].prefixes[J] : 0))
-#define masks(I, J)	(*(u8*)(mask + (J) * m + I))
-
-static void *__tm_alloc_pool_cartesian(struct bpf_wildcard *wcard, u32 *np)
-{
-	u32 n, m = wcard->desc->n_rules;
-	void *mask;
-	int *idx;
-	u32 i, j;
-
-	/*
-	 * Each element in rule has an array prefixes[n_prefixes], and we need
-	 * to build a Cartesian product of theese arrays. Say, we have ([16,8],
-	 * [24,16], [], []). Then we construct the following Cartesian product:
-	 *   (16, 24, 0, 0)
-	 *   (8, 24, 0, 0)
-	 *   (16, 16, 0, 0)
-	 *   (8, 16, 0, 0)
-	 */
-
-	n = 1;
-	for (i = 0; i < m; i++) {
-		if (!lengths(i))
-			continue;
-		if (wcard->desc->rule_desc[i].type != BPF_WILDCARD_RULE_PREFIX)
-			return ERR_PTR(-EINVAL);
-
-		/* Prefixes should be sorted in descending order, otherwise
-		 * lower tables won't be ever reached */
-		sort(wcard->desc->rule_desc[i].prefixes, lengths(i),
-		     sizeof(wcard->desc->rule_desc[i].prefixes[0]),
-		     __tm_cmp_u8_descending, NULL);
-
-		n *= lengths(i);
-	}
-
-	mask = kzalloc(n * m + m * sizeof(*idx), GFP_USER);
-	if (!mask)
-		return ERR_PTR(-ENOMEM);
-
-	idx = mask + n * m;
-	for (j = 0; j < n; j++) {
-		for (i = 0; i < m; i++)
-			masks(i, j) = prefix(i, idx[i]);
-
-		i = 0;
-		idx[i]++;
-		while (idx[i] == lengths(i)) {
-			idx[i++] = 0;
-			if (lengths(i))
-				idx[i]++;
-		}
-	}
-
-	*np = n;
-	return mask;
-}
-
-static void *__tm_alloc_pool_list(struct bpf_wildcard *wcard, u32 *np)
-{
-	u32 n, m = wcard->desc->n_rules;
-	void *mask;
-	u32 i, j;
-
-	/*
-	 * Each element in rule has an array prefixes[n_prefixes], and we need
-	 * to build a combined list of theese arrays. Say, we have ([16,8],
-	 * [16,8], [], []). Then we construct the following list:
-	 *   (16, 16, 0, 0)
-	 *   (8, 8, 0, 0)
-	 */
-
-	n = 0;
-	for (i = 0; i < m; i++) {
-		if (!lengths(i))
-			continue;
-		if (wcard->desc->rule_desc[i].type != BPF_WILDCARD_RULE_PREFIX)
-			return ERR_PTR(-EINVAL);
-
-		/* We do not sort elements for lists because users might want
-		 * to specify pools like (32,32),(32,0),(0,32). If sorted,
-		 * then this will be interpreted as (32,32),(32,32),(0,0) */
-
-		/* All the lists should be of the same length, or empty */
-		if (n == 0)
-			n = lengths(i);
-		else if (n != lengths(i))
-			return ERR_PTR(-EINVAL);
-	}
-
-	mask = kzalloc(n * m, GFP_USER);
-	if (!mask)
-		return ERR_PTR(-ENOMEM);
-
-	for (i = 0; i < m; i++)
-		for (j = 0; j < n; j++)
-			masks(i, j) = prefix(i, j);
-
-	*np = n;
-	return mask;
-}
-
-#undef lengths
-#undef prefix
-#undef masks
-
-static int tm_alloc_static_tables_pool(struct bpf_wildcard *wcard,
-				       bool cartesian)
-{
-	u32 n, m = wcard->desc->n_rules;
-	struct tm_table *table;
-	int err = 0;
-	void *mask;
-	u32 j;
-
-	if (cartesian)
-		mask = __tm_alloc_pool_cartesian(wcard, &n);
-	else
-		mask = __tm_alloc_pool_list(wcard, &n);
-	if (IS_ERR(mask))
-		return PTR_ERR(mask);
-
-	for (j = 0; j < n; j++) {
-		table = tm_new_table_from_mask(wcard, mask + j * m, m, false);
-		if (!table) {
-			err = -ENOMEM;
-			goto free_mem;
-		}
-		list_add_tail(&table->list, &wcard->tables_pool_list_head);
-	}
-
-free_mem:
-	kfree(mask);
-	return err;
 }
 
 static int tm_update_elem(struct bpf_wildcard *wcard,
@@ -1342,16 +1109,11 @@ static void tm_free(struct bpf_wildcard *wcard)
 
 	list_for_each_entry_safe(table, n, &wcard->tables_list_head, list)
 		__tm_table_free(table);
-
-	if (wcard->static_tables_pool)
-		list_for_each_entry_safe(table, n, &wcard->tables_pool_list_head, list)
-			__tm_table_free(table);
 }
 
 static int tm_alloc(struct bpf_wildcard *wcard, const union bpf_attr *attr)
 {
 	unsigned int i;
-	int err;
 
 	wcard->n_buckets = roundup_pow_of_two(wcard->map.max_entries);
 	wcard->buckets = bpf_map_area_alloc(wcard->n_buckets *
@@ -1370,29 +1132,7 @@ static int tm_alloc(struct bpf_wildcard *wcard, const union bpf_attr *attr)
 	INIT_LIST_HEAD(&wcard->tables_list_head);
 	wcard_init_lock(wcard, &wcard->tm_lock);
 
-	/* this flag means that we need to pre-allocate a list of tables to
-	 * pull tables from; it should be provided by user. Otherwise we don't
-	 * know what to do. However, we can try to do two things: either
-	 * pre-allocate tables based on the field size / rule type (only
-	 * /prefix rules require a non-zero prefix), or to do a dynamic
-	 * allocation as in classic TM
-	 */
-	wcard->static_tables_pool = !!(attr->map_extra & BPF_WILDCARD_F_TM_STATIC_POOL);
-
-	if (wcard->static_tables_pool) {
-		INIT_LIST_HEAD(&wcard->tables_pool_list_head);
-		err = tm_alloc_static_tables_pool(wcard,
-						  !(attr->map_extra &
-						    BPF_WILDCARD_F_TM_POOL_LIST));
-		if (err)
-			goto free_buckets;
-	}
-
 	return 0;
-
-free_buckets:
-	bpf_map_area_free(wcard->buckets);
-	return err;
 }
 
 #ifdef __DEBUG
@@ -1452,14 +1192,6 @@ static void __tm_pr_tables(struct bpf_wildcard *wcard)
 			table->id, atomic_read(&table->n_elements),
 			__tm_pr_mask(table->mask, mask_buf));
 	}
-
-	if (wcard->static_tables_pool) {
-		list_for_each_entry(table, &wcard->tables_pool_list_head, list) {
-			pr_info("static table[%u]: id=%x, elements=%d, mask=%s\n", i++,
-					table->id, atomic_read(&table->n_elements),
-					__tm_pr_mask(table->mask, mask_buf));
-		}
-	}
 }
 
 static void __tm_pr_hash_table(struct bpf_wildcard *wcard)
@@ -1491,7 +1223,7 @@ static void __tm_pr_hash_table(struct bpf_wildcard *wcard)
 static void tm_debug(struct bpf_wildcard *wcard)
 {
 	pr_info("-- tuple merge map ------------\n");
-	pr_info("n_buckets=%d, static_tables_pool=%d", wcard->n_buckets, wcard->static_tables_pool);
+	pr_info("n_buckets=%d", wcard->n_buckets);
 	__tm_pr_desc(wcard);
 	__tm_pr_tables(wcard);
 	__tm_pr_hash_table(wcard);
@@ -1652,9 +1384,7 @@ static int wildcard_map_alloc_check(union bpf_attr *attr)
 
 	switch (algorithm) {
 	case BPF_WILDCARD_F_ALGORITHM_TM:
-		flags_mask = BPF_WILDCARD_F_PRIORITY |
-			     BPF_WILDCARD_F_TM_STATIC_POOL |
-			     BPF_WILDCARD_F_TM_POOL_LIST;
+		flags_mask = BPF_WILDCARD_F_PRIORITY;
 		break;
 	}
 	if (attr->map_extra & ~BPF_WILDCARD_F_ALGORITHM_MASK & ~flags_mask)

@@ -160,10 +160,6 @@ struct wildcard_key {
 /* generic flags */
 #define BPF_WILDCARD_F_PRIORITY		(1 << 8)  /* Sort rules by priority */
 
-/* per-algorithm flags */
-#define BPF_WILDCARD_F_TM_STATIC_POOL	(1 << 16) /* Specify the search tables */
-#define BPF_WILDCARD_F_TM_POOL_LIST	(1 << 17) /* Specify tables as list */
-
 #define __BPF_WILDCARD_DATA__BPF_WILDCARD_RULE_PREFIX(T, FIELD)	\
 	T FIELD;						\
 	__u32 FIELD ## _prefix
