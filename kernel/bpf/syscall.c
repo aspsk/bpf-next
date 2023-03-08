@@ -1133,10 +1133,6 @@ static int map_create(union bpf_attr *attr, bool is_kernel)
 	    attr->map_extra != 0)
 		return -EINVAL;
 
-	if (attr->map_type != BPF_MAP_TYPE_WILDCARD &&
-	    (attr->map_extra_data || attr->map_extra_data_size != 0))
-		return -EINVAL;
-
 	f_flags = bpf_get_file_flag(attr->map_flags);
 	if (f_flags < 0)
 		return f_flags;
@@ -1148,13 +1144,8 @@ static int map_create(union bpf_attr *attr, bool is_kernel)
 
 	/* find map type and init map: hashtable vs rbtree vs bloom vs ... */
 	map = find_and_alloc_map(attr);
-	if (IS_ERR(map)) {
-		err = PTR_ERR(map);
-		goto free_map_extra_data;
-	}
-
-	/* ->map_alloc should release and zero the attr->map_extra_data */
-	WARN_ON(attr->map_extra_data);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
 
 	err = bpf_obj_name_cpy(map->name, attr->map_name,
 			       sizeof(attr->map_name));
@@ -1240,8 +1231,6 @@ free_map_field_offs:
 free_map:
 	btf_put(map->btf);
 	map->ops->map_free(map);
-free_map_extra_data:
-	kfree(attr->map_extra_data);
 	return err;
 }
 

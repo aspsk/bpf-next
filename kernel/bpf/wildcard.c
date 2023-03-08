@@ -96,6 +96,8 @@ static bool validate_encoded_rule(u32 x)
 }
 
 /*
+ * XXX: outdated
+ *
  * The key BTF should have the following structure:
  *
  *     struct {
@@ -120,12 +122,12 @@ static bool validate_encoded_rule(u32 x)
  * be later used in all calls.
  *
  */
-static void *wildcard_desc(u32 btf_fd, u32 key_type_id, int numa_node)
+static void *wildcard_desc_from_btf(u32 btf_fd, u32 key_type_id, int numa_node)
 {
-	const struct btf_type *key_type;
+	const struct btf_array *desc_array;
+	const struct btf_type *type;
 	const struct btf_member *m;
 	struct wildcard_desc *desc;
-	u32 btf_key_size;
 	const char *name;
 	struct btf *btf;
 	u32 n_rules, x;
@@ -142,13 +144,45 @@ static void *wildcard_desc(u32 btf_fd, u32 key_type_id, int numa_node)
 		return ERR_PTR(-EACCES);
 	}
 
-	key_type = btf_type_id_size(btf, &key_type_id, &btf_key_size);
-	if (!key_type) {
+	type = btf_type_by_id(btf, key_type_id);
+	if (!type) {
 		ret = ERR_PTR(-EINVAL);
 		goto put_btf;
 	}
 
-	m = btf_members(key_type);
+	m = btf_members(type);
+
+	name = btf_name_by_offset(btf, m->name_off);
+	if (!name || strcmp(name, "desc")) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	type = btf_type_by_id(btf, m->type);
+	if (!type) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	// XXX: allow us the following variants: either desc[0] or plain desc or ptr to desc
+	if (BTF_INFO_KIND(type->info) != 3) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	desc_array = btf_array(type);
+	if (!desc_array) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	type = btf_type_by_id(btf, desc_array->type);
+	if (!type) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	m = btf_members(type);
 
 	name = btf_name_by_offset(btf, m->name_off);
 	if (!name || strcmp(name, "n_rules") || btf_get_int(btf, m, &n_rules)) {
@@ -156,7 +190,7 @@ static void *wildcard_desc(u32 btf_fd, u32 key_type_id, int numa_node)
 		goto put_btf;
 	}
 
-	vlen = btf_vlen(key_type);
+	vlen = btf_vlen(type);
 	if (vlen != n_rules + 1) {
 		ret = ERR_PTR(-EINVAL);
 		goto put_btf;
@@ -349,7 +383,7 @@ static inline int __match(const struct wildcard_desc *wc_desc,
 	return 1;
 }
 
-// XXX?
+// XXX? terrible
 static void patch_endianness(u8 *x, size_t size)
 {
 	size_t i;
@@ -1082,6 +1116,7 @@ find_first_elem:
 
 copy:
 	memcpy(next_key, l->key, wcard->map.key_size);
+	patch_key(wcard->desc, next_key); // XXX is this that terrible?
 	return 0;
 }
 
@@ -1407,7 +1442,7 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 	if (!attr->btf_fd)
 		return ERR_PTR(-EINVAL);
 
-	desc = wildcard_desc(attr->btf_fd, attr->btf_key_type_id, numa_node);
+	desc = wildcard_desc_from_btf(attr->btf_fd, attr->btf_key_type_id, numa_node);
 	if (IS_ERR(desc)) {
 		err = PTR_ERR(desc);
 		goto free_wcard;

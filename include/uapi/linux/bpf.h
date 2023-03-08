@@ -125,7 +125,7 @@ enum {
 };
 
 struct wildcard_rule_desc {
-        __u32 type;    		/* WILDCARD_RULE_{PREFIX,RANGE,MATCH} */
+        __u32 type;    		/* WILDCARD_RULE_{PREFIX,RANGE,MATCH} */ // XXX replace by flags, so that I can add flags like "ignore" or something like this, e.g., this is a question: do we want to ignore renages or not, this depends on the task
         __u32 size;    		/* the size of the field in bytes */
 
 	__u32 n_prefixes;
@@ -143,7 +143,7 @@ enum {
 };
 
 struct wildcard_key {
-	__u32 type;	/* WILDCARD_KEY_{RULE,ELEM} */
+	__u32 type;	/* WILDCARD_KEY_{RULE,ELEM} */ // XXX: replace by u64 "flags" ?
 	__u32 priority;	/* rule priority, when BPF_WILDCARD_F_PRIORITY is set */
 	__u8 data[];
 };
@@ -207,7 +207,13 @@ struct wildcard_key {
 
 #define BPF_WILDCARD_DESC_x(x, NAME, ...)						\
 											\
+	struct NAME ## _desc {								\
+		__uint(n_rules, x);							\
+		__BPF_WILDCARD_RULE_DESC_ ## x(__VA_ARGS__);				\
+	};										\
+											\
 	struct NAME ## _key {								\
+		struct NAME ## _desc desc[0];						\
 		__u32 type;								\
 		__u32 priority;								\
 		union {									\
@@ -218,12 +224,7 @@ struct wildcard_key {
 				__BPF_WILDCARD_DATA_ELEM_ ## x(__VA_ARGS__);		\
 			} __packed;							\
 		};									\
-	} __packed;									\
-											\
-	struct NAME ## _desc {								\
-		__uint(n_rules, x);							\
-		__BPF_WILDCARD_RULE_DESC_ ## x(__VA_ARGS__);				\
-	}
+	} __packed
 
 #define BPF_WILDCARD_DESC_1(...) BPF_WILDCARD_DESC_x(1, __VA_ARGS__)
 #define BPF_WILDCARD_DESC_2(...) BPF_WILDCARD_DESC_x(2, __VA_ARGS__)
@@ -1446,9 +1447,6 @@ union bpf_attr {
 						   * struct stored as the
 						   * map value
 						   */
-
-		void *map_extra_data;
-		__u32 map_extra_data_size;
 
 		/* Any per-map-type extra fields
 		 *
