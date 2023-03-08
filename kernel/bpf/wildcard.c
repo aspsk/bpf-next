@@ -15,25 +15,10 @@
 
 #include <asm/unaligned.h>
 
-struct wildcard_rule_desc {
-        __u32 type;    		/* WILDCARD_RULE_{PREFIX,RANGE,MATCH} */
-        __u32 size;    		/* the size of the field in bytes */
-};
-
-struct wildcard_desc {
-        __u32 n_rules;
-        struct wildcard_rule_desc rule_desc[];
-};
-
-#define BPF_WILDCARD_RULE_OFFSET 8
-
-#define BPF_WILDCARD_RULE(TYPE, SIZE) \
-	(BPF_WILDCARD_RULE_ ## TYPE << BPF_WILDCARD_RULE_OFFSET | (SIZE))
-
 #define BPF_WILDCARD_RULE_SIZE(X) ((X) & 0xff)
-#define BPF_WILDCARD_RULE_TYPE(X) (((X) >> BPF_WILDCARD_RULE_OFFSET) & 0xff)
+#define BPF_WILDCARD_RULE_TYPE(X) ((X) >> 8)
 
-#if 1 /* from libbpf */
+#if 1 /* XXX from libbpf */
 static inline bool btf_is_mod(const struct btf_type *t)
 {
 	__u16 kind = btf_kind(t);
@@ -83,26 +68,35 @@ static int btf_get_int(const struct btf *btf, const struct btf_member *m, u32 *r
 }
 #endif
 
-static bool validate_encoded_rule(u32 x)
+static bool parse_rule(u32 x, u32 *type_res, u32 *size_res)
 {
+	u32 type = BPF_WILDCARD_RULE_TYPE(x);
 	u32 size = BPF_WILDCARD_RULE_SIZE(x);
 
-	switch (BPF_WILDCARD_RULE_TYPE(x)) {
+	switch (type) {
 	case BPF_WILDCARD_RULE_PREFIX:
 	case BPF_WILDCARD_RULE_MATCH:
 		switch (size) {
 		case 1: case 2: case 4: case 8: case 16:
-			return true;
+			break;
+		default:
+			return false;
 		}
 		break;
 	case BPF_WILDCARD_RULE_RANGE:
 		switch (size) {
 		case 1: case 2: case 4: case 8:
-			return true;
+			break;
+		default:
+			return false;
 		}
 		break;
+	default:
+		return false;
 	}
-	return false;
+	*type_res = type;
+	*size_res = size;
+	return true;
 }
 
 /*
@@ -135,9 +129,9 @@ static bool validate_encoded_rule(u32 x)
 static void *wildcard_desc_from_btf(u32 btf_fd, u32 key_type_id, int numa_node)
 {
 	const struct btf_array *desc_array;
-	const struct btf_type *type;
 	const struct btf_member *m;
 	struct wildcard_desc *desc;
+	const struct btf_type *t;
 	const char *name;
 	struct btf *btf;
 	u32 n_rules, x;
@@ -149,18 +143,28 @@ static void *wildcard_desc_from_btf(u32 btf_fd, u32 key_type_id, int numa_node)
 	btf = btf_get_by_fd(btf_fd);
 	if (IS_ERR(btf))
 		return btf;
+
 	if (btf_is_kernel(btf)) {
 		btf_put(btf);
 		return ERR_PTR(-EACCES);
 	}
 
-	type = btf_type_by_id(btf, key_type_id);
-	if (!type) {
+	t = btf_type_by_id(btf, key_type_id);
+	if (!t) {
 		ret = ERR_PTR(-EINVAL);
 		goto put_btf;
 	}
 
-	m = btf_members(type);
+	if (BTF_INFO_KIND(t->info) != 4) {
+		ret = ERR_PTR(-EINVAL);
+		goto put_btf;
+	}
+
+	m = btf_members(t);
+	if (!m) {
+		ret = ERR_PTR(-ENOTBLK);
+		goto put_btf;
+	}
 
 	name = btf_name_by_offset(btf, m->name_off);
 	if (!name || strcmp(name, "desc")) {
@@ -168,31 +172,31 @@ static void *wildcard_desc_from_btf(u32 btf_fd, u32 key_type_id, int numa_node)
 		goto put_btf;
 	}
 
-	type = btf_type_by_id(btf, m->type);
-	if (!type) {
+	t = btf_type_by_id(btf, m->type);
+	if (!t) {
 		ret = ERR_PTR(-EINVAL);
 		goto put_btf;
 	}
 
 	// XXX: allow us the following variants: either desc[0] or plain desc or ptr to desc
-	if (BTF_INFO_KIND(type->info) != 3) {
+	if (BTF_INFO_KIND(t->info) != 3) {
 		ret = ERR_PTR(-EINVAL);
 		goto put_btf;
 	}
 
-	desc_array = btf_array(type);
+	desc_array = btf_array(t);
 	if (!desc_array) {
 		ret = ERR_PTR(-EINVAL);
 		goto put_btf;
 	}
 
-	type = btf_type_by_id(btf, desc_array->type);
-	if (!type) {
+	t = btf_type_by_id(btf, desc_array->type);
+	if (!t) {
 		ret = ERR_PTR(-EINVAL);
 		goto put_btf;
 	}
 
-	m = btf_members(type);
+	m = btf_members(t);
 
 	name = btf_name_by_offset(btf, m->name_off);
 	if (!name || strcmp(name, "n_rules") || btf_get_int(btf, m, &n_rules)) {
@@ -200,7 +204,7 @@ static void *wildcard_desc_from_btf(u32 btf_fd, u32 key_type_id, int numa_node)
 		goto put_btf;
 	}
 
-	vlen = btf_vlen(type);
+	vlen = btf_vlen(t);
 	if (vlen != n_rules + 1) {
 		ret = ERR_PTR(-EINVAL);
 		goto put_btf;
@@ -214,14 +218,15 @@ static void *wildcard_desc_from_btf(u32 btf_fd, u32 key_type_id, int numa_node)
 	}
 	desc->n_rules = n_rules;
 
+
 	for (i = 0; i < vlen - 1; i += 1) {
-		if (btf_get_int(btf, ++m, &x) || !validate_encoded_rule(x)) {
+		if (btf_get_int(btf, ++m, &x) ||
+		    !parse_rule(x, &desc->rule_desc[i].type,
+			           &desc->rule_desc[i].size)) {
 			bpf_map_area_free(desc);
 			ret = ERR_PTR(-EINVAL);
 			goto put_btf;
 		}
-		desc->rule_desc[i].type = BPF_WILDCARD_RULE_TYPE(x);
-		desc->rule_desc[i].size = BPF_WILDCARD_RULE_SIZE(x);
 	}
 
 	ret = desc;
@@ -229,28 +234,6 @@ static void *wildcard_desc_from_btf(u32 btf_fd, u32 key_type_id, int numa_node)
 put_btf:
 	btf_put(btf);
 	return ret;
-}
-
-static u32 wildcard_key_size(const struct wildcard_desc *desc)
-{
-	u32 key_size = sizeof(struct wildcard_key);
-	int i;
-
-	for (i = 0; i < desc->n_rules; i++) {
-		switch (desc->rule_desc[i].type) {
-		case BPF_WILDCARD_RULE_PREFIX:
-			key_size += desc->rule_desc[i].size + sizeof(u32);
-			break;
-		case BPF_WILDCARD_RULE_RANGE:
-			key_size += 2 * desc->rule_desc[i].size;
-			break;
-		case BPF_WILDCARD_RULE_MATCH:
-			key_size += desc->rule_desc[i].size;
-			break;
-		}
-	}
-
-	return key_size;
 }
 
 typedef struct {
@@ -363,21 +346,21 @@ static inline int __match_rule(const struct wildcard_rule_desc *desc,
 	return 0;
 }
 
-static inline int __match(const struct wildcard_desc *wc_desc,
+static inline int __match(const struct wildcard_desc *desc,
 			  const struct wildcard_key *rule,
 			  const struct wildcard_key *elem)
 {
 	u32 off_rule = 0, off_elem = 0;
 	u32 i, size;
 
-	for (i = 0; i < wc_desc->n_rules; i++) {
-		if (!__match_rule(&wc_desc->rule_desc[i],
+	for (i = 0; i < desc->n_rules; i++) {
+		if (!__match_rule(&desc->rule_desc[i],
 				  &rule->data[off_rule],
 				  &elem->data[off_elem]))
 			return 0;
 
-		size = wc_desc->rule_desc[i].size;
-		switch (wc_desc->rule_desc[i].type) {
+		size = desc->rule_desc[i].size;
+		switch (desc->rule_desc[i].type) {
 		case BPF_WILDCARD_RULE_PREFIX:
 			off_rule += size + sizeof(u32);
 			break;
@@ -406,14 +389,14 @@ static void patch_endianness(u8 *x, size_t size)
 	}
 }
 
-static void patch_key(struct wildcard_desc *wc_desc, void *key)
+static void patch_key(struct wildcard_desc *desc, void *key)
 {
 	u32 off = 0;
 	u32 i, size;
 
-	for (i = 0; i < wc_desc->n_rules; i++) {
-		size = wc_desc->rule_desc[i].size;
-		switch (wc_desc->rule_desc[i].type) {
+	for (i = 0; i < desc->n_rules; i++) {
+		size = desc->rule_desc[i].size;
+		switch (desc->rule_desc[i].type) {
 		case BPF_WILDCARD_RULE_PREFIX:
 			patch_endianness(key + 8 + off, size);
 			off += size + sizeof(u32);
@@ -492,7 +475,7 @@ struct wildcard_ops {
 		     const union bpf_attr *attr);
 	void (*free)(struct bpf_wildcard *wcard);
 	int (*get_next_key)(struct bpf_wildcard *wcard,
-			    const struct wildcard_key *key,
+			    struct wildcard_key *key,
 			    struct wildcard_key *next_key);
 	void *(*lookup)(const struct bpf_wildcard *wcard,
 			const struct wildcard_key *key);
@@ -502,7 +485,7 @@ struct wildcard_ops {
 			   const struct wildcard_key *key,
 			   void *value, u64 flags);
 	int (*delete_elem)(struct bpf_wildcard *wcard,
-			   const struct wildcard_key *key);
+			   struct wildcard_key *key);
 #ifdef __DEBUG
 	void (*debug)(struct bpf_wildcard *wcard);
 #endif
@@ -722,17 +705,19 @@ static u32 tm_hash_rule(const struct wildcard_desc *desc,
 		size = desc->rule_desc[i].size;
 
 		if (type == BPF_WILDCARD_RULE_RANGE ||
-		    (type == BPF_WILDCARD_RULE_PREFIX && !table->mask->prefix[i]))
+		    (type == BPF_WILDCARD_RULE_PREFIX &&
+		     !table->mask->prefix[i]))
 			goto ignore;
 
 		if (likely(type == BPF_WILDCARD_RULE_PREFIX))
-			__tm_copy_masked_rule(buf+n, data, size, table->mask->prefix[i]);
+			__tm_copy_masked_rule(buf+n, data, size,
+					      table->mask->prefix[i]);
 		else if (type == BPF_WILDCARD_RULE_MATCH)
 			memcpy(buf+n, data, size);
 
 		n += size;
 ignore:
-		switch (desc->rule_desc[i].type) {
+		switch (type) {
 		case BPF_WILDCARD_RULE_PREFIX:
 			data += size + sizeof(u32);
 			break;
@@ -763,11 +748,13 @@ static u32 tm_hash(const struct wildcard_desc *desc,
 		size = desc->rule_desc[i].size;
 
 		if (type == BPF_WILDCARD_RULE_RANGE ||
-		    (type == BPF_WILDCARD_RULE_PREFIX && !table->mask->prefix[i]))
+		    (type == BPF_WILDCARD_RULE_PREFIX &&
+		     !table->mask->prefix[i]))
 			goto ignore;
 
 		if (likely(type == BPF_WILDCARD_RULE_PREFIX))
-			__tm_copy_masked_elem(buf+n, data, size, table->mask->prefix[i]);
+			__tm_copy_masked_elem(buf+n, data, size,
+					      table->mask->prefix[i]);
 		else if (type == BPF_WILDCARD_RULE_MATCH)
 			memcpy(buf+n, data, size);
 
@@ -881,9 +868,10 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 				     bool circumcision, bool dynamic)
 {
 	struct tm_table *table;
+	u32 type, size;
 	u32 off = 0;
-	u32 size, i;
 	u32 prefix;
+	u32 i;
 
 	/*
 	 * struct tm_table | struct tm_mask | u8 prefixes[n_rules]
@@ -904,9 +892,10 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 
 	table->mask->n_prefixes = wcard->desc->n_rules;
 	for (i = 0; i < wcard->desc->n_rules; i++) {
+		type = wcard->desc->rule_desc[i].type;
 		size = wcard->desc->rule_desc[i].size;
 
-		switch (wcard->desc->rule_desc[i].type) {
+		switch (type) {
 		case BPF_WILDCARD_RULE_PREFIX:
 			prefix = *(u32 *)(key->data + off + size);
 			table->mask->prefix[i] = prefix;
@@ -934,14 +923,16 @@ static int tm_table_compatible(const struct bpf_wildcard *wcard,
 			       const struct tm_table *table,
 			       const struct wildcard_key *key)
 {
+	u32 type, size;
 	u32 off = 0;
-	u32 size, i;
 	u32 prefix;
+	u32 i;
 
 	for (i = 0; i < wcard->desc->n_rules; i++) {
+		type = wcard->desc->rule_desc[i].type;
 		size = wcard->desc->rule_desc[i].size;
 
-		switch (wcard->desc->rule_desc[i].type) {
+		switch (type) {
 		case BPF_WILDCARD_RULE_PREFIX:
 			prefix = *(u32 *)(key->data + off + size);
 
@@ -1078,10 +1069,12 @@ static int tm_update_elem(struct bpf_wildcard *wcard,
 }
 
 static int tm_delete_elem(struct bpf_wildcard *wcard,
-			  const struct wildcard_key *key)
+			  struct wildcard_key *key)
 {
 	unsigned long irq_flags;
 	int ret;
+
+	patch_key(wcard->desc, key);
 
 	ret = tm_lock(wcard, &irq_flags);
 	if (ret)
@@ -1092,7 +1085,7 @@ static int tm_delete_elem(struct bpf_wildcard *wcard,
 }
 
 static int tm_get_next_key(struct bpf_wildcard *wcard,
-			   const struct wildcard_key *key,
+			   struct wildcard_key *key,
 			   struct wildcard_key *next_key)
 {
 	struct tm_bucket *bucket;
@@ -1102,6 +1095,8 @@ static int tm_get_next_key(struct bpf_wildcard *wcard,
 
 	if (!key)
 		goto find_first_elem;
+
+	patch_key(wcard->desc, key); // XXX is this that terrible?
 
 	l = __tm_lookup(wcard, key, NULL, &bucket);
 	if (!l)
@@ -1325,13 +1320,13 @@ static void *wildcard_map_lookup_elem(struct bpf_map *map, void *key)
 		}
 		break;
 	default:
-		return ERR_PTR(-EINVAL);
+		return NULL;
 	}
 
 	if (l)
 		return l->key + round_up(wcard->map.key_size, 8);
 
-	return ERR_PTR(-ENOENT);
+	return NULL;
 }
 
 static int wildcard_map_update_elem(struct bpf_map *map, void *key,
@@ -1410,6 +1405,9 @@ static int wildcard_map_alloc_check(union bpf_attr *attr)
 	    attr->value_size == 0)
 		return -EINVAL;
 
+	if (!attr->btf_fd)
+		return -EINVAL;
+
 	/* XXX: I can't check this here, because we do not know the key_size, yet */
 #if 0
 	if ((u64)attr->key_size + attr->value_size >= KMALLOC_MAX_SIZE -
@@ -1445,12 +1443,11 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 	struct wildcard_desc *desc;
 	int err;
 
-	wcard = bpf_map_area_alloc(sizeof(*wcard), numa_node);
+	wcard = bpf_map_area_alloc(sizeof(*wcard), NUMA_NO_NODE);
 	if (!wcard)
 		return ERR_PTR(-ENOMEM);
 
-	if (!attr->btf_fd)
-		return ERR_PTR(-EINVAL);
+	bpf_map_init_from_attr(&wcard->map, attr);
 
 	desc = wildcard_desc_from_btf(attr->btf_fd, attr->btf_key_type_id, numa_node);
 	if (IS_ERR(desc)) {
@@ -1463,10 +1460,11 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 
 	bpf_map_init_from_attr(&wcard->map, attr);
 
-	wcard->prealloc = !(wcard->map.map_flags & BPF_F_NO_PREALLOC);
+	// XXX: implement this
+	//wcard->prealloc = !(wcard->map.map_flags & BPF_F_NO_PREALLOC);
+
 	wcard->priority = !!(attr->map_extra & BPF_WILDCARD_F_PRIORITY);
 
-	wcard->map.key_size = wildcard_key_size(wcard->desc);
 	wcard->elem_size = sizeof(struct wcard_elem) +
 			  round_up(wcard->map.key_size, 8) +
 			  round_up(wcard->map.value_size, 8);
@@ -1476,12 +1474,15 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 
 	err = wcard->ops->alloc(wcard, attr);
 	if (err < 0)
-		goto free_wcard;
+		goto free_desc;
 
 	return &wcard->map;
 
+free_desc:
+	lockdep_unregister_key(&wcard->lockdep_key);
+	bpf_map_area_free(wcard->desc);
 free_wcard:
-	wildcard_map_free(&wcard->map);
+	bpf_map_area_free(wcard);
 	return ERR_PTR(err);
 }
 

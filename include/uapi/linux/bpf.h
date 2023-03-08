@@ -124,28 +124,39 @@ enum {
         BPF_WILDCARD_RULE_MATCH,
 };
 
+struct wildcard_rule_desc {
+        __u32 type;	/* WILDCARD_RULE_{PREFIX,RANGE,MATCH} */
+        __u32 size;	/* the size of the field in bytes */
+};
+
+struct wildcard_desc {
+        __u32 n_rules;
+        struct wildcard_rule_desc rule_desc[];
+};
+
 enum {
 	BPF_WILDCARD_KEY_RULE = 0,
 	BPF_WILDCARD_KEY_ELEM,
 };
 
 struct wildcard_key {
-	__u32 type;	/* WILDCARD_KEY_{RULE,ELEM} */ // XXX: replace by u64 "flags" ?
-	__u32 priority;	/* rule priority, when BPF_WILDCARD_F_PRIORITY is set */
+	__u32 type;	/* WILDCARD_KEY_{RULE,ELEM} */
+	__u32 priority;	/* priority, when BPF_WILDCARD_F_PRIORITY is set */
 	__u8 data[];
 };
 
+// XXX: how do we enforce it?
 /* Max total rule size. For example, for IPv6 4-tuple the size is (16+2)*2=36 */
 #define BPF_WILDCARD_MAX_TOTAL_RULE_SIZE 128
 
-/* Wildcard map algorithm selection */
+/* Wildcard map algorithm selection, set via map_extra */
 #define BPF_WILDCARD_F_ALGORITHM_TM	0
 #define BPF_WILDCARD_F_ALGORITHM_MAX	1
 #define BPF_WILDCARD_F_ALGORITHM_MASK	0xff
 #define BPF_WILDCARD_ALGORITHM(flags)	(flags & BPF_WILDCARD_F_ALGORITHM_MASK)
 
-/* generic flags */
-#define BPF_WILDCARD_F_PRIORITY		(1 << 8)  /* Sort rules by priority */
+/* generic wildcard map flags, set via map_extra */
+#define BPF_WILDCARD_F_PRIORITY		(1 << 8)
 
 #define __BPF_WILDCARD_DATA__BPF_WILDCARD_RULE_PREFIX(T, FIELD)	\
 	T FIELD;						\
@@ -177,20 +188,6 @@ struct wildcard_key {
 #define __BPF_WILDCARD_RULE_DESC_3(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD); __BPF_WILDCARD_RULE_DESC_2(__VA_ARGS__)
 #define __BPF_WILDCARD_RULE_DESC_4(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD); __BPF_WILDCARD_RULE_DESC_3(__VA_ARGS__)
 #define __BPF_WILDCARD_RULE_DESC_5(TYPE, T, FIELD, ...) __BPF_WILDCARD_RULE_DESC(TYPE, T, FIELD); __BPF_WILDCARD_RULE_DESC_4(__VA_ARGS__)
-
-#define __BPF_WILDCARD_TM_TABLE(PFX, N)      __uint(prefix ## N, PFX)
-#define __BPF_WILDCARD_TM_TABLES_1(PFX)      __BPF_WILDCARD_TM_TABLE(PFX, 1);
-#define __BPF_WILDCARD_TM_TABLES_2(PFX, ...) __BPF_WILDCARD_TM_TABLE(PFX, 2); __BPF_WILDCARD_TM_TABLES_1(__VA_ARGS__)
-#define __BPF_WILDCARD_TM_TABLES_3(PFX, ...) __BPF_WILDCARD_TM_TABLE(PFX, 3); __BPF_WILDCARD_TM_TABLES_2(__VA_ARGS__)
-#define __BPF_WILDCARD_TM_TABLES_4(PFX, ...) __BPF_WILDCARD_TM_TABLE(PFX, 4); __BPF_WILDCARD_TM_TABLES_3(__VA_ARGS__)
-
-#define BPF_WILDCARD_TM_TABLES_1(X, PFX)      struct { __BPF_WILDCARD_TM_TABLE(PFX, 1); } X
-#define BPF_WILDCARD_TM_TABLES_2(X, PFX, ...) struct { __BPF_WILDCARD_TM_TABLE(PFX, 2); __BPF_WILDCARD_TM_TABLES_1(__VA_ARGS__) } X
-#define BPF_WILDCARD_TM_TABLES_3(X, PFX, ...) struct { __BPF_WILDCARD_TM_TABLE(PFX, 3); __BPF_WILDCARD_TM_TABLES_2(__VA_ARGS__) } X
-#define BPF_WILDCARD_TM_TABLES_4(X, PFX, ...) struct { __BPF_WILDCARD_TM_TABLE(PFX, 4); __BPF_WILDCARD_TM_TABLES_3(__VA_ARGS__) } X
-#define BPF_WILDCARD_TM_TABLES_5(X, PFX, ...) struct { __BPF_WILDCARD_TM_TABLE(PFX, 5); __BPF_WILDCARD_TM_TABLES_4(__VA_ARGS__) } X
-
-#define BPF_WILDCARD_TM_OPTS(NAME, ...) struct NAME ## _opts { __VA_ARGS__ }
 
 #define BPF_WILDCARD_DESC_x(x, NAME, ...)						\
 											\

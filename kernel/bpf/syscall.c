@@ -1005,8 +1005,7 @@ static int map_check_btf(struct bpf_map *map, const struct btf *btf,
 	/* Some maps allow key to be unspecified. */
 	if (btf_key_id) {
 		key_type = btf_type_id_size(btf, &btf_key_id, &key_size);
-		if (!key_type || (key_size != map->key_size &&
-				  map->map_type != BPF_MAP_TYPE_WILDCARD)) /* XXX */
+		if (!key_type || key_size != map->key_size)
 			return -EINVAL;
 	} else {
 		key_type = btf_type_by_id(btf, 0);
