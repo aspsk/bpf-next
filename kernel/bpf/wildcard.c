@@ -449,7 +449,6 @@ struct bpf_wildcard {
 	struct wildcard_ops *ops;
 	struct wildcard_desc *desc;
 	bool prealloc;
-	bool priority;
 	int algorithm;
 	struct lock_class_key lockdep_key;
 
@@ -799,9 +798,11 @@ static struct wcard_elem *__tm_lookup(const struct bpf_wildcard *wcard,
 static void *tm_match(const struct bpf_wildcard *wcard,
 		      const struct wildcard_key *key)
 {
+	struct wcard_elem *l, *ret = NULL;
+	struct wildcard_key *curr_key;
 	struct tm_bucket *bucket;
 	struct tm_table *table;
-	struct wcard_elem *l;
+	u32 min_priority;
 	u32 hash;
 
 	list_for_each_entry_rcu(table, &wcard->tables_list_head, list) {
@@ -812,11 +813,16 @@ static void *tm_match(const struct bpf_wildcard *wcard,
 				continue;
 			if (l->table_id != table->id)
 				continue;
-			if (__match(wcard->desc, (void *)l->key, key))
-				return l;
+			curr_key = (void *)l->key;
+			if (__match(wcard->desc, curr_key, key)) {
+				if (!ret || min_priority > curr_key->priority) {
+					ret = l;
+					min_priority = curr_key->priority;
+				}
+			}
 		}
 	}
-	return NULL;
+	return ret;
 }
 static void *tm_lookup(const struct bpf_wildcard *wcard,
 		       const struct wildcard_key *key)
@@ -1427,7 +1433,7 @@ static int wildcard_map_alloc_check(union bpf_attr *attr)
 
 	switch (algorithm) {
 	case BPF_WILDCARD_F_ALGORITHM_TM:
-		flags_mask = BPF_WILDCARD_F_PRIORITY;
+		flags_mask = 0;
 		break;
 	}
 	if (attr->map_extra & ~BPF_WILDCARD_F_ALGORITHM_MASK & ~flags_mask)
@@ -1462,8 +1468,6 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 
 	// XXX: implement this
 	//wcard->prealloc = !(wcard->map.map_flags & BPF_F_NO_PREALLOC);
-
-	wcard->priority = !!(attr->map_extra & BPF_WILDCARD_F_PRIORITY);
 
 	wcard->elem_size = sizeof(struct wcard_elem) +
 			  round_up(wcard->map.key_size, 8) +

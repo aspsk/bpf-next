@@ -141,7 +141,7 @@ enum {
 
 struct wildcard_key {
 	__u32 type;	/* WILDCARD_KEY_{RULE,ELEM} */
-	__u32 priority;	/* priority, when BPF_WILDCARD_F_PRIORITY is set */
+	__u32 priority;	/* priority, 0 is the top */
 	__u8 data[];
 };
 
@@ -154,9 +154,6 @@ struct wildcard_key {
 #define BPF_WILDCARD_F_ALGORITHM_MAX	1
 #define BPF_WILDCARD_F_ALGORITHM_MASK	0xff
 #define BPF_WILDCARD_ALGORITHM(flags)	(flags & BPF_WILDCARD_F_ALGORITHM_MASK)
-
-/* generic wildcard map flags, set via map_extra */
-#define BPF_WILDCARD_F_PRIORITY		(1 << 8)
 
 #define __BPF_WILDCARD_DATA__BPF_WILDCARD_RULE_PREFIX(T, FIELD)	\
 	T FIELD;						\
