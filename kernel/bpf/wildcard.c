@@ -76,6 +76,7 @@ static bool parse_rule(u32 x, u32 *type_res, u32 *size_res)
 	switch (type) {
 	case BPF_WILDCARD_RULE_PREFIX:
 	case BPF_WILDCARD_RULE_MATCH:
+	case BPF_WILDCARD_RULE_WILDCARD_MATCH:
 		switch (size) {
 		case 1: case 2: case 4: case 8: case 16:
 			break;
@@ -320,6 +321,15 @@ __match_range(u32 size, const void *pmin, const void *pmax, const void *pelem)
 	return 0;
 }
 
+static inline bool __match_wildcard(u32 size, const void *rule, const void *elem)
+{
+	static const u8 zero[16] = {};
+
+	if (!memcmp(zero, rule, size))
+		return true;
+	return !memcmp(rule, elem, size);
+}
+
 static inline int __match_rule(const struct wildcard_rule_desc *desc,
 			       const void *rule, const void *elem)
 {
@@ -338,6 +348,8 @@ static inline int __match_rule(const struct wildcard_rule_desc *desc,
 			return __match_range(size, rule, rule+size, elem);
 		}
 		break;
+	case BPF_WILDCARD_RULE_WILDCARD_MATCH:
+		return __match_wildcard(size, rule, elem);
 	case BPF_WILDCARD_RULE_MATCH:
 		return !memcmp(rule, elem, size);
 	}
@@ -368,6 +380,7 @@ static inline int __match(const struct wildcard_desc *desc,
 			off_rule += 2 * size;
 			break;
 		case BPF_WILDCARD_RULE_MATCH:
+		case BPF_WILDCARD_RULE_WILDCARD_MATCH:
 			off_rule += size;
 			break;
 		}
@@ -407,6 +420,7 @@ static void patch_key(struct wildcard_desc *desc, void *key)
 			off += 2 * size;
 			break;
 		case BPF_WILDCARD_RULE_MATCH:
+		case BPF_WILDCARD_RULE_WILDCARD_MATCH:
 			off += size;
 			break;
 		}
@@ -704,14 +718,16 @@ static u32 tm_hash_rule(const struct wildcard_desc *desc,
 		size = desc->rule_desc[i].size;
 
 		if (type == BPF_WILDCARD_RULE_RANGE ||
-		    (type == BPF_WILDCARD_RULE_PREFIX &&
-		     !table->mask->prefix[i]))
+		    ((type == BPF_WILDCARD_RULE_PREFIX ||
+		      type == BPF_WILDCARD_RULE_WILDCARD_MATCH) &&
+		      !table->mask->prefix[i]))
 			goto ignore;
 
 		if (likely(type == BPF_WILDCARD_RULE_PREFIX))
 			__tm_copy_masked_rule(buf+n, data, size,
 					      table->mask->prefix[i]);
-		else if (type == BPF_WILDCARD_RULE_MATCH)
+		else if (type == BPF_WILDCARD_RULE_MATCH ||
+			 type == BPF_WILDCARD_RULE_WILDCARD_MATCH)
 			memcpy(buf+n, data, size);
 
 		n += size;
@@ -724,6 +740,7 @@ ignore:
 			data += 2 * size;
 			break;
 		case BPF_WILDCARD_RULE_MATCH:
+		case BPF_WILDCARD_RULE_WILDCARD_MATCH:
 			data += size;
 			break;
 		}
@@ -747,14 +764,16 @@ static u32 tm_hash(const struct wildcard_desc *desc,
 		size = desc->rule_desc[i].size;
 
 		if (type == BPF_WILDCARD_RULE_RANGE ||
-		    (type == BPF_WILDCARD_RULE_PREFIX &&
-		     !table->mask->prefix[i]))
+		    ((type == BPF_WILDCARD_RULE_PREFIX ||
+		      type == BPF_WILDCARD_RULE_WILDCARD_MATCH) &&
+		      !table->mask->prefix[i]))
 			goto ignore;
 
 		if (likely(type == BPF_WILDCARD_RULE_PREFIX))
 			__tm_copy_masked_elem(buf+n, data, size,
 					      table->mask->prefix[i]);
-		else if (type == BPF_WILDCARD_RULE_MATCH)
+		else if (type == BPF_WILDCARD_RULE_MATCH ||
+			 type == BPF_WILDCARD_RULE_WILDCARD_MATCH)
 			memcpy(buf+n, data, size);
 
 		n += size;
@@ -873,6 +892,7 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 				     const struct wildcard_key *key,
 				     bool circumcision, bool dynamic)
 {
+	static const u8 zero[16] = {};
 	struct tm_table *table;
 	u32 type, size;
 	u32 off = 0;
@@ -917,6 +937,17 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 			table->mask->prefix[i] = 0;
 			off += size;
 			break;
+		case BPF_WILDCARD_RULE_WILDCARD_MATCH:
+			if (!memcmp(zero, key->data + off, size))
+				table->mask->prefix[i] = 0;
+			else
+				/*
+				 * The actual prefix value is not used,
+				 * however, set it to proper value
+				 */
+				table->mask->prefix[i] = size * 8;
+			off += size;
+			break;
 		default:
 			BUG();
 		}
@@ -929,6 +960,7 @@ static int tm_table_compatible(const struct bpf_wildcard *wcard,
 			       const struct tm_table *table,
 			       const struct wildcard_key *key)
 {
+	static const u8 zero[16] = {};
 	u32 type, size;
 	u32 off = 0;
 	u32 prefix;
@@ -954,6 +986,11 @@ static int tm_table_compatible(const struct bpf_wildcard *wcard,
 			break;
 		case BPF_WILDCARD_RULE_MATCH:
 			/* ignore this case, table is always compatible */
+			off += size;
+			break;
+		case BPF_WILDCARD_RULE_WILDCARD_MATCH:
+			if (!memcmp(zero, key->data + off, size) != !table->mask->prefix[i])
+				return 0;
 			off += size;
 			break;
 		}
@@ -1204,6 +1241,8 @@ static const char *__type_to_str(int T)
 			return "BPF_WILDCARD_RULE_RANGE";
 		case BPF_WILDCARD_RULE_MATCH:
 			return "BPF_WILDCARD_RULE_MATCH";
+		case BPF_WILDCARD_RULE_WILDCARD_MATCH:
+			return "BPF_WILDCARD_RULE_WILDCARD_MATCH";
 	}
 
 	BUG();
