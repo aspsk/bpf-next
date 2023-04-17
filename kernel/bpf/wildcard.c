@@ -10,6 +10,7 @@
  * Transactions on Networking, https://dx.doi.org/10.1109/TNET.2019.2920718
  */
 
+#include <linux/bpf_mem_alloc.h>
 #include <linux/container_of.h>
 #include <linux/btf_ids.h>
 #include <linux/random.h>
@@ -36,11 +37,6 @@
 #define BPF_WILDCARD_MAX_TOTAL_HASH_SIZE  \
 	(BPF_WILDCARD_MAX_RULES * BPF_WILDCARD_MAX_RULE_SIZE)
 
-union wildcard_lock {
-	spinlock_t     lock;
-	raw_spinlock_t raw_lock;
-};
-
 #define __DEBUG
 
 struct tm_bucket {
@@ -57,15 +53,15 @@ struct tm_table {
 	struct list_head list;
 	struct tm_mask *mask;
 	int n_elements;
-	struct rcu_head rcu;
 	u32 id;
 };
 
 struct bpf_wildcard {
 	struct bpf_map map;
+	struct bpf_mem_alloc ma;
+	struct bpf_mem_alloc table_ma;
 	u32 elem_size;
 	struct wildcard_desc *desc;
-	bool prealloc;
 	struct lock_class_key lockdep_key;
 
 	/* currently, all map updates are protected by a single lock,
@@ -75,15 +71,16 @@ struct bpf_wildcard {
 	struct tm_bucket *buckets;
 	u32 n_buckets;
 
-	union wildcard_lock lock; /* one global lock to rule them all */
+	/* only one update at a time */
+	raw_spinlock_t raw_lock;
 	struct list_head tables_list_head;
+	int __percpu *map_locked;
 };
 
 struct wcard_elem {
 	struct bpf_wildcard *wcard;
 
 	struct hlist_node node;
-	struct rcu_head rcu;
 
 	u32 table_id;
 	u32 hash;
@@ -505,11 +502,6 @@ static int check_map_update_flags(void *l_old, u64 map_flags)
 	return 0;
 }
 
-static inline bool wcard_use_raw_lock(const struct bpf_wildcard *wcard)
-{
-	return (!IS_ENABLED(CONFIG_PREEMPT_RT) || wcard->prealloc);
-}
-
 static struct wcard_elem *wcard_elem_alloc(struct bpf_wildcard *wcard,
 					   const void *key,
 					   void *value,
@@ -523,8 +515,8 @@ static struct wcard_elem *wcard_elem_alloc(struct bpf_wildcard *wcard,
 		return ERR_PTR(-E2BIG);
 
 	wcard->count++;
-	l = bpf_map_kmalloc_node(map, wcard->elem_size,
-				 GFP_ATOMIC | __GFP_NOWARN, map->numa_node);
+
+	l = bpf_mem_cache_alloc(&wcard->ma);
 	if (unlikely(!l)) {
 		wcard->count--;
 		return ERR_PTR(-ENOMEM);
@@ -535,59 +527,10 @@ static struct wcard_elem *wcard_elem_alloc(struct bpf_wildcard *wcard,
 	return l;
 }
 
-static void __wcard_elem_free(struct wcard_elem *l)
+static void wcard_elem_free(struct bpf_wildcard *wcard, struct wcard_elem *l)
 {
-	l->wcard->count--;
-	kfree(l);
-}
-
-static void wcard_elem_free_rcu(struct rcu_head *head)
-{
-	struct wcard_elem *l = container_of(head, struct wcard_elem, rcu);
-
-	__wcard_elem_free(l);
-}
-
-static void wcard_elem_free(struct wcard_elem *l)
-{
-	call_rcu(&l->rcu, wcard_elem_free_rcu);
-}
-
-static inline void wcard_init_lock(struct bpf_wildcard *wcard,
-				   union wildcard_lock *lock)
-{
-	if (wcard_use_raw_lock(wcard)) {
-		raw_spin_lock_init(&lock->raw_lock);
-		lockdep_set_class(&lock->raw_lock, &wcard->lockdep_key);
-	} else {
-		spin_lock_init(&lock->lock);
-		lockdep_set_class(&lock->lock, &wcard->lockdep_key);
-	}
-}
-
-static inline int wcard_lock(struct bpf_wildcard *wcard,
-			     union wildcard_lock *lock,
-			     unsigned long *pflags)
-{
-	unsigned long flags;
-
-	if (wcard_use_raw_lock(wcard))
-		raw_spin_lock_irqsave(&lock->raw_lock, flags);
-	else
-		spin_lock_irqsave(&lock->lock, flags);
-	*pflags = flags;
-
-	return 0;
-}
-
-static inline void wcard_unlock(struct bpf_wildcard *wcard,
-				union wildcard_lock *lock,
-				unsigned long flags)
-{
-	if (wcard_use_raw_lock(wcard))
-		raw_spin_unlock_irqrestore(&lock->raw_lock, flags);
-	else
-		spin_unlock_irqrestore(&lock->lock, flags);
+	wcard->count--;
+	bpf_mem_cache_free(&wcard->ma, l);
 }
 
 static void __tm_copy_masked_rule(void *dst, const void *data, u32 size, u32 prefix)
@@ -820,21 +763,9 @@ static void *tm_lookup(const struct bpf_wildcard *wcard,
 	return __tm_lookup(wcard, key, NULL, NULL);
 }
 
-static void __tm_table_free(struct tm_table *table)
+static void tm_table_free(struct bpf_wildcard *wcard, struct tm_table *table)
 {
-	bpf_map_area_free(table);
-}
-
-static void tm_table_free_rcu(struct rcu_head *head)
-{
-	struct tm_table *table = container_of(head, struct tm_table, rcu);
-
-	__tm_table_free(table);
-}
-
-static void tm_table_free(struct tm_table *table)
-{
-	call_rcu(&table->rcu, tm_table_free_rcu);
+	bpf_mem_cache_free(&wcard->table_ma, table);
 }
 
 static bool __tm_table_id_exists(struct list_head *head, u32 id)
@@ -859,6 +790,16 @@ static u32 tm_new_table_id(struct bpf_wildcard *wcard, bool dynamic)
 	return id;
 }
 
+static size_t tm_table_size(struct bpf_wildcard *wcard)
+{
+	/*
+	 * struct tm_table | struct tm_mask | u8 prefixes[n_rules]
+	 *        \             ^       \           ^
+	 *         -------------|        -----------|
+	 */
+	return sizeof(struct tm_table) + sizeof(struct tm_mask) + wcard->desc->n_rules;
+}
+
 static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 				     const struct wildcard_key *key,
 				     bool circumcision, bool dynamic)
@@ -870,16 +811,7 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 	u32 prefix;
 	u32 i;
 
-	/*
-	 * struct tm_table | struct tm_mask | u8 prefixes[n_rules]
-	 *        \             ^       \           ^
-	 *         -------------|        -----------|
-	 */
-	size = sizeof(*table) + sizeof(struct tm_mask) + wcard->desc->n_rules;
-
-	table = bpf_map_kmalloc_node(&wcard->map, size,
-				     GFP_ATOMIC | __GFP_NOWARN,
-				     wcard->map.numa_node);
+	table = bpf_mem_cache_alloc(&wcard->table_ma);
 	if (!table)
 		return NULL;
 
@@ -1021,7 +953,7 @@ static int __tm_update_elem(struct bpf_wildcard *wcard,
 
 	table = tm_find_table(wcard, key);
 	if (IS_ERR(table)) {
-		__wcard_elem_free(l);
+		wcard_elem_free(wcard, l);
 		return PTR_ERR(table);
 	}
 
@@ -1048,16 +980,45 @@ static int __tm_delete_elem(struct bpf_wildcard *wcard,
 		return -ENOENT;
 
 	hlist_del_rcu(&elem->node);
-	wcard_elem_free(elem);
+	wcard_elem_free(wcard, elem);
 
 	bucket->n_elements -= 1;
 	table->n_elements -= 1;
 	if (table->n_elements == 0) {
 		list_del_rcu(&table->list);
-		tm_table_free(table);
+		tm_table_free(wcard, table);
 	}
 
 	return 0;
+}
+
+static int wildcard_lock(struct bpf_wildcard *wcard, unsigned long *irq_flags)
+{
+	unsigned long flags;
+
+	/*
+	 * We only expect this map to be locked from userspace, but this is
+	 * technically possible to use it from any context, so check that we
+	 * won't dedlock the same way this is done for hashtab (besides that
+	 * we allow only one lock per CPU)
+	 */
+	preempt_disable();
+	if (unlikely(__this_cpu_inc_return(*(wcard->map_locked)) != 1)) {
+		__this_cpu_dec(*(wcard->map_locked));
+		preempt_enable();
+		return -EBUSY;
+	}
+
+	raw_spin_lock_irqsave(&wcard->raw_lock, flags);
+	*irq_flags = flags;
+	return 0;
+}
+
+static void wildcard_unlock(struct bpf_wildcard *wcard, unsigned long irq_flags)
+{
+	raw_spin_unlock_irqrestore(&wcard->raw_lock, irq_flags);
+	__this_cpu_dec(*(wcard->map_locked));
+	preempt_enable();
 }
 
 static int tm_update_elem(struct bpf_wildcard *wcard,
@@ -1070,12 +1031,12 @@ static int tm_update_elem(struct bpf_wildcard *wcard,
 	if (key->type != BPF_WILDCARD_KEY_RULE)
 		return -EINVAL;
 
-	ret = wcard_lock(wcard, &wcard->lock, &irq_flags);
+	ret = wildcard_lock(wcard, &irq_flags);
 	if (ret)
 		return ret;
 	patch_key(wcard->desc, key);
 	ret = __tm_update_elem(wcard, key, value, flags);
-	wcard_unlock(wcard, &wcard->lock, irq_flags);
+	wildcard_unlock(wcard, irq_flags);
 	return ret;
 }
 
@@ -1088,12 +1049,12 @@ static int tm_delete_elem(struct bpf_wildcard *wcard,
 	if (!key || key->type != BPF_WILDCARD_KEY_RULE)
 		return -EINVAL;
 
-	ret = wcard_lock(wcard, &wcard->lock, &irq_flags);
+	ret = wildcard_lock(wcard, &irq_flags);
 	if (ret)
 		return ret;
 	patch_key(wcard->desc, key);
 	ret = __tm_delete_elem(wcard, key);
-	wcard_unlock(wcard, &wcard->lock, irq_flags);
+	wildcard_unlock(wcard, irq_flags);
 	return ret;
 }
 
@@ -1141,14 +1102,14 @@ copy:
 	return 0;
 }
 
-static void tm_free_bucket(struct tm_bucket *bucket)
+static void tm_free_bucket(struct bpf_wildcard *wcard, struct tm_bucket *bucket)
 {
 	struct hlist_node *n;
 	struct wcard_elem *l;
 
 	hlist_for_each_entry_safe(l, n, &bucket->head, node) {
 		hlist_del(&l->node);
-		__wcard_elem_free(l);
+		wcard_elem_free(wcard, l);
 	}
 }
 
@@ -1334,13 +1295,21 @@ static void wildcard_map_free(struct bpf_map *map)
 	wildcard_debug_free(wcard);
 #endif
 
+	free_percpu(wcard->map_locked);
+
+	/* It's called from a worker thread, so disable migration here,
+	 * since bpf_mem_cache_free() relies on that.
+	 */
+	migrate_disable();
 	for (i = 0; i < wcard->n_buckets; i++)
-		tm_free_bucket(&wcard->buckets[i]);
+		tm_free_bucket(wcard, &wcard->buckets[i]);
 	bpf_map_area_free(wcard->buckets);
-
 	list_for_each_entry_safe(table, n, &wcard->tables_list_head, list)
-		__tm_table_free(table);
+		tm_table_free(wcard, table);
+	migrate_enable();
 
+	bpf_mem_alloc_destroy(&wcard->ma);
+	bpf_mem_alloc_destroy(&wcard->table_ma);
 	lockdep_unregister_key(&wcard->lockdep_key);
 	bpf_map_area_free(wcard->desc);
 	bpf_map_area_free(wcard);
@@ -1348,8 +1317,6 @@ static void wildcard_map_free(struct bpf_map *map)
 
 static int wildcard_map_alloc_check(union bpf_attr *attr)
 {
-	bool prealloc;
-
 	if (!bpf_capable())
 		return -EPERM;
 
@@ -1357,10 +1324,9 @@ static int wildcard_map_alloc_check(union bpf_attr *attr)
 	    !bpf_map_flags_access_ok(attr->map_flags))
 		return -EINVAL;
 
-	/* not implemented, yet, sorry */
-	prealloc = !(attr->map_flags & BPF_F_NO_PREALLOC);
-	if (prealloc)
-		return -ENOTSUPP;
+       /* not implemented */
+       if (!(attr->map_flags & BPF_F_NO_PREALLOC))
+               return -ENOTSUPP;
 
 	if (attr->max_entries == 0 || attr->key_size == 0 ||
 	    attr->value_size == 0)
@@ -1403,8 +1369,6 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 	}
 	wcard->desc = desc;
 
-	wcard->prealloc = !(wcard->map.map_flags & BPF_F_NO_PREALLOC);
-
 	wcard->elem_size = sizeof(struct wcard_elem) +
 			  round_up(wcard->map.key_size, 8) +
 			  round_up(wcard->map.value_size, 8);
@@ -1417,16 +1381,38 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 		goto free_desc;
 	}
 
+	wcard->map_locked = bpf_map_alloc_percpu(&wcard->map,
+						 sizeof(int),
+						 sizeof(int),
+						 GFP_USER);
+	if (!wcard->map_locked)
+		goto free_buckets;
+
+	err = bpf_mem_alloc_init(&wcard->ma, wcard->elem_size, false);
+	if (err)
+		goto free_map_locked;
+
+	err = bpf_mem_alloc_init(&wcard->table_ma, tm_table_size(wcard), false);
+	if (err)
+		goto free_ma;
+
 	for (i = 0; i < wcard->n_buckets; i++) {
 		INIT_HLIST_HEAD(&wcard->buckets[i].head);
 		wcard->buckets[i].n_elements = 0;
 	}
 
 	INIT_LIST_HEAD(&wcard->tables_list_head);
-	wcard_init_lock(wcard, &wcard->lock);
+	raw_spin_lock_init(&wcard->raw_lock);
+	lockdep_set_class(&wcard->raw_lock, &wcard->lockdep_key);
 
 	return &wcard->map;
 
+free_ma:
+	bpf_mem_alloc_destroy(&wcard->ma);
+free_map_locked:
+	free_percpu(wcard->map_locked);
+free_buckets:
+	bpf_map_area_free(wcard->buckets);
 free_desc:
 	bpf_map_area_free(wcard->desc);
 free_wcard:
