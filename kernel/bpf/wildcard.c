@@ -41,6 +41,8 @@ union wildcard_lock {
 	raw_spinlock_t raw_lock;
 };
 
+#define __DEBUG
+
 struct tm_bucket {
 	struct hlist_head head;
 	atomic_t n_elements;
@@ -1202,12 +1204,115 @@ static int wildcard_map_get_next_key(struct bpf_map *map, void *key, void *next_
 	return tm_get_next_key(wcard, key, next_key);
 }
 
+#ifdef __DEBUG
+static const char *__tm_pr_mask(struct tm_mask *mask, char buf[])
+{
+	char *bufp = buf;
+	u32 i;
+
+	bufp += sprintf(bufp, "[%d](", mask->n_prefixes);
+
+	for (i = 0; i < mask->n_prefixes; i++)
+		bufp += sprintf(bufp, "%d%s", mask->prefix[i], i == mask->n_prefixes-1 ? ")" : ",");
+
+	return buf;
+}
+
+static const char *__type_to_str(int T)
+{
+	switch (T) {
+		case BPF_WILDCARD_RULE_PREFIX:
+			return "BPF_WILDCARD_RULE_PREFIX";
+		case BPF_WILDCARD_RULE_RANGE:
+			return "BPF_WILDCARD_RULE_RANGE";
+		case BPF_WILDCARD_RULE_MATCH:
+			return "BPF_WILDCARD_RULE_MATCH";
+		case BPF_WILDCARD_RULE_WILDCARD_MATCH:
+			return "BPF_WILDCARD_RULE_WILDCARD_MATCH";
+	}
+
+	BUG();
+	return "go away";
+}
+
+static void __tm_pr_desc(struct bpf_wildcard *wcard)
+{
+	u32 i;
+
+	if (!wcard->desc) {
+		BUG();
+	} else {
+		pr_info("WCARD DESC: n_rules=%u:", wcard->desc->n_rules);
+
+		for (i = 0; i < wcard->desc->n_rules; i++) {
+			pr_info("\trule_desc[%u]={type=%s, size=%u}", i,
+					__type_to_str(wcard->desc->rule_desc[i].type),
+					wcard->desc->rule_desc[i].size);
+		}
+	}
+}
+
+static void __tm_pr_tables(struct bpf_wildcard *wcard)
+{
+	struct tm_table *table;
+	unsigned int i = 0;
+	char mask_buf[64];
+
+	list_for_each_entry(table, &wcard->tables_list_head, list) {
+		pr_info("table[%u]: id=%x, elements=%d, mask=%s\n", i++,
+			table->id, atomic_read(&table->n_elements),
+			__tm_pr_mask(table->mask, mask_buf));
+	}
+}
+
+static void __tm_pr_hash_table(struct bpf_wildcard *wcard)
+{
+	unsigned int i, non_empty, printed;
+	struct tm_bucket *bucket;
+
+	non_empty = 0;
+	for (i = 0; i < wcard->n_buckets; i++) {
+		bucket = &wcard->buckets[i];
+		if (hlist_empty(&bucket->head))
+			continue;
+		non_empty += 1;
+	}
+
+	printed = 0;
+	for (i = 0; i < wcard->n_buckets; i++) {
+		bucket = &wcard->buckets[i];
+		if (hlist_empty(&bucket->head))
+			continue;
+
+		printed += 1;
+		if (printed < 5 || printed >= non_empty - 2)
+			pr_info("\tbucket[%u]: %d elements\n", i,
+				atomic_read(&wcard->buckets[i].n_elements));
+	}
+}
+
+static void wildcard_debug_free(struct bpf_wildcard *wcard)
+{
+	pr_info("-- tuple merge map ------------\n");
+	pr_info("n_buckets=%d", wcard->n_buckets);
+	__tm_pr_desc(wcard);
+	__tm_pr_tables(wcard);
+	__tm_pr_hash_table(wcard);
+	pr_info("\n");
+	pr_info("--end--\n");
+}
+#endif
+
 static void wildcard_map_free(struct bpf_map *map)
 {
 	struct bpf_wildcard *wcard =
 		container_of(map, struct bpf_wildcard, map);
 	struct tm_table *table, *n;
 	unsigned int i;
+
+#ifdef __DEBUG
+	wildcard_debug_free(wcard);
+#endif
 
 	for (i = 0; i < wcard->n_buckets; i++)
 		tm_free_bucket(&wcard->buckets[i]);
