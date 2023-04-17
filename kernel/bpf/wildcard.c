@@ -44,7 +44,7 @@ union wildcard_lock {
 
 struct tm_bucket {
 	struct hlist_head head;
-	atomic_t n_elements;
+	int n_elements;
 };
 
 struct tm_mask {
@@ -55,7 +55,7 @@ struct tm_mask {
 struct tm_table {
 	struct list_head list;
 	struct tm_mask *mask;
-	atomic_t n_elements;
+	int n_elements;
 	struct rcu_head rcu;
 	u32 id;
 };
@@ -884,7 +884,7 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 
 	table->id = tm_new_table_id(wcard, dynamic);
 	table->mask = (struct tm_mask *)(table + 1);
-	atomic_set(&table->n_elements, 0);
+	table->n_elements = 0;
 
 	table->mask->n_prefixes = wcard->desc->n_rules;
 	for (i = 0; i < wcard->desc->n_rules; i++) {
@@ -1028,8 +1028,8 @@ static int __tm_update_elem(struct bpf_wildcard *wcard,
 	bucket = &wcard->buckets[hash & (wcard->n_buckets - 1)];
 	l->hash = hash;
 	l->table_id = table->id;
-	atomic_inc(&table->n_elements);
-	atomic_inc(&bucket->n_elements);
+	table->n_elements += 1;
+	bucket->n_elements += 1;
 
 	hlist_add_head_rcu(&l->node, &bucket->head);
 	return 0;
@@ -1041,7 +1041,6 @@ static int __tm_delete_elem(struct bpf_wildcard *wcard,
 	struct tm_bucket *bucket;
 	struct wcard_elem *elem;
 	struct tm_table *table;
-	int n;
 
 	elem = __tm_lookup(wcard, key, &table, &bucket);
 	if (!elem)
@@ -1050,9 +1049,9 @@ static int __tm_delete_elem(struct bpf_wildcard *wcard,
 	hlist_del_rcu(&elem->node);
 	wcard_elem_free(elem);
 
-	atomic_dec(&bucket->n_elements);
-	n = atomic_dec_return(&table->n_elements);
-	if (n == 0) {
+	bucket->n_elements -= 1;
+	table->n_elements -= 1;
+	if (table->n_elements == 0) {
 		list_del_rcu(&table->list);
 		tm_table_free(table);
 	}
@@ -1261,7 +1260,7 @@ static void __tm_pr_tables(struct bpf_wildcard *wcard)
 
 	list_for_each_entry(table, &wcard->tables_list_head, list) {
 		pr_info("table[%u]: id=%x, elements=%d, mask=%s\n", i++,
-			table->id, atomic_read(&table->n_elements),
+			table->id, table->n_elements,
 			__tm_pr_mask(table->mask, mask_buf));
 	}
 }
@@ -1288,7 +1287,7 @@ static void __tm_pr_hash_table(struct bpf_wildcard *wcard)
 		printed += 1;
 		if (printed < 5 || printed >= non_empty - 2)
 			pr_info("\tbucket[%u]: %d elements\n", i,
-				atomic_read(&wcard->buckets[i].n_elements));
+				wcard->buckets[i].n_elements);
 	}
 }
 
@@ -1400,7 +1399,7 @@ static struct bpf_map *wildcard_map_alloc(union bpf_attr *attr)
 
 	for (i = 0; i < wcard->n_buckets; i++) {
 		INIT_HLIST_HEAD(&wcard->buckets[i].head);
-		atomic_set(&wcard->buckets[i].n_elements, 0);
+		wcard->buckets[i].n_elements = 0;
 	}
 
 	INIT_LIST_HEAD(&wcard->tables_list_head);
