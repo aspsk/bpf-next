@@ -13,6 +13,7 @@
 #include <linux/container_of.h>
 #include <linux/btf_ids.h>
 #include <linux/random.h>
+#include <linux/filter.h>
 #include <linux/jhash.h>
 #include <linux/sort.h>
 #include <linux/bpf.h>
@@ -1151,25 +1152,44 @@ static void tm_free_bucket(struct tm_bucket *bucket)
 	}
 }
 
-static void *wildcard_map_lookup_elem(struct bpf_map *map, void *key)
+static void *__wildcard_map_lookup_elem(struct bpf_map *map, void *key)
 {
 	struct bpf_wildcard *wcard =
 		container_of(map, struct bpf_wildcard, map);
-	struct wcard_elem *l;
 
 	switch (((struct wildcard_key *)key)->type) {
 	case BPF_WILDCARD_KEY_MATCH:
-		l = tm_match(wcard, key);
-		break;
+		return tm_match(wcard, key);
 	case BPF_WILDCARD_KEY_RULE:
-		l = tm_lookup(wcard, key);
-		break;
+		return tm_lookup(wcard, key);
 	default:
 		return NULL;
 	}
+}
+
+static void *wildcard_map_lookup_elem(struct bpf_map *map, void *key)
+{
+	struct wcard_elem *l = __wildcard_map_lookup_elem(map, key);
+
 	if (l)
-		return l->key + round_up(wcard->map.key_size, 8);
+		return l->key + round_up(map->key_size, 8);
+
 	return NULL;
+}
+
+static int wildcard_map_gen_lookup(struct bpf_map *map, struct bpf_insn *insn_buf)
+{
+	struct bpf_insn *insn = insn_buf;
+	const int ret = BPF_REG_0;
+
+	BUILD_BUG_ON(!__same_type(&__wildcard_map_lookup_elem,
+		     (void *(*)(struct bpf_map *map, void *key))NULL));
+	*insn++ = BPF_EMIT_CALL(__wildcard_map_lookup_elem);
+	*insn++ = BPF_JMP_IMM(BPF_JEQ, ret, 0, 1);
+	*insn++ = BPF_ALU64_IMM(BPF_ADD, ret,
+				offsetof(struct wcard_elem, key) +
+				round_up(map->key_size, 8));
+	return insn - insn_buf;
 }
 
 static long wildcard_map_update_elem(struct bpf_map *map, void *key,
@@ -1442,6 +1462,7 @@ const struct bpf_map_ops wildcard_map_ops = {
 	.map_alloc = wildcard_map_alloc,
 	.map_free = wildcard_map_free,
 	.map_lookup_elem = wildcard_map_lookup_elem,
+	.map_gen_lookup = wildcard_map_gen_lookup,
 	.map_update_elem = wildcard_map_update_elem,
 	.map_delete_elem = wildcard_map_delete_elem,
 	.map_get_next_key = wildcard_map_get_next_key,
