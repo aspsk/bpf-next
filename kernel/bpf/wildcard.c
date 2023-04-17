@@ -13,7 +13,7 @@
 #include <linux/container_of.h>
 #include <linux/btf_ids.h>
 #include <linux/random.h>
-#include <linux/xxhash.h>
+#include <linux/jhash.h>
 #include <linux/sort.h>
 #include <linux/bpf.h>
 #include <linux/err.h>
@@ -23,8 +23,7 @@
 #include <asm/unaligned.h>
 
 #define WILDCARD_CREATE_FLAG_MASK \
-	(BPF_F_NO_PREALLOC | BPF_F_NUMA_NODE | \
-	 BPF_F_ACCESS_MASK | BPF_F_ZERO_SEED)
+	(BPF_F_NO_PREALLOC | BPF_F_NUMA_NODE | BPF_F_ACCESS_MASK)
 
 /* Max number of rules */
 #define BPF_WILDCARD_MAX_RULES 9
@@ -666,7 +665,9 @@ static void __tm_copy_masked_elem(void *dst, const void *data, u32 size, u32 pre
 
 static inline u32 bpf_hash32(const void *key, u32 length, u32 initval)
 {
-       return xxh64(key, length, initval) >> 32;
+	if (likely(length % 4 == 0))
+		return jhash2(key, length / 4, initval);
+	return jhash(key, length, initval);
 }
 
 static u32 tm_hash_rule(const struct wildcard_desc *desc,
@@ -1172,8 +1173,8 @@ static void *wildcard_map_lookup_elem(struct bpf_map *map, void *key)
 	return NULL;
 }
 
-static int wildcard_map_update_elem(struct bpf_map *map, void *key,
-				    void *value, u64 map_flags)
+static long wildcard_map_update_elem(struct bpf_map *map, void *key,
+				     void *value, u64 map_flags)
 {
 	struct bpf_wildcard *wcard =
 		container_of(map, struct bpf_wildcard, map);
@@ -1188,7 +1189,7 @@ static int wildcard_map_update_elem(struct bpf_map *map, void *key,
 	return tm_update_elem(wcard, key, value, map_flags);
 }
 
-static int wildcard_map_delete_elem(struct bpf_map *map, void *key)
+static long wildcard_map_delete_elem(struct bpf_map *map, void *key)
 {
 	struct bpf_wildcard *wcard =
 		container_of(map, struct bpf_wildcard, map);
