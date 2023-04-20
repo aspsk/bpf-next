@@ -34,10 +34,8 @@
 #define BPF_WILDCARD_MAX_RULE_SIZE 16
 
 /* Max hash size in bytes: 144. An IPv6 5-tuple size is (16+2)*2+1=37 */
-#define BPF_WILDCARD_MAX_TOTAL_HASH_SIZE  \
+#define BPF_WILDCARD_MAX_TOTAL_HASH_SIZE \
 	(BPF_WILDCARD_MAX_RULES * BPF_WILDCARD_MAX_RULE_SIZE)
-
-#define __DEBUG
 
 struct tm_bucket {
 	struct hlist_head head;
@@ -444,9 +442,9 @@ static inline int __match(const struct wildcard_desc *desc,
 	return 1;
 }
 
-static void patch_endianness(u8 *x, size_t size)
-{
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+static void reverse_bytes(u8 *x, size_t size)
+{
 	size_t i;
 	u8 t;
 
@@ -455,7 +453,6 @@ static void patch_endianness(u8 *x, size_t size)
 		x[i] = x[size - 1 - i];
 		x[size - 1 - i] = t;
 	}
-#endif
 }
 
 /*
@@ -473,12 +470,12 @@ static void patch_key(struct wildcard_desc *desc, void *key)
 		size = desc->rule_desc[i].size;
 		switch (desc->rule_desc[i].type) {
 		case BPF_WILDCARD_RULE_PREFIX:
-			patch_endianness(key + 8 + off, size);
+			reverse_bytes(key + 8 + off, size);
 			off += size + sizeof(u32);
 			break;
 		case BPF_WILDCARD_RULE_RANGE:
-			patch_endianness(key + 8 + off, size);
-			patch_endianness(key + 8 + off + size, size);
+			reverse_bytes(key + 8 + off, size);
+			reverse_bytes(key + 8 + off + size, size);
 			off += 2 * size;
 			break;
 		case BPF_WILDCARD_RULE_MATCH:
@@ -488,6 +485,11 @@ static void patch_key(struct wildcard_desc *desc, void *key)
 		}
 	}
 }
+#else
+static inline void patch_key(struct wildcard_desc *desc __always_unused, void *key __always_unused)
+{
+}
+#endif
 
 static int check_map_update_flags(void *l_old, u64 map_flags)
 {
@@ -1185,104 +1187,7 @@ static int wildcard_map_get_next_key(struct bpf_map *map, void *key, void *next_
 	return tm_get_next_key(wcard, key, next_key);
 }
 
-#ifdef __DEBUG
-static const char *__tm_pr_mask(struct tm_mask *mask, char buf[])
-{
-	char *bufp = buf;
-	u32 i;
-
-	bufp += sprintf(bufp, "[%d](", mask->n_prefixes);
-
-	for (i = 0; i < mask->n_prefixes; i++)
-		bufp += sprintf(bufp, "%d%s", mask->prefix[i], i == mask->n_prefixes-1 ? ")" : ",");
-
-	return buf;
-}
-
-static const char *__type_to_str(int T)
-{
-	switch (T) {
-		case BPF_WILDCARD_RULE_PREFIX:
-			return "BPF_WILDCARD_RULE_PREFIX";
-		case BPF_WILDCARD_RULE_RANGE:
-			return "BPF_WILDCARD_RULE_RANGE";
-		case BPF_WILDCARD_RULE_MATCH:
-			return "BPF_WILDCARD_RULE_MATCH";
-		case BPF_WILDCARD_RULE_WILDCARD_MATCH:
-			return "BPF_WILDCARD_RULE_WILDCARD_MATCH";
-	}
-
-	BUG();
-	return "go away";
-}
-
-static void __tm_pr_desc(struct bpf_wildcard *wcard)
-{
-	u32 i;
-
-	if (!wcard->desc) {
-		BUG();
-	} else {
-		pr_info("WCARD DESC: n_rules=%u:", wcard->desc->n_rules);
-
-		for (i = 0; i < wcard->desc->n_rules; i++) {
-			pr_info("\trule_desc[%u]={type=%s, size=%u}", i,
-					__type_to_str(wcard->desc->rule_desc[i].type),
-					wcard->desc->rule_desc[i].size);
-		}
-	}
-}
-
-static void __tm_pr_tables(struct bpf_wildcard *wcard)
-{
-	struct tm_table *table;
-	unsigned int i = 0;
-	char mask_buf[64];
-
-	list_for_each_entry(table, &wcard->tables_list_head, list) {
-		pr_info("table[%u]: id=%x, elements=%d, mask=%s\n", i++,
-			table->id, table->n_elements,
-			__tm_pr_mask(table->mask, mask_buf));
-	}
-}
-
-static void __tm_pr_hash_table(struct bpf_wildcard *wcard)
-{
-	unsigned int i, non_empty, printed;
-	struct tm_bucket *bucket;
-
-	non_empty = 0;
-	for (i = 0; i < wcard->n_buckets; i++) {
-		bucket = &wcard->buckets[i];
-		if (hlist_empty(&bucket->head))
-			continue;
-		non_empty += 1;
-	}
-
-	printed = 0;
-	for (i = 0; i < wcard->n_buckets; i++) {
-		bucket = &wcard->buckets[i];
-		if (hlist_empty(&bucket->head))
-			continue;
-
-		printed += 1;
-		if (printed < 5 || printed >= non_empty - 2)
-			pr_info("\tbucket[%u]: %d elements\n", i,
-				wcard->buckets[i].n_elements);
-	}
-}
-
-static void wildcard_debug_free(struct bpf_wildcard *wcard)
-{
-	pr_info("-- tuple merge map ------------\n");
-	pr_info("n_buckets=%d", wcard->n_buckets);
-	__tm_pr_desc(wcard);
-	__tm_pr_tables(wcard);
-	__tm_pr_hash_table(wcard);
-	pr_info("\n");
-	pr_info("--end--\n");
-}
-#endif
+#include "wildcard-debug.c"
 
 static void wildcard_map_free(struct bpf_map *map)
 {
@@ -1291,9 +1196,7 @@ static void wildcard_map_free(struct bpf_map *map)
 	struct tm_table *table, *n;
 	unsigned int i;
 
-#ifdef __DEBUG
 	wildcard_debug_free(wcard);
-#endif
 
 	free_percpu(wcard->map_locked);
 
