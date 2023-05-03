@@ -12,6 +12,7 @@
 
 #include <linux/bpf_mem_alloc.h>
 #include <linux/container_of.h>
+#include <linux/list_sort.h>
 #include <linux/btf_ids.h>
 #include <linux/random.h>
 #include <linux/filter.h>
@@ -52,6 +53,7 @@ struct tm_table {
 	struct tm_mask *mask;
 	int n_elements;
 	u32 id;
+	u32 max_priority;
 };
 
 struct bpf_wildcard {
@@ -734,7 +736,7 @@ static void *tm_match(const struct bpf_wildcard *wcard,
 	struct wildcard_key *curr_key;
 	struct tm_bucket *bucket;
 	struct tm_table *table;
-	u32 min_priority;
+	u32 min_priority = 0xffffffff;
 	u32 hash;
 
 	list_for_each_entry_rcu(table, &wcard->tables_list_head, list) {
@@ -753,6 +755,8 @@ static void *tm_match(const struct bpf_wildcard *wcard,
 				}
 			}
 		}
+		if (min_priority <= table->max_priority)
+			break;
 	}
 	return ret;
 }
@@ -820,6 +824,7 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 	table->id = tm_new_table_id(wcard, dynamic);
 	table->mask = (struct tm_mask *)(table + 1);
 	table->n_elements = 0;
+	table->max_priority = 0xffffffff;
 
 	table->mask->n_prefixes = wcard->desc->n_rules;
 	for (i = 0; i < wcard->desc->n_rules; i++) {
@@ -831,7 +836,7 @@ static struct tm_table *tm_new_table(struct bpf_wildcard *wcard,
 			prefix = *(u32 *)(key->data + off + size);
 			table->mask->prefix[i] = prefix;
 			if (circumcision)
-				table->mask->prefix[i] -= prefix/8;
+				table->mask->prefix[i] -= min(4, (int)(prefix/8));
 			off += size + sizeof(u32);
 			break;
 		case BPF_WILDCARD_RULE_RANGE:
@@ -929,6 +934,28 @@ static struct tm_table *tm_find_table(struct bpf_wildcard *wcard,
 	return table;
 }
 
+static bool tm_table_update_priority(struct tm_table *table, __u32 priority)
+{
+	// doesn't support deletions, obviously
+	if (table->max_priority > priority) {
+		table->max_priority = priority;
+		return true;
+	}
+	return false;
+}
+
+static int tm_table_cmp(void *priv, const struct list_head *a, const struct list_head *b)
+{
+	struct tm_table *table_a = list_entry(a, struct tm_table, list);
+	struct tm_table *table_b = list_entry(b, struct tm_table, list);
+	return table_a->max_priority - table_b->max_priority;
+}
+
+static void tm_table_resort(struct bpf_wildcard *wcard)
+{
+	list_sort(NULL, &wcard->tables_list_head, tm_table_cmp);
+}
+
 static int __tm_update_elem(struct bpf_wildcard *wcard,
 			    const struct wildcard_key *key,
 			    void *value, u64 map_flags)
@@ -939,6 +966,12 @@ static int __tm_update_elem(struct bpf_wildcard *wcard,
 	struct wcard_elem *l;
 	u32 hash;
 	int ret;
+
+	// XXX do we distinguish keys with different priorities? (no)
+	// XXX we need to be able to update rule priority. Imagine:
+	//       update (prio=1, key=X)
+	//       update (prio=2, key=X)
+	// we will just update value in this case, not priority
 
 	l = __tm_lookup(wcard, key, NULL, NULL);
 	ret = check_map_update_flags(l, map_flags);
@@ -965,6 +998,12 @@ static int __tm_update_elem(struct bpf_wildcard *wcard,
 	l->table_id = table->id;
 	table->n_elements += 1;
 	bucket->n_elements += 1;
+
+	// XXX check if we need to update priority of the table
+	// XXX resort tables if priorities changed
+
+	if (tm_table_update_priority(table, ((struct wildcard_key*)l->key)->priority))
+		tm_table_resort(wcard);
 
 	hlist_add_head_rcu(&l->node, &bucket->head);
 	return 0;
@@ -1029,9 +1068,6 @@ static int tm_update_elem(struct bpf_wildcard *wcard,
 {
 	unsigned long irq_flags;
 	int ret;
-
-	if (key->type != BPF_WILDCARD_KEY_RULE)
-		return -EINVAL;
 
 	ret = wildcard_lock(wcard, &irq_flags);
 	if (ret)
@@ -1155,6 +1191,17 @@ static int wildcard_map_gen_lookup(struct bpf_map *map, struct bpf_insn *insn_bu
 	return insn - insn_buf;
 }
 
+static int key_sanity_check(struct bpf_wildcard *wcard, struct wildcard_key *key)
+{
+	if (key->type != BPF_WILDCARD_KEY_RULE)
+		return -EINVAL;
+
+	// XXX: check that prefix matches the binary value (e.g., reject "10.2.3.0/23" (because 24-th  bit is set)
+	// XXX: what elese?
+
+	return 0;
+}
+
 static long wildcard_map_update_elem(struct bpf_map *map, void *key,
 				     void *value, u64 map_flags)
 {
@@ -1163,6 +1210,9 @@ static long wildcard_map_update_elem(struct bpf_map *map, void *key,
 
 	if (unlikely((map_flags & ~BPF_F_LOCK) > BPF_EXIST))
 		/* unknown flags */
+		return -EINVAL;
+
+	if (key_sanity_check(wcard, key))
 		return -EINVAL;
 
 	WARN_ON_ONCE(!rcu_read_lock_held() && !rcu_read_lock_trace_held() &&

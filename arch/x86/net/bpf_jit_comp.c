@@ -253,7 +253,8 @@ struct jit_context {
 /* Number of bytes emit_patch() needs to generate instructions */
 #define X86_PATCH_SIZE		5
 /* Number of bytes that will be skipped on tailcall */
-#define X86_TAIL_CALL_OFFSET	(11 + ENDBR_INSN_SIZE)
+//#define X86_TAIL_CALL_OFFSET	(11 + ENDBR_INSN_SIZE)
+#define X86_TAIL_CALL_OFFSET	(0 + ENDBR_INSN_SIZE)
 
 static void push_callee_regs(u8 **pprog, bool *callee_regs_used)
 {
@@ -368,8 +369,10 @@ static int __bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
 		ret = t == BPF_MOD_CALL ?
 		      emit_call(&prog, old_addr, ip) :
 		      emit_jump(&prog, old_addr, ip);
-		if (ret)
+		if (ret) {
+			pr_warn("1");
 			return ret;
+		}
 	}
 
 	memcpy(new_insn, nop_insn, X86_PATCH_SIZE);
@@ -378,18 +381,26 @@ static int __bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
 		ret = t == BPF_MOD_CALL ?
 		      emit_call(&prog, new_addr, ip) :
 		      emit_jump(&prog, new_addr, ip);
-		if (ret)
+		if (ret) {
+			pr_warn("2");
 			return ret;
+		}
 	}
 
 	ret = -EBUSY;
 	mutex_lock(&text_mutex);
-	if (memcmp(ip, old_insn, X86_PATCH_SIZE))
+	if (memcmp(ip, old_insn, X86_PATCH_SIZE)) {
+		u8 *x1 = (u8*)ip;
+		u8 *x2 = (u8*)old_insn;
+		pr_warn("3: x1={%02x,%02x,%02x,%02x} x2={%02x,%02x,%02x,%02x}", x1[0], x1[1], x1[2], x1[3], x2[0], x2[1], x2[2], x2[3]);
 		goto out;
+	}
 	ret = 1;
 	if (memcmp(ip, new_insn, X86_PATCH_SIZE)) {
 		text_poke_bp(ip, new_insn, X86_PATCH_SIZE, NULL);
 		ret = 0;
+	} else {
+		pr_warn("4");
 	}
 out:
 	mutex_unlock(&text_mutex);
@@ -475,6 +486,8 @@ static void emit_bpf_tail_call_indirect(u8 **pprog, bool *callee_regs_used,
 	u8 *prog = *pprog, *start = *pprog;
 	int offset;
 
+	pr_warn("hello bitch\n");
+
 	/*
 	 * rdi - pointer to ctx
 	 * rsi - pointer to bpf_array
@@ -529,6 +542,7 @@ static void emit_bpf_tail_call_indirect(u8 **pprog, bool *callee_regs_used,
 	      offsetof(struct bpf_prog, bpf_func));
 	EMIT4(0x48, 0x83, 0xC1,                   /* add rcx, X86_TAIL_CALL_OFFSET */
 	      X86_TAIL_CALL_OFFSET);
+
 	/*
 	 * Now we're ready to jump into next BPF program
 	 * rdi == ctx (1st arg)
@@ -541,7 +555,7 @@ static void emit_bpf_tail_call_indirect(u8 **pprog, bool *callee_regs_used,
 	*pprog = prog;
 }
 
-static void emit_bpf_tail_call_direct(struct bpf_jit_poke_descriptor *poke,
+static void emit_bpf_tail_call_direct(struct bpf_prog *bbbprog, struct bpf_jit_poke_descriptor *poke,
 				      u8 **pprog, u8 *ip,
 				      bool *callee_regs_used, u32 stack_depth,
 				      struct jit_context *ctx)
@@ -549,6 +563,8 @@ static void emit_bpf_tail_call_direct(struct bpf_jit_poke_descriptor *poke,
 	int tcc_off = -4 - round_up(stack_depth, 8);
 	u8 *prog = *pprog, *start = *pprog;
 	int offset;
+
+	pr_warn("hello bitch direct: %s jited_len=%d\n", bbbprog->aux->name, bbbprog->jited_len);
 
 	/*
 	 * if (tail_call_cnt++ >= MAX_TAIL_CALL_CNT)
@@ -575,6 +591,9 @@ static void emit_bpf_tail_call_direct(struct bpf_jit_poke_descriptor *poke,
 	if (stack_depth)
 		EMIT3_off32(0x48, 0x81, 0xC4, round_up(stack_depth, 8));
 
+	//EMIT1(0x90);         /* nop1 */
+	EMIT1(0xC9);         /* leave */
+
 	memcpy(prog, x86_nops[5], X86_PATCH_SIZE);
 	prog += X86_PATCH_SIZE;
 
@@ -591,6 +610,8 @@ static void bpf_tail_call_direct_fixup(struct bpf_prog *prog)
 	struct bpf_prog *target;
 	int i, ret;
 
+	pr_warn("hello bitch direct fixup: prog->aux->name=%s\n", prog->aux->name);
+
 	for (i = 0; i < prog->aux->size_poke_tab; i++) {
 		poke = &prog->aux->poke_tab[i];
 		if (poke->aux && poke->aux != prog->aux)
@@ -601,10 +622,15 @@ static void bpf_tail_call_direct_fixup(struct bpf_prog *prog)
 		if (poke->reason != BPF_POKE_REASON_TAIL_CALL)
 			continue;
 
+		pr_warn("\t\tfixing up a tail call\n");
+
 		array = container_of(poke->tail_call.map, struct bpf_array, map);
 		mutex_lock(&array->aux->poke_mutex);
 		target = array->ptrs[poke->tail_call.key];
 		if (target) {
+
+			pr_warn("\t\tadj_off=%d\n", poke->adj_off);
+
 			ret = __bpf_arch_text_poke(poke->tailcall_target,
 						   BPF_MOD_JUMP, NULL,
 						   (u8 *)target->bpf_func +
@@ -615,6 +641,8 @@ static void bpf_tail_call_direct_fixup(struct bpf_prog *prog)
 						   (u8 *)poke->tailcall_target +
 						   X86_PATCH_SIZE, NULL);
 			BUG_ON(ret < 0);
+		} else {
+			pr_warn("\t\tdidn't find target");
 		}
 		WRITE_ONCE(poke->tailcall_target_stable, true);
 		mutex_unlock(&array->aux->poke_mutex);
@@ -1556,7 +1584,7 @@ st:			if (is_imm8(insn->off))
 
 		case BPF_JMP | BPF_TAIL_CALL:
 			if (imm32)
-				emit_bpf_tail_call_direct(&bpf_prog->aux->poke_tab[imm32 - 1],
+				emit_bpf_tail_call_direct(bpf_prog, &bpf_prog->aux->poke_tab[imm32 - 1],
 							  &prog, image + addrs[i - 1],
 							  callee_regs_used,
 							  bpf_prog->aux->stack_depth,
@@ -1849,6 +1877,19 @@ emit_jmp:
 		addrs[i] = proglen;
 		prog = temp;
 	}
+
+	/*XXX*/
+	if (image) {
+		EMIT1(0xC9); // leave for tail_call_tracable
+		//memcpy(prog, x86_nops[5], X86_PATCH_SIZE);
+		//prog += X86_PATCH_SIZE;
+		//EMIT1(0xC9); // leave for tail_call_tracable
+		EMIT1_off32(0xE9, -addrs[insn_cnt]-6);
+
+		memcpy(rw_image + proglen, temp, 6);
+	}
+	proglen += 6;
+	/*XXX*/
 
 	if (image && excnt != bpf_prog->aux->num_exentries) {
 		pr_err("extable is not populated\n");

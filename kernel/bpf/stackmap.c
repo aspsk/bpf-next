@@ -3,6 +3,7 @@
  */
 #include <linux/bpf.h>
 #include <linux/jhash.h>
+#include <linux/xxhash.h>
 #include <linux/filter.h>
 #include <linux/kernel.h>
 #include <linux/stacktrace.h>
@@ -229,6 +230,7 @@ static long __bpf_get_stackid(struct bpf_map *map,
 	trace_len = trace_nr * sizeof(u64);
 	ips = trace->ip + skip;
 	hash = jhash2((u32 *)ips, trace_len / sizeof(u32), 0);
+	hash2 = xxh3((u32 *)ips, trace_len / sizeof(u32), 0);
 	id = hash & (smap->n_buckets - 1);
 	bucket = READ_ONCE(smap->buckets[id]);
 

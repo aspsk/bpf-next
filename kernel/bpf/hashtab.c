@@ -605,12 +605,13 @@ free_htab:
 	return ERR_PTR(err);
 }
 
-static inline u32 htab_map_hash(const void *key, u32 key_len, u32 hashrnd)
-{
-	if (likely(key_len % 4 == 0))
-		return jhash2(key, key_len / 4, hashrnd);
-	return jhash(key, key_len, hashrnd);
-}
+	static inline u32
+	htab_map_hash(const void *key, u32 key_len, u32 hashrnd)
+	{
+		if (likely(key_len % 4 == 0 && key_len < 32))
+			return jhash2(key, key_len / 4, hashrnd);
+		return xxh3(key, key_len, hashrnd);
+	}
 
 static inline struct bucket *__select_bucket(struct bpf_htab *htab, u32 hash)
 {

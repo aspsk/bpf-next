@@ -136,7 +136,47 @@ static struct bpf_map *find_and_alloc_map(union bpf_attr *attr)
 		return map;
 	map->ops = ops;
 	map->map_type = type;
+
+	atomic64_set(&map->stats_lookup_ok, 0);
+	atomic64_set(&map->stats_lookup_ok_time, 0);
+	atomic64_set(&map->stats_lookup_fail, 0);
+	atomic64_set(&map->stats_lookup_fail_time, 0);
+	atomic64_set(&map->stats_update, 0);
+	atomic64_set(&map->stats_update_time, 0);
+	atomic64_set(&map->stats_delete, 0);
+	atomic64_set(&map->stats_delete_time, 0);
+
 	return map;
+}
+
+static __always_inline void *debug_lookup(struct bpf_map *map, void *key)
+{
+	u64 start, end;
+	void *ptr;
+
+	// XXX
+	// disable migrate
+	// disable preempt
+	// disable IRQ
+
+	start = ktime_get_mono_fast_ns();
+	ptr = map->ops->map_lookup_elem(map, key);
+	end = ktime_get_mono_fast_ns();
+
+	if (IS_ERR_OR_NULL(ptr)) {
+		atomic64_inc(&map->stats_lookup_fail);
+		atomic64_add(end - start, &map->stats_lookup_fail_time);
+	} else {
+		atomic64_inc(&map->stats_lookup_ok);
+		atomic64_add(end - start, &map->stats_lookup_ok_time);
+	}
+
+	// XXX
+	// enable IRQ
+	// enable preempt
+	// enable migrate
+
+	return ptr;
 }
 
 static void bpf_map_write_active_inc(struct bpf_map *map)
@@ -272,7 +312,7 @@ static int bpf_map_copy_value(struct bpf_map *map, void *key, void *value,
 		if (map->ops->map_lookup_elem_sys_only)
 			ptr = map->ops->map_lookup_elem_sys_only(map, key);
 		else
-			ptr = map->ops->map_lookup_elem(map, key);
+			ptr = debug_lookup(map, key);
 		if (IS_ERR(ptr)) {
 			err = PTR_ERR(ptr);
 		} else if (!ptr) {
@@ -4253,6 +4293,14 @@ static int bpf_map_get_info_by_fd(struct file *file,
 	info.max_entries = map->max_entries;
 	info.map_flags = map->map_flags;
 	info.map_extra = map->map_extra;
+	info.stats_lookup_ok =       atomic64_read(&map->stats_lookup_ok);
+	info.stats_lookup_ok_time =  atomic64_read(&map->stats_lookup_ok_time);
+	info.stats_lookup_fail =     atomic64_read(&map->stats_lookup_fail);
+	info.stats_lookup_fail_time= atomic64_read(&map->stats_lookup_fail_time);
+	info.stats_update=           atomic64_read(&map->stats_update);
+	info.stats_update_time=      atomic64_read(&map->stats_update_time);
+	info.stats_delete=           atomic64_read(&map->stats_delete);
+	info.stats_delete_time=      atomic64_read(&map->stats_delete_time);
 	memcpy(info.name, map->name, sizeof(map->name));
 
 	if (map->btf) {
