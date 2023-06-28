@@ -50,7 +50,7 @@ struct bpf_common_lru {
 	struct bpf_lru_locallist __percpu *local_list;
 };
 
-typedef bool (*del_from_htab_func)(void *arg, struct bpf_lru_node *node);
+typedef bool (*del_from_htab_func)(void *arg, struct bpf_lru_node *node, void *b);
 
 struct bpf_lru {
 	union {
@@ -78,7 +78,7 @@ int bpf_lru_init(struct bpf_lru *lru, bool percpu, u32 hash_offset,
 void bpf_lru_populate(struct bpf_lru *lru, void *buf, u32 node_offset,
 		      u32 elem_size, u32 nr_elems);
 void bpf_lru_destroy(struct bpf_lru *lru);
-struct bpf_lru_node *bpf_lru_pop_free(struct bpf_lru *lru, u32 hash);
+struct bpf_lru_node *bpf_lru_pop_free(struct bpf_lru *lru, u32 hash, void *b);
 void bpf_lru_push_free(struct bpf_lru *lru, struct bpf_lru_node *node);
 void bpf_lru_promote(struct bpf_lru *lru, struct bpf_lru_node *node);
 

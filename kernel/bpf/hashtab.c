@@ -154,6 +154,8 @@ static inline int htab_lock_bucket(const struct bpf_htab *htab,
 
 	hash = hash & min_t(u32, HASHTAB_MAP_LOCK_MASK, htab->n_buckets - 1);
 
+	//pr_err("trying to lock bucket %p\n", b);
+
 	preempt_disable();
 	if (unlikely(__this_cpu_inc_return(*(htab->map_locked[hash])) != 1)) {
 		__this_cpu_dec(*(htab->map_locked[hash]));
@@ -171,13 +173,14 @@ static inline void htab_unlock_bucket(const struct bpf_htab *htab,
 				      struct bucket *b, u32 hash,
 				      unsigned long flags)
 {
+	//pr_err("htab_unlock_bucket: unlocking bucket %p\n", b);
 	hash = hash & min_t(u32, HASHTAB_MAP_LOCK_MASK, htab->n_buckets - 1);
 	raw_spin_unlock_irqrestore(&b->raw_lock, flags);
 	__this_cpu_dec(*(htab->map_locked[hash]));
 	preempt_enable();
 }
 
-static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node);
+static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node, void *b);
 
 static bool htab_is_lru(const struct bpf_htab *htab)
 {
@@ -343,9 +346,9 @@ free_elems:
  * bucket_lock needs to be released first before acquiring lru_lock.
  */
 static struct htab_elem *prealloc_lru_pop(struct bpf_htab *htab, void *key,
-					  u32 hash)
+					  u32 hash, void *b)
 {
-	struct bpf_lru_node *node = bpf_lru_pop_free(&htab->lru, hash);
+	struct bpf_lru_node *node = bpf_lru_pop_free(&htab->lru, hash, b);
 	struct htab_elem *l;
 
 	if (node) {
@@ -818,7 +821,7 @@ static void check_and_free_fields(struct bpf_htab *htab,
 /* It is called from the bpf_lru_list when the LRU needs to delete
  * older elements from the htab.
  */
-static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node)
+static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node, void *locked_bucket)
 {
 	struct bpf_htab *htab = arg;
 	struct htab_elem *l = NULL, *tgt_l;
@@ -832,9 +835,12 @@ static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node)
 	b = __select_bucket(htab, tgt_l->hash);
 	head = &b->head;
 
-	ret = htab_lock_bucket(htab, b, tgt_l->hash, &flags);
-	if (ret)
-		return false;
+	if (locked_bucket != b) {
+		//pr_err("locking in htab_lru_map_delete_node: locked_bucket=%p, b=%p\n", locked_bucket, b);
+		ret = htab_lock_bucket(htab, b, tgt_l->hash, &flags);
+		if (ret)
+			return false;
+	}
 
 	hlist_nulls_for_each_entry_rcu(l, n, head, hash_node)
 		if (l == tgt_l) {
@@ -843,7 +849,8 @@ static bool htab_lru_map_delete_node(void *arg, struct bpf_lru_node *node)
 			break;
 		}
 
-	htab_unlock_bucket(htab, b, tgt_l->hash, flags);
+	if (locked_bucket != b)
+		htab_unlock_bucket(htab, b, tgt_l->hash, flags);
 
 	return l == tgt_l;
 }
@@ -1207,18 +1214,9 @@ static long htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value
 	b = __select_bucket(htab, hash);
 	head = &b->head;
 
-	/* For LRU, we need to alloc before taking bucket's
-	 * spinlock because getting free nodes from LRU may need
-	 * to remove older elements from htab and this removal
-	 * operation will need a bucket lock.
-	 */
-	l_new = prealloc_lru_pop(htab, key, hash);
-	if (!l_new)
-		return -ENOMEM;
-	copy_map_value(&htab->map,
-		       l_new->key + round_up(map->key_size, 8), value);
-
+	//pr_err("locking in htab_lru_map_update_elem: b=%p\n", b);
 	ret = htab_lock_bucket(htab, b, hash, &flags);
+	//pr_err("htab_lock_bucket returned %d\n", ret);
 	if (ret)
 		return ret;
 
@@ -1228,14 +1226,22 @@ static long htab_lru_map_update_elem(struct bpf_map *map, void *key, void *value
 	if (ret)
 		goto err;
 
-	/* add new element to the head of the list, so that
-	 * concurrent search will find it before old elem
-	 */
-	hlist_nulls_add_head_rcu(&l_new->hash_node, head);
 	if (l_old) {
-		bpf_lru_node_set_ref(&l_new->lru_node);
-		hlist_nulls_del_rcu(&l_old->hash_node);
+		//pr_err("\thtab->map=%p\n", &htab->map);
+		//pr_err("\tl_old->key=%p\n", l_old->key);
+		copy_map_value(&htab->map, l_old->key + round_up(map->key_size, 8), value);
+		bpf_lru_node_set_ref(&l_old->lru_node);
+	} else {
+		l_new = prealloc_lru_pop(htab, key, hash, b);
+		if (!l_new) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		copy_map_value(&htab->map,
+		       l_new->key + round_up(map->key_size, 8), value);
+		hlist_nulls_add_head_rcu(&l_new->hash_node, head);
 	}
+
 	ret = 0;
 
 err:
@@ -1243,8 +1249,6 @@ err:
 
 	if (ret)
 		htab_lru_push_free(htab, l_new);
-	else if (l_old)
-		htab_lru_push_free(htab, l_old);
 
 	return ret;
 }
@@ -1336,7 +1340,7 @@ static long __htab_lru_percpu_map_update_elem(struct bpf_map *map, void *key,
 	 * operation will need a bucket lock.
 	 */
 	if (map_flags != BPF_EXIST) {
-		l_new = prealloc_lru_pop(htab, key, hash);
+		l_new = prealloc_lru_pop(htab, key, hash, b);
 		if (!l_new)
 			return -ENOMEM;
 	}
