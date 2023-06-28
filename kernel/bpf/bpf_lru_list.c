@@ -7,8 +7,7 @@
 
 #include "bpf_lru_list.h"
 
-#define LOCAL_FREE_TARGET		(128)
-#define LOCAL_NR_SCANS			LOCAL_FREE_TARGET
+#define LOCAL_NR_SCANS			BPF_LRU_LOCAL_FREE_TARGET
 
 #define PERCPU_FREE_TARGET		(4)
 #define PERCPU_NR_SCANS			PERCPU_FREE_TARGET
@@ -332,12 +331,12 @@ static void bpf_lru_list_pop_free_to_local(struct bpf_lru *lru,
 				 list) {
 		__bpf_lru_node_move_to_free(l, node, local_free_list(loc_l),
 					    BPF_LRU_LOCAL_LIST_T_FREE);
-		if (++nfree == LOCAL_FREE_TARGET)
+		if (++nfree == BPF_LRU_LOCAL_FREE_TARGET)
 			break;
 	}
 
-	if (nfree < LOCAL_FREE_TARGET)
-		__bpf_lru_list_shrink(lru, l, LOCAL_FREE_TARGET - nfree,
+	if (nfree < BPF_LRU_LOCAL_FREE_TARGET)
+		__bpf_lru_list_shrink(lru, l, BPF_LRU_LOCAL_FREE_TARGET - nfree,
 				      local_free_list(loc_l),
 				      BPF_LRU_LOCAL_LIST_T_FREE);
 

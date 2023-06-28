@@ -217,15 +217,25 @@ static bool htab_has_extra_elems(struct bpf_htab *htab)
 	return !htab_is_percpu(htab) && !htab_is_lru(htab);
 }
 
-static void htab_free_prealloced_timers(struct bpf_htab *htab)
+static inline u32 htab_num_entries(struct bpf_htab *htab)
 {
 	u32 num_entries = htab->map.max_entries;
+
+	if (htab_has_extra_elems(htab))
+		num_entries += num_possible_cpus();
+	//else if (htab_is_lru(htab))
+		//num_entries += num_possible_cpus() * BPF_LRU_LOCAL_FREE_TARGET;
+
+	return num_entries;
+}
+
+static void htab_free_prealloced_timers(struct bpf_htab *htab)
+{
+	u32 num_entries = htab_num_entries(htab);
 	int i;
 
 	if (!btf_record_has_field(htab->map.record, BPF_TIMER))
 		return;
-	if (htab_has_extra_elems(htab))
-		num_entries += num_possible_cpus();
 
 	for (i = 0; i < num_entries; i++) {
 		struct htab_elem *elem;
@@ -238,13 +248,11 @@ static void htab_free_prealloced_timers(struct bpf_htab *htab)
 
 static void htab_free_prealloced_fields(struct bpf_htab *htab)
 {
-	u32 num_entries = htab->map.max_entries;
+	u32 num_entries = htab_num_entries(htab);
 	int i;
 
 	if (IS_ERR_OR_NULL(htab->map.record))
 		return;
-	if (htab_has_extra_elems(htab))
-		num_entries += num_possible_cpus();
 	for (i = 0; i < num_entries; i++) {
 		struct htab_elem *elem;
 
@@ -312,11 +320,8 @@ static struct htab_elem *prealloc_lru_pop(struct bpf_htab *htab, void *key,
 
 static int prealloc_init(struct bpf_htab *htab)
 {
-	u32 num_entries = htab->map.max_entries;
+	u32 num_entries = htab_num_entries(htab);
 	int err = -ENOMEM, i;
-
-	if (htab_has_extra_elems(htab))
-		num_entries += num_possible_cpus();
 
 	htab->elems = bpf_map_area_alloc((u64)htab->elem_size * num_entries,
 					 htab->map.numa_node);
@@ -2205,10 +2210,7 @@ static u64 htab_map_mem_usage(const struct bpf_map *map)
 	usage += sizeof(struct bucket) * htab->n_buckets;
 	usage += sizeof(int) * num_possible_cpus() * HASHTAB_MAP_LOCK_COUNT;
 	if (prealloc) {
-		num_entries = map->max_entries;
-		if (htab_has_extra_elems(htab))
-			num_entries += num_possible_cpus();
-
+		num_entries = htab_num_entries(htab);
 		usage += htab->elem_size * num_entries;
 
 		if (percpu)

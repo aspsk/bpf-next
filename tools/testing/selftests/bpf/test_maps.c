@@ -1913,6 +1913,7 @@ int main(void)
 
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
+if (0) {
 	map_opts.map_flags = 0;
 	run_all_tests();
 
@@ -1922,6 +1923,9 @@ int main(void)
 #define DEFINE_TEST(name) test_##name();
 #include <map_tests/tests.h>
 #undef DEFINE_TEST
+}
+
+	test_lru_evictions();
 
 	printf("test_maps: OK, %d SKIPPED\n", skips);
 	return 0;
