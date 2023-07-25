@@ -2,7 +2,7 @@
 /* Copyright (c) 2016 Facebook
  */
 #include <linux/bpf.h>
-#include <linux/jhash.h>
+#include <linux/xxhash.h>
 #include <linux/filter.h>
 #include <linux/kernel.h>
 #include <linux/stacktrace.h>
@@ -225,7 +225,7 @@ static long __bpf_get_stackid(struct bpf_map *map,
 	trace_nr = trace->nr - skip;
 	trace_len = trace_nr * sizeof(u64);
 	ips = trace->ip + skip;
-	hash = jhash2((u32 *)ips, trace_len / sizeof(u32), 0);
+	hash = xxh_combined(ips, trace_len, 0);
 	id = hash & (smap->n_buckets - 1);
 	bucket = READ_ONCE(smap->buckets[id]);
 
