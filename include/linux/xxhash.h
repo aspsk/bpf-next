@@ -130,6 +130,23 @@ static inline unsigned long xxhash(const void *input, size_t length,
 #endif
 }
 
+/*
+ * xxh_combined() - calculate wordsize hash of the input with a given seed
+ *
+ * @input:  The data to hash.
+ * @length: The length of the data to hash.
+ * @seed:   The seed can be used to alter the result predictably.
+ *
+ * This function is a combination of the XXH3 algorithm (for lengths <= 240)
+ * and the existing xxhash() function (for lengths > 240). The XXH3 performs
+ * way better for inputs of lengths <=240. For longer inputs the XXH3 algorithm
+ * assumes usage of vectorized instructions, and the scalar version performs
+ * slower than the older xxhash() algorithm.
+ *
+ * Return: wordsize hash of the data.
+ */
+unsigned long xxh_combined(const void *input, size_t length, u64 seed);
+
 /*-****************************
  * Streaming Hash Functions
  *****************************/
