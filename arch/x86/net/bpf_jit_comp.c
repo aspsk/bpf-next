@@ -1008,6 +1008,12 @@ static void emit_nops(u8 **pprog, int len)
 	*pprog = prog;
 }
 
+static __always_inline void copy_nops(u8 *dst, int len)
+{
+	BUILD_BUG_ON(len != 2 && len != 5);
+	memcpy(dst, x86_nops[len], len);
+}
+
 /* emit the 3-byte VEX prefix
  *
  * r: same as rex.r, extra bit for ModRM reg field
@@ -1078,6 +1084,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 {
 	bool tail_call_reachable = bpf_prog->aux->tail_call_reachable;
 	struct bpf_insn *insn = bpf_prog->insnsi;
+	struct bpf_static_branch *branch;
 	bool callee_regs_used[4] = {};
 	int insn_cnt = bpf_prog->len;
 	bool tail_call_seen = false;
@@ -1950,8 +1957,24 @@ emit_jmp:
 					}
 					emit_nops(&prog, INSN_SZ_DIFF - 2);
 				}
+				branch = bpf_static_branch_by_offset(bpf_prog, (i-1) * 8);
+				if (branch) {
+					branch->arch_jmp[0] = 0xEB;
+					branch->arch_jmp[1] = jmp_offset;
+					copy_nops(branch->arch_nop, 2);
+					branch->arch_len = 2;
+					branch->arch_offset = addrs[i-1];
+				}
 				EMIT2(0xEB, jmp_offset);
 			} else if (is_simm32(jmp_offset)) {
+				branch = bpf_static_branch_by_offset(bpf_prog, (i-1) * 8);
+				if (branch) {
+					branch->arch_jmp[0] = 0xE9;
+					memcpy(&branch->arch_jmp[1], &jmp_offset, 4);
+					copy_nops(branch->arch_nop, 5);
+					branch->arch_len = 5;
+					branch->arch_offset = addrs[i-1];
+				}
 				EMIT1_off32(0xE9, jmp_offset);
 			} else {
 				pr_err("jmp gen bug %llx\n", jmp_offset);
@@ -3024,4 +3047,9 @@ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp
 	return;
 #endif
 	WARN(1, "verification of programs using bpf_throw should have failed\n");
+}
+
+bool bpf_jit_supports_static_keys(void)
+{
+	return true;
 }

@@ -391,6 +391,13 @@ struct bpf_sec_def {
 	libbpf_prog_attach_fn_t prog_attach_fn;
 };
 
+struct static_branch_info {
+	struct bpf_map *map;
+	__u32 offset;
+	__u32 jump_target;
+	__u32 flags;
+};
+
 /*
  * bpf_prog should be a better name but it has been used in
  * linux/filter.h.
@@ -463,6 +470,9 @@ struct bpf_program {
 	__u32 line_info_rec_size;
 	__u32 line_info_cnt;
 	__u32 prog_flags;
+
+	struct static_branch_info *static_branches_info;
+	__u32 static_branches_info_size;
 };
 
 struct bpf_struct_ops {
@@ -493,6 +503,7 @@ struct bpf_struct_ops {
 #define KSYMS_SEC ".ksyms"
 #define STRUCT_OPS_SEC ".struct_ops"
 #define STRUCT_OPS_LINK_SEC ".struct_ops.link"
+#define STATIC_JUMPS_SEC ".jump_table"
 
 enum libbpf_map_type {
 	LIBBPF_MAP_UNSPEC,
@@ -624,6 +635,7 @@ struct elf_state {
 	Elf_Data *symbols;
 	Elf_Data *st_ops_data;
 	Elf_Data *st_ops_link_data;
+	Elf_Data *static_branches_data;
 	size_t shstrndx; /* section index for section name strings */
 	size_t strtabidx;
 	struct elf_sec_desc *secs;
@@ -634,6 +646,7 @@ struct elf_state {
 	int symbols_shndx;
 	int st_ops_shndx;
 	int st_ops_link_shndx;
+	int static_branches_shndx;
 };
 
 struct usdt_manager;
@@ -715,6 +728,7 @@ void bpf_program__unload(struct bpf_program *prog)
 
 	zfree(&prog->func_info);
 	zfree(&prog->line_info);
+	zfree(&prog->static_branches_info); // XXX: here or bpf_program__exit?
 }
 
 static void bpf_program__exit(struct bpf_program *prog)
@@ -3605,6 +3619,9 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			} else if (strcmp(name, STRUCT_OPS_LINK_SEC) == 0) {
 				obj->efile.st_ops_link_data = data;
 				obj->efile.st_ops_link_shndx = idx;
+			} else if (strcmp(name, STATIC_JUMPS_SEC) == 0) {
+				obj->efile.static_branches_data = data;
+				obj->efile.static_branches_shndx = idx;
 			} else {
 				pr_info("elf: skipping unrecognized data section(%d) %s\n",
 					idx, name);
@@ -3620,7 +3637,8 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			if (!section_have_execinstr(obj, targ_sec_idx) &&
 			    strcmp(name, ".rel" STRUCT_OPS_SEC) &&
 			    strcmp(name, ".rel" STRUCT_OPS_LINK_SEC) &&
-			    strcmp(name, ".rel" MAPS_ELF_SEC)) {
+			    strcmp(name, ".rel" MAPS_ELF_SEC) &&
+			    strcmp(name, ".rel" STATIC_JUMPS_SEC)) { // XXX: or do I need to also save it? :hmm:
 				pr_info("elf: skipping relo section(%d) %s for section(%d) %s\n",
 					idx, name, targ_sec_idx,
 					elf_sec_name(obj, elf_sec_by_idx(obj, targ_sec_idx)) ?: "<?>");
@@ -4419,6 +4437,198 @@ bpf_object__collect_prog_relos(struct bpf_object *obj, Elf64_Shdr *shdr, Elf_Dat
 
 		prog->nr_reloc++;
 	}
+	return 0;
+}
+
+struct jump_table_entry {
+	__u32 jump_offset;
+	__u32 jump_target;
+	union {
+		__u64 map_ptr;	/* map_ptr is always zero, as it is relocated */
+		__u64 flags;	/* so we can reuse it to store flags */
+	};
+};
+
+static struct bpf_program *shndx_to_prog(struct bpf_object *obj, size_t sec_idx)
+{
+	size_t i;
+
+	for (i = 0; i < obj->nr_programs; i++)
+		if (obj->programs[i].sec_idx == sec_idx)
+			return &obj->programs[i];
+	return NULL;
+}
+
+static struct bpf_program *find_prog_for_jump_entry(struct bpf_object *obj, int nrels, Elf_Data *relo_data, __u32 entry_offset)
+{
+	struct bpf_program *prog;
+	Elf64_Rel *rel;
+	Elf64_Sym *sym;
+	int i;
+
+/*
+Relocation section '.rel.jump_table' at offset 0x658 contains 3 entries:
+    Offset             Info             Type               Symbol's Value  Symbol's Name
+0000000000000000  0000000100000004 R_BPF_64_NODYLD32      0000000000000000 kprobe/__x64_sys_getpgid
+0000000000000004  0000000100000003 R_BPF_64_ABS32         0000000000000000 kprobe/__x64_sys_getpgid
+0000000000000008  0000000600000002 R_BPF_64_ABS64         0000000000000000 debug_key
+
+$ llvm-readelf -Ws test.bpf.o
+
+Symbol table '.symtab' contains 9 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND
+     1: 0000000000000000     0 SECTION LOCAL  DEFAULT     3 kprobe/__x64_sys_getpgid
+     2: 0000000000000020     0 NOTYPE  LOCAL  DEFAULT     3 LBB0_1
+     3: 0000000000000010     0 NOTYPE  LOCAL  DEFAULT     3 LBB0_5
+     4: 0000000000000068     0 NOTYPE  LOCAL  DEFAULT     3 LBB0_3
+
+(here offset 0 corresponds to 'kprobe/__x64_sys_getpgid' which is a symbol 'SECTION' in symbols)
+*/
+
+	pr_warn("[DEBUG] checking offset 0x%x\n", entry_offset);
+
+	for (i = 0; i < nrels; i++) {
+		rel = elf_rel_by_idx(relo_data, i);
+		if (!rel) {
+			pr_warn("static jump: relo #%d: failed to get ELF relo\n", i);
+			return ERR_PTR(-LIBBPF_ERRNO__FORMAT);
+		}
+
+		// XXX: continue if offset doesn't match
+		pr_warn("[DEBUG] checking rel with offset 0x%lx\n", rel->r_offset);
+		if ((__u32)rel->r_offset != entry_offset)
+			continue;
+		pr_warn("[DEBUG] rel with offset 0x%lx: match\n", rel->r_offset);
+
+		sym = elf_sym_by_idx(obj, ELF64_R_SYM(rel->r_info));
+		if (!sym) {
+			pr_warn(".maps relo #%d: symbol %zx not found\n",
+				i, (size_t)ELF64_R_SYM(rel->r_info));
+			return ERR_PTR(-LIBBPF_ERRNO__FORMAT);
+		}
+
+		prog = shndx_to_prog(obj, sym->st_shndx);
+		if (!prog)
+			return ERR_PTR(-LIBBPF_ERRNO__FORMAT);
+		pr_warn("[DEBUG] found prog name=%s sec_name=%s\n", prog->name, prog->sec_name);
+		return prog;
+	}
+	return ERR_PTR(-LIBBPF_ERRNO__FORMAT);
+}
+
+static struct bpf_map *find_map_for_jump_entry(struct bpf_object *obj, int nrels, Elf_Data *relo_data, __u32 entry_offset)
+{
+	struct bpf_map *map;
+	const char *name;
+	Elf64_Rel *rel;
+	Elf64_Sym *sym;
+	int i;
+
+	pr_warn("[DEBUG] checking offset 0x%x for a corresponding map\n", entry_offset);
+
+	for (i = 0; i < nrels; i++) {
+		rel = elf_rel_by_idx(relo_data, i);
+		if (!rel) {
+			pr_warn("static jump: relo #%d: failed to get ELF relo\n", i);
+			return NULL;
+		}
+
+		// XXX: continue if offset doesn't match
+		pr_warn("[DEBUG] checking rel with offset 0x%lx\n", rel->r_offset);
+		if ((__u32)rel->r_offset != entry_offset)
+			continue;
+		pr_warn("[DEBUG] rel with offset 0x%lx: match\n", rel->r_offset);
+
+		sym = elf_sym_by_idx(obj, ELF64_R_SYM(rel->r_info));
+		if (!sym) {
+			pr_warn(".maps relo #%d: symbol %zx not found\n",
+				i, (size_t)ELF64_R_SYM(rel->r_info));
+			return NULL;
+		}
+
+		name = elf_sym_str(obj, sym->st_name) ?: "<?>";
+		if (!name || !strcmp(name, "")) {
+			pr_warn("[DEBUG] bad symbol, name is empty\n");
+			return NULL;
+		}
+
+		pr_warn("[DEBUG] .jump_table relo #%d: for %zd value %zd rel->r_offset %zu name %d ('%s')\n",
+			 i, (ssize_t)(rel->r_info >> 32), (size_t)sym->st_value,
+			 (size_t)rel->r_offset, sym->st_name, name);
+
+		map = bpf_object__find_map_by_name(obj, name);
+		if (!map)
+			return NULL;
+		pr_warn("[DEBUG] found map name=%s, map->fd=%d\n", map->name, map->fd);
+		return map;
+	}
+
+	return NULL;
+}
+
+// XXX what a terrible code :nightmare:
+static void add_static_branch(struct bpf_program *prog, struct jump_table_entry *entry, struct bpf_map *map)
+{
+	__u32 static_branches_info_size_old = prog->static_branches_info_size;
+	__u32 static_branches_info_size_new = static_branches_info_size_old + sizeof(struct static_branch_info);
+
+	struct static_branch_info *info;
+	void *x;
+
+	x = realloc(prog->static_branches_info, static_branches_info_size_new);
+	if (!x)
+		exit(1);
+
+	info = x + static_branches_info_size_old;
+	info->offset = entry->jump_offset;
+	info->jump_target = entry->jump_target;
+	info->flags = (__u32) entry->flags;
+	info->map = map;
+
+	prog->static_branches_info = x;
+	prog->static_branches_info_size = static_branches_info_size_new;
+}
+
+static int
+bpf_object__collect_static_branches_relos(struct bpf_object *obj, Elf64_Shdr *shdr, Elf_Data *relo_data)
+{
+	Elf_Data *branches_data = obj->efile.static_branches_data;
+	//int branches_idx = obj->efile.static_branches_shndx;
+	int nrels = shdr->sh_size / shdr->sh_entsize;
+	struct jump_table_entry *entries;
+	size_t i;
+
+	if (!branches_data) {
+		pr_warn("[DEBUG] ELF object %s: no static branches\n", obj->name);
+		return 0;
+	}
+
+	// XXX all the sanity checks...
+
+	entries = (void *)branches_data->d_buf;
+	for (i = 0; i < branches_data->d_size / sizeof(struct jump_table_entry); i++) {
+		__u32 entry_offset = i * sizeof(struct jump_table_entry);
+		struct bpf_program *prog;
+		struct bpf_map *map;
+
+		// find the program which corresponds to the entry
+		prog = find_prog_for_jump_entry(obj, nrels, relo_data, entry_offset);
+		if (IS_ERR(prog)) {
+			pr_warn("[DEBUG] ELF object %s: no program found for offset %u [#=%zd]\n", obj->name, entry_offset, i);
+			return PTR_ERR(prog);
+		}
+
+		// find the map which corresponds to the entry
+		map = find_map_for_jump_entry(obj, nrels, relo_data, entry_offset + offsetof(struct jump_table_entry, map_ptr)); // XXX or this is ID or what? need to comply with this FD|ID thing, probably
+		if (!map) {
+			pr_warn("[DEBUG] ELF object %s: no static key map found for offset %u [#=%zd]\n", obj->name, entry_offset, i);
+			return -EINVAL;
+		}
+
+		add_static_branch(prog, &entries[i], map);
+	}
+
 	return 0;
 }
 
@@ -6059,12 +6269,15 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 		case RELO_LD64:
 			map = &obj->maps[relo->map_idx];
 			if (obj->gen_loader) {
+				pr_warn("XXX here: obj->gen_loader, map->name=%s\n", map->name);
 				insn[0].src_reg = BPF_PSEUDO_MAP_IDX;
 				insn[0].imm = relo->map_idx;
 			} else if (map->autocreate) {
+				pr_warn("XXX here: map->autocreate=true, map->name=%s map->fd=%d\n", map->name, map->fd);
 				insn[0].src_reg = BPF_PSEUDO_MAP_FD;
 				insn[0].imm = map->fd;
 			} else {
+				pr_warn("XXX else: poison_map_ldimm64; map->name=%s\n", map->name);
 				poison_map_ldimm64(prog, i, relo->insn_idx, insn,
 						   relo->map_idx, map);
 			}
@@ -6879,6 +7092,8 @@ static int bpf_object__collect_relos(struct bpf_object *obj)
 			err = bpf_object__collect_st_ops_relos(obj, shdr, data);
 		else if (idx == obj->efile.btf_maps_shndx)
 			err = bpf_object__collect_map_relos(obj, shdr, data);
+		else if (idx == obj->efile.static_branches_shndx)
+			err = bpf_object__collect_static_branches_relos(obj, shdr, data);
 		else
 			err = bpf_object__collect_prog_relos(obj, shdr, data);
 		if (err)
@@ -7002,6 +7217,29 @@ static int libbpf_prepare_prog_load(struct bpf_program *prog,
 
 static void fixup_verifier_log(struct bpf_program *prog, char *buf, size_t buf_sz);
 
+static struct bpf_static_branch_info *convert_static_branch_info(struct static_branch_info *info, size_t size)
+{
+	size_t n = size/sizeof(struct static_branch_info);
+	struct bpf_static_branch_info *bpf_info;
+	size_t i;
+
+	if (!info)
+		return NULL;
+
+	bpf_info = calloc(n, sizeof(struct bpf_static_branch_info));
+	if (!bpf_info)
+		return NULL;
+
+	for (i = 0; i < n; i++) {
+		bpf_info[i].insn_offset = info[i].offset;
+		bpf_info[i].jump_target = info[i].jump_target;
+		bpf_info[i].flags = info[i].flags;
+		bpf_info[i].map_fd = info[i].map->fd;
+	}
+
+	return bpf_info;
+}
+
 static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog,
 				struct bpf_insn *insns, int insns_cnt,
 				const char *license, __u32 kern_version, int *prog_fd)
@@ -7106,7 +7344,26 @@ retry_load:
 	load_attr.log_size = log_buf_size;
 	load_attr.log_level = log_level;
 
+#if 1 // just some debug, remove me after done
+	if (prog->static_branches_info_size) {
+		size_t i, n = prog->static_branches_info_size / sizeof(struct static_branch_info);
+		pr_warn("[DEBUG] I've found that prog[%s]->static_branches_info_size ≠ 0\n", prog->name);
+		for (i = 0; i < n; i++) {
+			struct static_branch_info *info = &prog->static_branches_info[i];
+			pr_warn("[DEBUG]\t\tbranch_info[%zd]: offset=%u map=%s\n", i, info->offset, info->map->name);
+		}
+	} else {
+		pr_warn("[DEBUG] prog[%s]->static_branches_info_size is 0\n", prog->name);
+	}
+#endif
+
+	load_attr.static_branches_info = convert_static_branch_info(prog->static_branches_info, prog->static_branches_info_size);
+	load_attr.static_branches_info_size = prog->static_branches_info_size / sizeof(struct static_branch_info) * sizeof(struct bpf_static_branch_info);
+
 	ret = bpf_prog_load(prog->type, prog_name, license, insns, insns_cnt, &load_attr);
+
+	pr_warn("bpf_prog_load: ret=%d\n", ret);
+
 	if (ret >= 0) {
 		if (log_level && own_log_buf) {
 			pr_debug("prog '%s': -- BEGIN PROG LOAD LOG --\n%s-- END PROG LOAD LOG --\n",

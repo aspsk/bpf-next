@@ -289,6 +289,7 @@ struct bpf_map {
 	bool bypass_spec_v1;
 	bool frozen; /* write-once; write-protected by freeze_mutex */
 	s64 __percpu *elem_count;
+	struct bpf_prog *static_key_prog; // XXX this should be an hlist
 };
 
 static inline const char *btf_field_type_name(enum btf_field_type type)
@@ -1381,6 +1382,19 @@ struct btf_mod_pair {
 
 struct bpf_kfunc_desc_tab;
 
+struct bpf_static_branch {
+	struct bpf_map *map;
+	u32 flags;
+	u32 bpf_offset;
+	u32 arch_offset;
+	u32 arch_len;
+	u8 bpf_jmp[8];
+	u8 arch_nop[8];
+	u8 arch_jmp[8];
+};
+
+struct bpf_static_branch *bpf_static_branch_by_offset(struct bpf_prog *bpf_prog, u32 offset);
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1473,6 +1487,8 @@ struct bpf_prog_aux {
 		struct work_struct work;
 		struct rcu_head	rcu;
 	};
+	struct bpf_static_branch *static_branches;
+	u32 static_branches_len;
 };
 
 struct bpf_prog {

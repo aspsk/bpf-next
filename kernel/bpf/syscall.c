@@ -127,6 +127,84 @@ bool bpf_map_write_active(const struct bpf_map *map)
 	return atomic64_read(&map->writecnt) != 0;
 }
 
+// XXX: this one is arch-dependent, I need to actually implement an arch-specific part as well
+static void poke_static_branch(struct bpf_prog *prog, struct bpf_static_branch *branch, bool on)
+{
+	bool inverse = !!(branch->flags & BPF_F_INVERSE_BRANCH);
+	static const u64 bpf_nop = BPF_JMP | BPF_JA;
+	const void *arch_op;
+	const void *bpf_op;
+
+#if 1 // XXX debug
+	u8 *op8 = (on ^ inverse) ? branch->arch_jmp : branch->arch_nop;
+
+	if (branch->arch_len == 2) {
+		pr_warn("XXX I AM POKING CODE: instruction %02x %02x\n\n\n",
+			op8[0], op8[1]);
+	} else if (branch->arch_len == 5) {
+		pr_warn("XXX I AM POKING CODE: instruction %02x %02x %02x %02x %02x\n\n\n",
+			op8[0], op8[1], op8[2], op8[3], op8[4]);
+	} else {
+		pr_warn("XXX I AM NOT POKING CODE!!! instruction len = %d\n\n\n", branch->arch_len);
+		return;
+	}
+#endif
+
+	if (on ^ inverse) {
+		bpf_op = branch->bpf_jmp;
+		arch_op = branch->arch_jmp;
+	} else {
+		bpf_op = &bpf_nop;
+		arch_op = branch->arch_nop;
+	}
+
+	text_poke_bp(prog->bpf_func + branch->arch_offset,
+		     arch_op, branch->arch_len, NULL);
+
+	memcpy(&prog->insnsi[branch->bpf_offset / 8], bpf_op, 8);
+}
+
+static int __bpf_update_static_branch(const struct bpf_map *map,
+				      struct bpf_prog *prog, bool on)
+{
+	struct bpf_static_branch *branch;
+	int i;
+
+	for (i = 0; i < prog->aux->static_branches_len; i++) {
+		branch = &prog->aux->static_branches[i];
+		if (branch->map != map) {
+			pr_warn("skipping static branch for prog %s offset %u [map %s]\n",
+				prog->aux->name, branch->bpf_offset, map->name);
+			continue;
+		}
+
+		pr_warn("updating static branch for prog %s [start=%lu] offset %u [map %s]\n",
+			prog->aux->name, (unsigned long)prog->bpf_func, branch->bpf_offset, map->name);
+
+		poke_static_branch(prog, branch, on);
+	}
+
+	return 0;
+}
+
+bool __weak bpf_jit_supports_static_keys(void)
+{
+	return false;
+}
+
+// XXX: locking :'(
+static int bpf_update_staic_branch(const struct bpf_map *map, __u32 *value)
+{
+	struct bpf_prog *prog;
+	bool on = !!*value;
+
+	prog = map->static_key_prog; // XXX: many progs should be allowed
+	if (!prog)
+		return -EINVAL;
+
+	return __bpf_update_static_branch(map, prog, on);
+}
+
 static u32 bpf_map_value_size(const struct bpf_map *map)
 {
 	if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
@@ -197,6 +275,14 @@ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
 		   map->map_type == BPF_MAP_TYPE_STACK ||
 		   map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
 		err = map->ops->map_push_elem(map, value, flags);
+	} else if (map->map_type == BPF_MAP_TYPE_ARRAY &&
+		map->map_flags & BPF_F_STATIC_KEY) {
+		err = bpf_update_staic_branch(map, value);
+		if (!err) {
+			rcu_read_lock();
+			err = map->ops->map_update_elem(map, key, value, flags);
+			rcu_read_unlock();
+		}
 	} else {
 		rcu_read_lock();
 		err = map->ops->map_update_elem(map, key, value, flags);
@@ -1096,6 +1182,22 @@ free_map_tab:
 	return ret;
 }
 
+static bool __is_static_key(u32 map_type, u32 key_size, u32 value_size,
+			    u32 max_entries, u32 map_flags)
+{
+	return map_type == BPF_MAP_TYPE_ARRAY &&
+	       key_size == 4 &&
+	       value_size == 4 &&
+	       max_entries == 1 &&
+	       map_flags & BPF_F_STATIC_KEY;
+}
+
+bool is_static_key(struct bpf_map *map)
+{
+	return __is_static_key(map->map_type, map->key_size, map->value_size,
+			       map->max_entries, map->map_flags);
+}
+
 #define BPF_MAP_CREATE_LAST_FIELD map_extra
 /* called via syscall */
 static int map_create(union bpf_attr *attr)
@@ -1122,6 +1224,11 @@ static int map_create(union bpf_attr *attr)
 	if (attr->map_type != BPF_MAP_TYPE_BLOOM_FILTER &&
 	    attr->map_extra != 0)
 		return -EINVAL;
+
+	if (__is_static_key(attr->map_type, attr->key_size, attr->value_size,
+			    attr->max_entries, attr->map_flags) &&
+	    !bpf_jit_supports_static_keys())
+		return -EOPNOTSUPP;
 
 	f_flags = bpf_get_file_flag(attr->map_flags);
 	if (f_flags < 0)
@@ -2366,7 +2473,7 @@ struct bpf_prog *bpf_prog_get_type_dev(u32 ufd, enum bpf_prog_type type,
 }
 EXPORT_SYMBOL_GPL(bpf_prog_get_type_dev);
 
-static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map)
+static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map, bool check_boundaries)
 {
 	struct bpf_map **used_maps_new;
 	int i;
@@ -2374,6 +2481,13 @@ static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map)
 	for (i = 0; i < prog->aux->used_map_cnt; i++)
 		if (prog->aux->used_maps[i] == map)
 			return -EEXIST;
+
+	/*
+	 * This is ok to add more maps after the program is loaded, but not
+	 * before bpf_check, as verifier env has only MAX_USED_MAPS slots
+	 */
+	if (check_boundaries && prog->aux->used_map_cnt >= MAX_USED_MAPS)
+		return -E2BIG;
 
 	used_maps_new = krealloc_array(prog->aux->used_maps,
 				       prog->aux->used_map_cnt + 1,
@@ -2387,6 +2501,7 @@ static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map)
 
 	return 0;
 }
+
 
 /* Initially all BPF programs could be loaded w/o specifying
  * expected_attach_type. Later for some of them specifying expected_attach_type
@@ -2575,8 +2690,217 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 	}
 }
 
+static void static_key_add_prog(struct bpf_map *static_key, struct bpf_prog *prog)
+{
+	// XXX we only support one program now for simplicity
+	static_key->static_key_prog = prog;
+}
+
+static bool is_imm8(int value)
+{
+	return value <= 127 && value >= -128;
+}
+
+static bool init_static_jump_instruction(struct bpf_prog *prog,
+					 struct bpf_static_branch *branch,
+					 struct bpf_static_branch_info *branch_info)
+{
+	bool inverse = !!(branch_info->flags & BPF_F_INVERSE_BRANCH);
+	u32 insn_offset = branch_info->insn_offset;
+	u32 jump_target = branch_info->jump_target;
+	s32 jump_offset = ((long)jump_target - (long)insn_offset) / 8 - 1;
+	struct bpf_insn *jump_insn;
+
+	if (insn_offset / 8 >= prog->len || jump_target / 8 >= prog->len) {
+		pr_err("insn_offset(%u) / 8 >= prog->len(%u) || jump_target(%u) / 8 >= prog->len(%u)\n", insn_offset, prog->len, jump_target, prog->len);
+		return false;
+	}
+
+	jump_insn = &prog->insnsi[insn_offset / 8];
+	if (jump_insn->code != (BPF_JMP | BPF_JA) &&
+	    jump_insn->code != (BPF_JMP32 | BPF_JA)) {
+		pr_err("jump_insn->code=%u\n", jump_insn->code);
+		return false;
+	}
+
+	if (jump_insn->dst_reg || jump_insn->src_reg) {
+		pr_err("jump_insn->dst_reg(%u) || jump_insn->src_reg(%u)\n", jump_insn->dst_reg , jump_insn->src_reg);
+		return false;
+	}
+
+	if (jump_insn->off && jump_insn->imm) {
+		pr_err("jump_insn->off(%d) && jump_insn->imm(%d)", jump_insn->off, jump_insn->imm);
+		return false;
+	}
+
+	if (inverse) {
+		/* We expect that the instruction is JA [jump_offset] */
+		if (is_imm8(jump_offset)) {
+			if (jump_insn->off != jump_offset) {
+				pr_err("jump_insn->off(%d) != jump_offset(%d)\n", jump_insn->off, jump_offset);
+				return false;
+			}
+		} else {
+			if (jump_insn->imm != jump_offset) {
+				pr_err("jump_insn->imm(%d) != jump_offset(%d)\n", jump_insn->imm, jump_offset);
+				return false;
+			}
+		}
+		pr_err("FOUND INVERSE INSTRUCTION\n");
+	} else {
+		/* The instruction here should be JA 0. We will replace it by a
+		 * non-zero jump so that this is simpler to verify this program
+		 * (verifier might optimize out such instructions and we don't
+		 * want to care about this). After verification the instruction
+		 * will be set to proper value
+		 */
+		if (jump_insn->off || jump_insn->imm) {
+			pr_err("jump_insn->off(%d) || jump_insn->imm(%d)", jump_insn->off, jump_insn->imm);
+			return false;
+		}
+
+		if (is_imm8(jump_offset))
+			jump_insn->off = jump_offset;
+		else
+			jump_insn->imm = jump_offset;
+
+		pr_err("PATCHING INSTRUCTION[%d] from NOP to JUMP off=%u imm=%u\n", insn_offset/8, jump_insn->off, jump_insn->imm);
+	}
+
+	memcpy(branch->bpf_jmp, jump_insn, 8);
+	branch->bpf_offset = insn_offset;
+	return true;
+}
+
+static int
+__bpf_prog_init_static_branches(struct bpf_prog *prog,
+				struct bpf_static_branch_info *static_branches_info,
+				int n)
+{
+	size_t size = n * sizeof(*prog->aux->static_branches);
+	struct bpf_static_branch *static_branches;
+	struct bpf_map *map;
+	int i, err = 0;
+
+	static_branches = kzalloc(size, GFP_USER | __GFP_NOWARN);
+	if (!static_branches)
+		return -ENOMEM;
+
+	for (i = 0; i < n; i++) {
+		if (static_branches_info[i].flags & ~(BPF_F_INVERSE_BRANCH)) {
+			pr_err("static_branches_info[i].flags = %x\n", static_branches_info[i].flags);
+			err = -EINVAL;
+			goto free_static_branches;
+		}
+		static_branches[i].flags = static_branches_info[i].flags;
+
+		if (!init_static_jump_instruction(prog, &static_branches[i],
+						  &static_branches_info[i])) {
+			pr_err("init_static_jump_instruction error\n");
+			err = -EINVAL;
+			goto free_static_branches;
+		}
+
+		map = bpf_map_get(static_branches_info[i].map_fd);
+		if (IS_ERR(map)) {
+			pr_err("no map, map_fd=%u\n", static_branches_info[i].map_fd);
+			err = PTR_ERR(map);
+			goto free_static_branches;
+		}
+
+		if (!is_static_key(map)) {
+			bpf_map_put(map);
+			err = -EINVAL;
+			pr_err("!is_static_key\n");
+			goto free_static_branches;
+		}
+
+		err = __bpf_prog_bind_map(prog, map, true);
+		if (err) {
+			bpf_map_put(map);
+			if (err != -EEXIST)
+				goto free_static_branches;
+		}
+
+		static_branches[i].map = map;
+
+		pr_info("I'found a static branch at %u, static_key=%s\n", static_branches_info[i].insn_offset, map->name);
+	}
+
+	prog->aux->static_branches = static_branches;
+	prog->aux->static_branches_len = n;
+
+	return 0;
+
+free_static_branches:
+	kfree(static_branches);
+	return err;
+}
+
+static int bpf_prog_init_static_branches(struct bpf_prog *prog, union bpf_attr *attr)
+{
+	void __user *user_static_branches = u64_to_user_ptr(attr->static_branches_info);
+	size_t item_size = sizeof(struct bpf_static_branch_info);
+	struct bpf_static_branch_info *static_branches_info;
+	size_t size = attr->static_branches_info_size;
+	int err = 0;
+
+	if (!attr->static_branches_info)
+		return size ? -EINVAL : 0;
+	if (!size)
+		return -EINVAL;
+	if (size % item_size)
+		return -EINVAL;
+
+	if (!bpf_jit_supports_static_keys())
+		return -EOPNOTSUPP;
+
+	static_branches_info = kzalloc(size, GFP_USER | __GFP_NOWARN);
+	if (!static_branches_info)
+		return -ENOMEM;
+
+	// XXX: bpf pointer? but I don't want kernel ops at all
+	if (copy_from_user(static_branches_info, user_static_branches, size)) {
+		err = -EFAULT;
+		goto free_branches;
+	}
+
+	err = __bpf_prog_init_static_branches(prog, static_branches_info, size / item_size);
+	if (err) {
+		pr_err("__bpf_prog_init_static_branches: %d\n", err);
+		goto free_branches;
+	}
+
+	err = 0;
+
+free_branches:
+	kfree(static_branches_info);
+	return err;
+}
+
+static bool static_key_value(struct bpf_map *map)
+{
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+
+	return *(int *)array->value;
+}
+
+static int bpf_prog_enable_static_branches(struct bpf_prog *prog)
+{
+	struct bpf_static_branch *branch;
+	u32 i;
+
+	for (i = 0; i < prog->aux->static_branches_len; i++) {
+		branch = &prog->aux->static_branches[i];
+		static_key_add_prog(branch->map, prog);
+		__bpf_update_static_branch(branch->map, prog, static_key_value(branch->map));
+	}
+
+	return 0;
+}
+
 /* last field in 'union bpf_attr' used by this command */
-#define	BPF_PROG_LOAD_LAST_FIELD log_true_size
+#define	BPF_PROG_LOAD_LAST_FIELD static_branches_info_size
 
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
@@ -2734,12 +3058,23 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	if (err < 0)
 		goto free_prog_sec;
 
+	err = bpf_prog_init_static_branches(prog, attr);
+	if (err < 0)
+		goto free_prog_sec;
+
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
+
+	pr_warn("bpf_check returned %d\n", err);
+
 	if (err < 0)
 		goto free_used_maps;
 
 	prog = bpf_prog_select_runtime(prog, &err);
+	if (err < 0)
+		goto free_used_maps;
+
+	err = bpf_prog_enable_static_branches(prog); // XXX should this be moved after the alloc_id so that the prog can be updated by map updates?
 	if (err < 0)
 		goto free_used_maps;
 
@@ -5326,7 +5661,7 @@ static int bpf_prog_bind_map(union bpf_attr *attr)
 	}
 
 	mutex_lock(&prog->aux->used_maps_mutex);
-	ret = __bpf_prog_bind_map(prog, map);
+	ret = __bpf_prog_bind_map(prog, map, false);
 	mutex_unlock(&prog->aux->used_maps_mutex);
 
 	if (ret)
