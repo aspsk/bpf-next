@@ -2391,6 +2391,34 @@ struct bpf_prog *bpf_prog_get_type_dev(u32 ufd, enum bpf_prog_type type,
 }
 EXPORT_SYMBOL_GPL(bpf_prog_get_type_dev);
 
+static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map)
+{
+	struct bpf_map **used_maps_new;
+	int i;
+
+	for (i = 0; i < prog->aux->used_map_cnt; i++)
+		if (prog->aux->used_maps[i] == map)
+			return -EEXIST;
+
+	/* The bpf program will not access the bpf map, but for the sake of
+	 * simplicity, increase sleepable_refcnt for sleepable program as well.
+	 */
+	if (prog->aux->sleepable)
+		atomic64_inc(&map->sleepable_refcnt);
+
+	used_maps_new = krealloc_array(prog->aux->used_maps,
+				       prog->aux->used_map_cnt + 1,
+				       sizeof(used_maps_new[0]),
+				       GFP_KERNEL);
+	if (!used_maps_new)
+		return -ENOMEM;
+
+	prog->aux->used_maps = used_maps_new;
+	prog->aux->used_maps[prog->aux->used_map_cnt++] = map;
+
+	return 0;
+}
+
 /* Initially all BPF programs could be loaded w/o specifying
  * expected_attach_type. Later for some of them specifying expected_attach_type
  * at load time became required so that program could be validated properly.
@@ -5311,8 +5339,7 @@ static int bpf_prog_bind_map(union bpf_attr *attr)
 {
 	struct bpf_prog *prog;
 	struct bpf_map *map;
-	struct bpf_map **used_maps_old, **used_maps_new;
-	int i, ret = 0;
+	int ret = 0;
 
 	if (CHECK_ATTR(BPF_PROG_BIND_MAP))
 		return -EINVAL;
@@ -5331,42 +5358,16 @@ static int bpf_prog_bind_map(union bpf_attr *attr)
 	}
 
 	mutex_lock(&prog->aux->used_maps_mutex);
-
-	used_maps_old = prog->aux->used_maps;
-
-	for (i = 0; i < prog->aux->used_map_cnt; i++)
-		if (used_maps_old[i] == map) {
-			bpf_map_put(map);
-			goto out_unlock;
-		}
-
-	used_maps_new = kmalloc_array(prog->aux->used_map_cnt + 1,
-				      sizeof(used_maps_new[0]),
-				      GFP_KERNEL);
-	if (!used_maps_new) {
-		ret = -ENOMEM;
-		goto out_unlock;
-	}
-
-	/* The bpf program will not access the bpf map, but for the sake of
-	 * simplicity, increase sleepable_refcnt for sleepable program as well.
-	 */
-	if (prog->aux->sleepable)
-		atomic64_inc(&map->sleepable_refcnt);
-	memcpy(used_maps_new, used_maps_old,
-	       sizeof(used_maps_old[0]) * prog->aux->used_map_cnt);
-	used_maps_new[prog->aux->used_map_cnt] = map;
-
-	prog->aux->used_map_cnt++;
-	prog->aux->used_maps = used_maps_new;
-
-	kfree(used_maps_old);
-
-out_unlock:
+	ret = __bpf_prog_bind_map(prog, map);
 	mutex_unlock(&prog->aux->used_maps_mutex);
 
 	if (ret)
 		bpf_map_put(map);
+
+	/* This map was already bound to the program */
+	if (ret == -EEXIST)
+		ret = 0;
+
 out_prog_put:
 	bpf_prog_put(prog);
 	return ret;
