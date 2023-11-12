@@ -452,6 +452,47 @@ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
 	return __bpf_arch_text_poke(ip, t, old_addr, new_addr);
 }
 
+// XXX: this one is arch-dependent, I need to actually implement an arch-specific part as well
+int bpf_arch_poke_static_branch(struct bpf_prog *prog, struct bpf_static_branch *branch, bool on)
+{
+	bool inverse = !!(branch->flags & BPF_F_INVERSE_BRANCH);
+	static const u64 bpf_nop = BPF_JMP | BPF_JA;
+	const void *arch_op;
+	const void *bpf_op;
+
+	if (!prog || !branch)
+		return -EINVAL;
+
+#if 1 // XXX debug
+	u8 *op8 = (on ^ inverse) ? branch->arch_jmp : branch->arch_nop;
+
+	if (branch->arch_len == 2) {
+		pr_warn("XXX I AM POKING CODE: instruction %02x %02x\n\n\n",
+			op8[0], op8[1]);
+	} else if (branch->arch_len == 5) {
+		pr_warn("XXX I AM POKING CODE: instruction %02x %02x %02x %02x %02x\n\n\n",
+			op8[0], op8[1], op8[2], op8[3], op8[4]);
+	} else {
+		pr_warn("XXX I AM NOT POKING CODE!!! instruction len = %d\n\n\n", branch->arch_len);
+		return -EINVAL;
+	}
+#endif
+
+	if (on ^ inverse) {
+		bpf_op = branch->bpf_jmp;
+		arch_op = branch->arch_jmp;
+	} else {
+		bpf_op = &bpf_nop;
+		arch_op = branch->arch_nop;
+	}
+
+	text_poke_bp(prog->bpf_func + branch->arch_offset,
+		     arch_op, branch->arch_len, NULL);
+
+	memcpy(&prog->insnsi[branch->bpf_offset / 8], bpf_op, 8);
+	return 0;
+}
+
 #define EMIT_LFENCE()	EMIT3(0x0F, 0xAE, 0xE8)
 
 static void emit_indirect_jump(u8 **pprog, int reg, u8 *ip)
@@ -3047,9 +3088,4 @@ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp
 	return;
 #endif
 	WARN(1, "verification of programs using bpf_throw should have failed\n");
-}
-
-bool bpf_jit_supports_static_keys(void)
-{
-	return true;
 }

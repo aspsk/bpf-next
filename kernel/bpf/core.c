@@ -2927,6 +2927,11 @@ void __weak arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp,
 {
 }
 
+int __weak bpf_arch_poke_static_branch(struct bpf_prog *prog, struct bpf_static_branch *branch, bool on)
+{
+	return -EOPNOTSUPP;
+}
+
 #ifdef CONFIG_BPF_SYSCALL
 static int __init bpf_global_ma_init(void)
 {

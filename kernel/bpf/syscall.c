@@ -127,46 +127,10 @@ bool bpf_map_write_active(const struct bpf_map *map)
 	return atomic64_read(&map->writecnt) != 0;
 }
 
-// XXX: this one is arch-dependent, I need to actually implement an arch-specific part as well
-static void poke_static_branch(struct bpf_prog *prog, struct bpf_static_branch *branch, bool on)
-{
-	bool inverse = !!(branch->flags & BPF_F_INVERSE_BRANCH);
-	static const u64 bpf_nop = BPF_JMP | BPF_JA;
-	const void *arch_op;
-	const void *bpf_op;
-
-#if 1 // XXX debug
-	u8 *op8 = (on ^ inverse) ? branch->arch_jmp : branch->arch_nop;
-
-	if (branch->arch_len == 2) {
-		pr_warn("XXX I AM POKING CODE: instruction %02x %02x\n\n\n",
-			op8[0], op8[1]);
-	} else if (branch->arch_len == 5) {
-		pr_warn("XXX I AM POKING CODE: instruction %02x %02x %02x %02x %02x\n\n\n",
-			op8[0], op8[1], op8[2], op8[3], op8[4]);
-	} else {
-		pr_warn("XXX I AM NOT POKING CODE!!! instruction len = %d\n\n\n", branch->arch_len);
-		return;
-	}
-#endif
-
-	if (on ^ inverse) {
-		bpf_op = branch->bpf_jmp;
-		arch_op = branch->arch_jmp;
-	} else {
-		bpf_op = &bpf_nop;
-		arch_op = branch->arch_nop;
-	}
-
-	text_poke_bp(prog->bpf_func + branch->arch_offset,
-		     arch_op, branch->arch_len, NULL);
-
-	memcpy(&prog->insnsi[branch->bpf_offset / 8], bpf_op, 8);
-}
-
 static int bpf_update_static_branches(struct bpf_prog *prog, const struct bpf_map *map, bool on)
 {
 	struct bpf_static_branch *branch;
+	int err = 0;
 	int i;
 
 	for (i = 0; i < prog->aux->static_branches_len; i++) {
@@ -180,15 +144,20 @@ static int bpf_update_static_branches(struct bpf_prog *prog, const struct bpf_ma
 		pr_warn("updating static branch for prog %s [start=%lu] offset %u [map %s]\n",
 			prog->aux->name, (unsigned long)prog->bpf_func, branch->bpf_offset, map->name);
 
-		poke_static_branch(prog, branch, on);
+		err = bpf_arch_poke_static_branch(prog, branch, on);
+		if (err)
+			break;
 	}
 
-	return 0;
+	return err;
 }
 
-bool __weak bpf_jit_supports_static_keys(void)
+bool bpf_jit_supports_static_keys(void)
 {
-	return false;
+	int err;
+
+	err = bpf_arch_poke_static_branch(NULL, NULL, false);
+	return err != -EOPNOTSUPP;
 }
 
 static int bpf_update_static_key(struct bpf_map *map, void *key, void *value, __u64 flags)

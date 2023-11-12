@@ -3193,6 +3193,12 @@ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
 void *bpf_arch_text_copy(void *dst, void *src, size_t len);
 int bpf_arch_text_invalidate(void *dst, size_t len);
 
+int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
+		       void *addr1, void *addr2);
+
+int bpf_arch_poke_static_branch(struct bpf_prog *prog,
+				struct bpf_static_branch *branch, bool on);
+
 struct btf_id_set;
 bool btf_id_set_contains(const struct btf_id_set *set, u32 id);
 
