@@ -290,7 +290,7 @@ struct bpf_map {
 	bool frozen; /* write-once; write-protected by freeze_mutex */
 	s64 __percpu *elem_count;
 	struct mutex static_key_mutex;
-	struct bpf_prog *static_key_prog; // XXX this should be an hlist
+	struct list_head static_key_list_head;
 };
 
 static inline const char *btf_field_type_name(enum btf_field_type type)
@@ -1519,6 +1519,7 @@ struct bpf_prog {
 					    const struct bpf_insn *insn);
 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+	struct list_head	static_key_list;
 	/* Instructions for interpreter */
 	union {
 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);

@@ -2660,6 +2660,8 @@ int bpf_prog_array_copy_info(struct bpf_prog_array *array,
 								     : 0;
 }
 
+void static_key_remove_prog(struct bpf_map *map, struct bpf_prog_aux *aux); // XXX
+
 void __bpf_free_used_maps(struct bpf_prog_aux *aux,
 			  struct bpf_map **used_maps, u32 len)
 {
@@ -2670,6 +2672,8 @@ void __bpf_free_used_maps(struct bpf_prog_aux *aux,
 		map = used_maps[i];
 		if (map->ops->map_poke_untrack)
 			map->ops->map_poke_untrack(map, aux);
+		if (map->map_flags & BPF_F_STATIC_KEY)
+			static_key_remove_prog(map, aux);
 		bpf_map_put(map);
 	}
 }

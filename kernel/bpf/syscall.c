@@ -127,7 +127,7 @@ bool bpf_map_write_active(const struct bpf_map *map)
 	return atomic64_read(&map->writecnt) != 0;
 }
 
-static int bpf_update_static_branches(struct bpf_prog *prog, const struct bpf_map *map, bool on)
+static int bpf_prog_update_static_branches(struct bpf_prog *prog, const struct bpf_map *map, bool on)
 {
 	struct bpf_static_branch *branch;
 	int err = 0;
@@ -160,9 +160,72 @@ bool bpf_jit_supports_static_keys(void)
 	return err != -EOPNOTSUPP;
 }
 
-static int bpf_update_static_key(struct bpf_map *map, void *key, void *value, __u64 flags)
+// XXX: we actually need to create such elements and put them on the list XXX:
+// all this static branch crap looks a lot like 'poke' crap, but this would be
+// waste of time to merge the two. I can though reuse a lot of functions, maybe
+// the following structure as well?
+
+struct prog_static_key_elem {
+	struct list_head list;
+	struct bpf_prog_aux *aux;
+};
+
+static int static_key_add_prog(struct bpf_map *map, struct bpf_prog *prog)
 {
-	struct bpf_prog *prog;
+	struct prog_static_key_elem *elem;
+	u32 key = 0;
+	int err = 0;
+	u32 *val;
+
+	mutex_lock(&map->static_key_mutex);
+
+	val = map->ops->map_lookup_elem(map, &key);
+	if (!val) {
+		err = -ENOENT;
+		goto unlock_ret;
+	}
+
+	list_for_each_entry(elem, &map->static_key_list_head, list) {
+		if (elem->aux == prog->aux)
+			goto unlock_ret;
+	}
+
+	elem = kmalloc(sizeof(*elem), GFP_KERNEL);
+	if (!elem) {
+		err = -ENOMEM;
+		goto unlock_ret;
+	}
+
+	INIT_LIST_HEAD(&elem->list);
+	elem->aux = prog->aux;
+
+	list_add_tail(&elem->list, &map->static_key_list_head);
+
+	err = bpf_prog_update_static_branches(prog, map, *val);
+
+unlock_ret:
+	mutex_unlock(&map->static_key_mutex);
+	return err;
+}
+
+void static_key_remove_prog(struct bpf_map *map, struct bpf_prog_aux *aux)
+{
+	struct prog_static_key_elem *elem, *tmp;
+
+	mutex_lock(&map->static_key_mutex);
+	list_for_each_entry_safe(elem, tmp, &map->static_key_list_head, list) {
+		if (elem->aux == aux) {
+			list_del_init(&elem->list);
+			kfree(elem);
+			break;
+		}
+	}
+	mutex_unlock(&map->static_key_mutex);
+}
+
+static int static_key_update(struct bpf_map *map, void *key, void *value, __u64 flags)
+{
+	struct prog_static_key_elem *elem;
 	bool on = *(u32 *)value;
 	int err;
 
@@ -172,13 +235,11 @@ static int bpf_update_static_key(struct bpf_map *map, void *key, void *value, __
 	if (err)
 		goto unlock_ret;
 
-	prog = map->static_key_prog; // XXX: many progs should be allowed
-	if (!prog) {
-		err = -EINVAL;
-		goto unlock_ret;
+	list_for_each_entry(elem, &map->static_key_list_head, list) {
+		err = bpf_prog_update_static_branches(elem->aux->prog, map, on);
+		if (err)
+			break;
 	}
-
-	err = bpf_update_static_branches(prog, map, on);
 
 unlock_ret:
 	mutex_unlock(&map->static_key_mutex);
@@ -257,7 +318,7 @@ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
 		err = map->ops->map_push_elem(map, value, flags);
 	} else if (map->map_flags & BPF_F_STATIC_KEY) {
 		rcu_read_lock();
-		err = bpf_update_static_key(map, key, value, flags);
+		err = static_key_update(map, key, value, flags);
 		rcu_read_unlock();
 	} else {
 		rcu_read_lock();
@@ -1306,6 +1367,7 @@ static int map_create(union bpf_attr *attr)
 	mutex_init(&map->freeze_mutex);
 	mutex_init(&map->static_key_mutex);
 	spin_lock_init(&map->owner.lock);
+	INIT_LIST_HEAD(&map->static_key_list_head);
 
 	if (attr->btf_key_type_id || attr->btf_value_type_id ||
 	    /* Even the map's value is a kernel's struct,
@@ -2461,7 +2523,7 @@ static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map, bool 
 
 	/*
 	 * This is ok to add more maps after the program is loaded, but not
-	 * before bpf_check, as verifier env has only MAX_USED_MAPS slots
+	 * before bpf_check, as verifier env only has MAX_USED_MAPS slots
 	 */
 	if (check_boundaries && prog->aux->used_map_cnt >= MAX_USED_MAPS)
 		return -E2BIG;
@@ -2665,33 +2727,6 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 	default:
 		return false;
 	}
-}
-
-static int static_key_add_prog(struct bpf_map *map, struct bpf_prog *prog)
-{
-	u32 key = 0;
-	int err = 0;
-	u32 *val;
-
-	mutex_lock(&map->static_key_mutex);
-
-	// XXX we only support one program now for simplicity, we should do a search here instead
-	if (map->static_key_prog == prog)
-		goto unlock_ret;
-	map->static_key_prog = prog;
-	// XXX we only support one program now for simplicity, we should do a search here instead
-
-	val = map->ops->map_lookup_elem(map, &key);
-	if (!val) {
-		err = -ENOENT;
-		goto unlock_ret;
-	}
-
-	err = bpf_update_static_branches(prog, map, *val);
-
-unlock_ret:
-	mutex_unlock(&map->static_key_mutex);
-	return err;
 }
 
 static bool is_imm8(int value)
