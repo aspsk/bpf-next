@@ -164,8 +164,7 @@ static void poke_static_branch(struct bpf_prog *prog, struct bpf_static_branch *
 	memcpy(&prog->insnsi[branch->bpf_offset / 8], bpf_op, 8);
 }
 
-static int __bpf_update_static_branch(const struct bpf_map *map,
-				      struct bpf_prog *prog, bool on)
+static int bpf_update_static_branches(struct bpf_prog *prog, const struct bpf_map *map, bool on)
 {
 	struct bpf_static_branch *branch;
 	int i;
@@ -192,17 +191,29 @@ bool __weak bpf_jit_supports_static_keys(void)
 	return false;
 }
 
-// XXX: locking :'(
-static int bpf_update_staic_branch(const struct bpf_map *map, __u32 *value)
+static int bpf_update_static_key(struct bpf_map *map, void *key, void *value, __u64 flags)
 {
 	struct bpf_prog *prog;
-	bool on = !!*value;
+	bool on = *(u32 *)value;
+	int err;
+
+	mutex_lock(&map->static_key_mutex);
+
+	err = map->ops->map_update_elem(map, key, value, flags);
+	if (err)
+		goto unlock_ret;
 
 	prog = map->static_key_prog; // XXX: many progs should be allowed
-	if (!prog)
-		return -EINVAL;
+	if (!prog) {
+		err = -EINVAL;
+		goto unlock_ret;
+	}
 
-	return __bpf_update_static_branch(map, prog, on);
+	err = bpf_update_static_branches(prog, map, on);
+
+unlock_ret:
+	mutex_unlock(&map->static_key_mutex);
+	return err;
 }
 
 static u32 bpf_map_value_size(const struct bpf_map *map)
@@ -275,14 +286,10 @@ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
 		   map->map_type == BPF_MAP_TYPE_STACK ||
 		   map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
 		err = map->ops->map_push_elem(map, value, flags);
-	} else if (map->map_type == BPF_MAP_TYPE_ARRAY &&
-		map->map_flags & BPF_F_STATIC_KEY) {
-		err = bpf_update_staic_branch(map, value);
-		if (!err) {
-			rcu_read_lock();
-			err = map->ops->map_update_elem(map, key, value, flags);
-			rcu_read_unlock();
-		}
+	} else if (map->map_flags & BPF_F_STATIC_KEY) {
+		rcu_read_lock();
+		err = bpf_update_static_key(map, key, value, flags);
+		rcu_read_unlock();
 	} else {
 		rcu_read_lock();
 		err = map->ops->map_update_elem(map, key, value, flags);
@@ -1328,6 +1335,7 @@ static int map_create(union bpf_attr *attr)
 	atomic64_set(&map->refcnt, 1);
 	atomic64_set(&map->usercnt, 1);
 	mutex_init(&map->freeze_mutex);
+	mutex_init(&map->static_key_mutex);
 	spin_lock_init(&map->owner.lock);
 
 	if (attr->btf_key_type_id || attr->btf_value_type_id ||
@@ -2690,10 +2698,31 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 	}
 }
 
-static void static_key_add_prog(struct bpf_map *static_key, struct bpf_prog *prog)
+static int static_key_add_prog(struct bpf_map *map, struct bpf_prog *prog)
 {
-	// XXX we only support one program now for simplicity
-	static_key->static_key_prog = prog;
+	u32 key = 0;
+	int err = 0;
+	u32 *val;
+
+	mutex_lock(&map->static_key_mutex);
+
+	// XXX we only support one program now for simplicity, we should do a search here instead
+	if (map->static_key_prog == prog)
+		goto unlock_ret;
+	map->static_key_prog = prog;
+	// XXX we only support one program now for simplicity, we should do a search here instead
+
+	val = map->ops->map_lookup_elem(map, &key);
+	if (!val) {
+		err = -ENOENT;
+		goto unlock_ret;
+	}
+
+	err = bpf_update_static_branches(prog, map, *val);
+
+unlock_ret:
+	mutex_unlock(&map->static_key_mutex);
+	return err;
 }
 
 static bool is_imm8(int value)
@@ -2878,22 +2907,17 @@ free_branches:
 	return err;
 }
 
-static bool static_key_value(struct bpf_map *map)
-{
-	struct bpf_array *array = container_of(map, struct bpf_array, map);
-
-	return *(int *)array->value;
-}
-
-static int bpf_prog_enable_static_branches(struct bpf_prog *prog)
+static int bpf_prog_register_static_branches(struct bpf_prog *prog)
 {
 	struct bpf_static_branch *branch;
+	int err;
 	u32 i;
 
 	for (i = 0; i < prog->aux->static_branches_len; i++) {
 		branch = &prog->aux->static_branches[i];
-		static_key_add_prog(branch->map, prog);
-		__bpf_update_static_branch(branch->map, prog, static_key_value(branch->map));
+		err = static_key_add_prog(branch->map, prog);
+		if (err)
+			break;
 	}
 
 	return 0;
@@ -3074,7 +3098,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	if (err < 0)
 		goto free_used_maps;
 
-	err = bpf_prog_enable_static_branches(prog); // XXX should this be moved after the alloc_id so that the prog can be updated by map updates?
+	err = bpf_prog_register_static_branches(prog);
 	if (err < 0)
 		goto free_used_maps;
 

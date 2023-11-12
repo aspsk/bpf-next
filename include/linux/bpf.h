@@ -289,6 +289,7 @@ struct bpf_map {
 	bool bypass_spec_v1;
 	bool frozen; /* write-once; write-protected by freeze_mutex */
 	s64 __percpu *elem_count;
+	struct mutex static_key_mutex;
 	struct bpf_prog *static_key_prog; // XXX this should be an hlist
 };
 
