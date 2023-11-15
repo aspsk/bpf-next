@@ -3244,4 +3244,9 @@ static inline bool bpf_is_subprog(const struct bpf_prog *prog)
 	return prog->aux->func_idx != 0;
 }
 
+struct bpf_prog_aux_list_elem {
+	struct list_head list;
+	struct bpf_prog_aux *aux;
+};
+
 #endif /* _LINUX_BPF_H */

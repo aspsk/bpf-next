@@ -962,15 +962,10 @@ static void prog_array_map_seq_show_elem(struct bpf_map *map, void *key,
 	rcu_read_unlock();
 }
 
-struct prog_poke_elem {
-	struct list_head list;
-	struct bpf_prog_aux *aux;
-};
-
 static int prog_array_map_poke_track(struct bpf_map *map,
 				     struct bpf_prog_aux *prog_aux)
 {
-	struct prog_poke_elem *elem;
+	struct bpf_prog_aux_list_elem *elem;
 	struct bpf_array_aux *aux;
 	int ret = 0;
 
@@ -1003,7 +998,7 @@ out:
 static void prog_array_map_poke_untrack(struct bpf_map *map,
 					struct bpf_prog_aux *prog_aux)
 {
-	struct prog_poke_elem *elem, *tmp;
+	struct bpf_prog_aux_list_elem *elem, *tmp;
 	struct bpf_array_aux *aux;
 
 	aux = container_of(map, struct bpf_array, map)->aux;
@@ -1023,7 +1018,7 @@ static void prog_array_map_poke_run(struct bpf_map *map, u32 key,
 				    struct bpf_prog *new)
 {
 	u8 *old_addr, *new_addr, *old_bypass_addr;
-	struct prog_poke_elem *elem;
+	struct bpf_prog_aux_list_elem *elem;
 	struct bpf_array_aux *aux;
 
 	aux = container_of(map, struct bpf_array, map)->aux;
@@ -1154,7 +1149,7 @@ static struct bpf_map *prog_array_map_alloc(union bpf_attr *attr)
 
 static void prog_array_map_free(struct bpf_map *map)
 {
-	struct prog_poke_elem *elem, *tmp;
+	struct bpf_prog_aux_list_elem *elem, *tmp;
 	struct bpf_array_aux *aux;
 
 	aux = container_of(map, struct bpf_array, map)->aux;
