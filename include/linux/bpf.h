@@ -300,7 +300,17 @@ struct bpf_map {
 	bool free_after_rcu_gp;
 	atomic64_t sleepable_refcnt;
 	s64 __percpu *elem_count;
+	struct list_head static_key_list_head;
+	struct mutex static_key_mutex;
 };
+
+bool bpf_jit_supports_static_keys(void);
+struct bpf_static_branch *bpf_static_branch_by_offset(struct bpf_prog *bpf_prog,
+						      u32 offset);
+int bpf_prog_register_static_branches(struct bpf_prog *prog);
+int bpf_prog_init_static_branches(struct bpf_prog *prog, union bpf_attr *attr);
+int bpf_static_key_update(struct bpf_map *map, void *key, void *value, u64 flags);
+void bpf_static_key_remove_prog(struct bpf_map *map, struct bpf_prog_aux *aux);
 
 static inline const char *btf_field_type_name(enum btf_field_type type)
 {
@@ -1398,6 +1408,17 @@ struct btf_mod_pair {
 
 struct bpf_kfunc_desc_tab;
 
+struct bpf_static_branch {
+	struct bpf_map *map;
+	u32 flags;
+	u32 bpf_offset;
+	void *arch_addr;
+	u32 arch_len;
+	u8 bpf_jmp[8];
+	u8 arch_nop[8];
+	u8 arch_jmp[8];
+};
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1490,6 +1511,8 @@ struct bpf_prog_aux {
 		struct work_struct work;
 		struct rcu_head	rcu;
 	};
+	struct bpf_static_branch *static_branches;
+	u32 static_branches_len;
 };
 
 struct bpf_prog {
@@ -3193,6 +3216,9 @@ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
 void *bpf_arch_text_copy(void *dst, void *src, size_t len);
 int bpf_arch_text_invalidate(void *dst, size_t len);
 
+int bpf_arch_poke_static_branch(struct bpf_prog *prog,
+				struct bpf_static_branch *branch, bool on);
+
 struct btf_id_set;
 bool btf_id_set_contains(const struct btf_id_set *set, u32 id);
 
@@ -3248,5 +3274,8 @@ struct bpf_prog_aux_list_elem {
 	struct list_head list;
 	struct bpf_prog_aux *aux;
 };
+
+int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map,
+			bool check_boundaries);
 
 #endif /* _LINUX_BPF_H */

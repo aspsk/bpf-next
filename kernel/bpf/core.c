@@ -2672,6 +2672,8 @@ void __bpf_free_used_maps(struct bpf_prog_aux *aux,
 		map = used_maps[i];
 		if (map->ops->map_poke_untrack)
 			map->ops->map_poke_untrack(map, aux);
+		if (map->map_flags & BPF_F_STATIC_KEY)
+			bpf_static_key_remove_prog(map, aux);
 		if (sleepable)
 			atomic64_dec(&map->sleepable_refcnt);
 		bpf_map_put(map);
@@ -2929,6 +2931,13 @@ bool __weak bpf_jit_supports_exceptions(void)
 
 void __weak arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie)
 {
+}
+
+int __weak bpf_arch_poke_static_branch(struct bpf_prog *prog,
+				       struct bpf_static_branch *branch,
+				       bool on)
+{
+	return -EOPNOTSUPP;
 }
 
 #ifdef CONFIG_BPF_SYSCALL

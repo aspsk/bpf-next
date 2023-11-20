@@ -1328,6 +1328,9 @@ enum {
 
 /* Get path from provided FD in BPF_OBJ_PIN/BPF_OBJ_GET commands */
 	BPF_F_PATH_FD		= (1U << 14),
+
+/* Treat this map as a BPF Static Key */
+	BPF_F_STATIC_KEY	= (1U << 15),
 };
 
 /* Flags for BPF_PROG_QUERY. */
@@ -1371,6 +1374,18 @@ struct bpf_stack_build_id {
 };
 
 #define BPF_OBJ_NAME_LEN 16U
+
+/* flags for bpf_static_branch_info */
+enum {
+	BPF_F_INVERSE_BRANCH = 1,
+};
+
+struct bpf_static_branch_info {
+	__u32 map_fd;			/* map in control */
+	__u32 insn_offset;		/* absolute offset of the branch instruction */
+	__u32 jump_target;		/* absolute offset of the jump target */
+	__u32 flags;
+};
 
 union bpf_attr {
 	struct { /* anonymous struct used by BPF_MAP_CREATE command */
@@ -1470,6 +1485,9 @@ union bpf_attr {
 		 * truncated), or smaller (if log buffer wasn't filled completely).
 		 */
 		__u32		log_true_size;
+		/* An array of struct bpf_static_branch_info */
+		__aligned_u64	static_branches_info;
+		__u32		static_branches_info_size;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */

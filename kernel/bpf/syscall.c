@@ -197,6 +197,10 @@ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
 		   map->map_type == BPF_MAP_TYPE_STACK ||
 		   map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
 		err = map->ops->map_push_elem(map, value, flags);
+	} else if (map->map_flags & BPF_F_STATIC_KEY) {
+		rcu_read_lock();
+		err = bpf_static_key_update(map, key, value, flags);
+		rcu_read_unlock();
 	} else {
 		rcu_read_lock();
 		err = map->ops->map_update_elem(map, key, value, flags);
@@ -1121,6 +1125,16 @@ free_map_tab:
 	return ret;
 }
 
+static bool is_static_key(u32 map_type, u32 key_size, u32 value_size,
+			    u32 max_entries, u32 map_flags)
+{
+	return map_type == BPF_MAP_TYPE_ARRAY &&
+	       key_size == 4 &&
+	       value_size == 4 &&
+	       max_entries == 1 &&
+	       map_flags & BPF_F_STATIC_KEY;
+}
+
 #define BPF_MAP_CREATE_LAST_FIELD map_extra
 /* called via syscall */
 static int map_create(union bpf_attr *attr)
@@ -1129,6 +1143,7 @@ static int map_create(union bpf_attr *attr)
 	int numa_node = bpf_map_attr_numa_node(attr);
 	u32 map_type = attr->map_type;
 	struct bpf_map *map;
+	bool static_key;
 	int f_flags;
 	int err;
 
@@ -1146,6 +1161,13 @@ static int map_create(union bpf_attr *attr)
 
 	if (attr->map_type != BPF_MAP_TYPE_BLOOM_FILTER &&
 	    attr->map_extra != 0)
+		return -EINVAL;
+
+	static_key = is_static_key(attr->map_type, attr->key_size, attr->value_size,
+				   attr->max_entries, attr->map_flags);
+	if (static_key && !bpf_jit_supports_static_keys())
+		return -EOPNOTSUPP;
+	if (!static_key && (attr->map_flags & BPF_F_STATIC_KEY))
 		return -EINVAL;
 
 	f_flags = bpf_get_file_flag(attr->map_flags);
@@ -1246,7 +1268,9 @@ static int map_create(union bpf_attr *attr)
 	atomic64_set(&map->refcnt, 1);
 	atomic64_set(&map->usercnt, 1);
 	mutex_init(&map->freeze_mutex);
+	mutex_init(&map->static_key_mutex);
 	spin_lock_init(&map->owner.lock);
+	INIT_LIST_HEAD(&map->static_key_list_head);
 
 	if (attr->btf_key_type_id || attr->btf_value_type_id ||
 	    /* Even the map's value is a kernel's struct,
@@ -2391,7 +2415,7 @@ struct bpf_prog *bpf_prog_get_type_dev(u32 ufd, enum bpf_prog_type type,
 }
 EXPORT_SYMBOL_GPL(bpf_prog_get_type_dev);
 
-static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map)
+int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map, bool check_boundaries)
 {
 	struct bpf_map **used_maps_new;
 	int i;
@@ -2399,6 +2423,13 @@ static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map)
 	for (i = 0; i < prog->aux->used_map_cnt; i++)
 		if (prog->aux->used_maps[i] == map)
 			return -EEXIST;
+
+	/*
+	 * This is ok to add more maps after the program is loaded, but not
+	 * before bpf_check, as verifier env only has MAX_USED_MAPS slots
+	 */
+	if (check_boundaries && prog->aux->used_map_cnt >= MAX_USED_MAPS)
+		return -E2BIG;
 
 	/* The bpf program will not access the bpf map, but for the sake of
 	 * simplicity, increase sleepable_refcnt for sleepable program as well.
@@ -2418,6 +2449,7 @@ static int __bpf_prog_bind_map(struct bpf_prog *prog, struct bpf_map *map)
 
 	return 0;
 }
+
 
 /* Initially all BPF programs could be loaded w/o specifying
  * expected_attach_type. Later for some of them specifying expected_attach_type
@@ -2607,7 +2639,7 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 }
 
 /* last field in 'union bpf_attr' used by this command */
-#define	BPF_PROG_LOAD_LAST_FIELD log_true_size
+#define	BPF_PROG_LOAD_LAST_FIELD static_branches_info_size
 
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
@@ -2766,12 +2798,20 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	if (err < 0)
 		goto free_prog_sec;
 
+	err = bpf_prog_init_static_branches(prog, attr);
+	if (err < 0)
+		goto free_prog_sec;
+
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
 	if (err < 0)
 		goto free_used_maps;
 
 	prog = bpf_prog_select_runtime(prog, &err);
+	if (err < 0)
+		goto free_used_maps;
+
+	err = bpf_prog_register_static_branches(prog);
 	if (err < 0)
 		goto free_used_maps;
 
@@ -5358,7 +5398,7 @@ static int bpf_prog_bind_map(union bpf_attr *attr)
 	}
 
 	mutex_lock(&prog->aux->used_maps_mutex);
-	ret = __bpf_prog_bind_map(prog, map);
+	ret = __bpf_prog_bind_map(prog, map, false);
 	mutex_unlock(&prog->aux->used_maps_mutex);
 
 	if (ret)

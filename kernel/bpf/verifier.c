@@ -15380,6 +15380,7 @@ static int visit_func_call_insn(int t, struct bpf_insn *insns,
 static int visit_insn(int t, struct bpf_verifier_env *env)
 {
 	struct bpf_insn *insns = env->prog->insnsi, *insn = &insns[t];
+	struct bpf_static_branch *branch;
 	int ret, off, insn_sz;
 
 	if (bpf_pseudo_func(insn))
@@ -15450,14 +15451,25 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 		else
 			off = insn->imm;
 
-		/* unconditional jump with single edge */
-		ret = push_insn(t, t + off + 1, FALLTHROUGH, env);
-		if (ret)
-			return ret;
+		branch = bpf_static_branch_by_offset(env->prog, t * 8);
+		if (unlikely(branch)) {
+			/* static branch with two edges */
+			mark_prune_point(env, t);
 
-		mark_prune_point(env, t + off + 1);
-		mark_jmp_point(env, t + off + 1);
+			ret = push_insn(t, t + 1, FALLTHROUGH, env);
+			if (ret)
+				return ret;
 
+			ret = push_insn(t, t + off + 1, BRANCH, env);
+		} else {
+			/* unconditional jump with single edge */
+			ret = push_insn(t, t + off + 1, FALLTHROUGH, env);
+			if (ret)
+				return ret;
+
+			mark_prune_point(env, t + off + 1);
+			mark_jmp_point(env, t + off + 1);
+		}
 		return ret;
 
 	default:
@@ -17427,6 +17439,10 @@ static int do_check(struct bpf_verifier_env *env)
 
 				mark_reg_scratched(env, BPF_REG_0);
 			} else if (opcode == BPF_JA) {
+				struct bpf_verifier_state *other_branch;
+				struct bpf_static_branch *branch;
+				u32 jmp_offset;
+
 				if (BPF_SRC(insn->code) != BPF_K ||
 				    insn->src_reg != BPF_REG_0 ||
 				    insn->dst_reg != BPF_REG_0 ||
@@ -17437,9 +17453,20 @@ static int do_check(struct bpf_verifier_env *env)
 				}
 
 				if (class == BPF_JMP)
-					env->insn_idx += insn->off + 1;
+					jmp_offset = insn->off + 1;
 				else
-					env->insn_idx += insn->imm + 1;
+					jmp_offset = insn->imm + 1;
+
+				branch = bpf_static_branch_by_offset(env->prog, env->insn_idx * 8);
+				if (unlikely(branch)) {
+					other_branch = push_stack(env, env->insn_idx + jmp_offset,
+								  env->insn_idx, false);
+					if (!other_branch)
+						return -EFAULT;
+
+					jmp_offset = 1;
+				}
+				env->insn_idx += jmp_offset;
 				continue;
 
 			} else if (opcode == BPF_EXIT) {
@@ -17733,6 +17760,11 @@ static int check_map_prog_compatibility(struct bpf_verifier_env *env,
 
 {
 	enum bpf_prog_type prog_type = resolve_prog_type(prog);
+
+	if (map->map_flags & BPF_F_STATIC_KEY) {
+		verbose(env, "progs cannot access static keys yet\n");
+		return -EINVAL;
+	}
 
 	if (btf_record_has_field(map->record, BPF_LIST_HEAD) ||
 	    btf_record_has_field(map->record, BPF_RB_ROOT)) {
@@ -18105,6 +18137,25 @@ static void adjust_poke_descs(struct bpf_prog *prog, u32 off, u32 len)
 	}
 }
 
+static void adjust_static_branches(struct bpf_prog *prog, u32 off, u32 len)
+{
+	struct bpf_static_branch *branch;
+	const u32 delta = (len - 1) * 8; /* # of new prog bytes */
+	int i;
+
+	if (len <= 1)
+		return;
+
+	for (i = 0; i < prog->aux->static_branches_len; i++) {
+		branch = &prog->aux->static_branches[i];
+		if (branch->bpf_offset <= off * 8)
+			continue;
+
+		branch->bpf_offset += delta;
+		memcpy(branch->bpf_jmp, &prog->insnsi[branch->bpf_offset/8], 8);
+	}
+}
+
 static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
 					    const struct bpf_insn *patch, u32 len)
 {
@@ -18131,6 +18182,7 @@ static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 of
 	adjust_func_info(env, off, len);
 	adjust_subprog_starts(env, off, len);
 	adjust_poke_descs(new_prog, off, len);
+	adjust_static_branches(new_prog, off, len);
 	return new_prog;
 }
 
@@ -18796,6 +18848,9 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->nr_linfo = prog->aux->nr_linfo;
 		func[i]->aux->jited_linfo = prog->aux->jited_linfo;
 		func[i]->aux->linfo_idx = env->subprog_info[i].linfo_idx;
+		func[i]->aux->static_branches = prog->aux->static_branches;
+		func[i]->aux->static_branches_len = prog->aux->static_branches_len;
+
 		num_exentries = 0;
 		insn = func[i]->insnsi;
 		for (j = 0; j < func[i]->len; j++, insn++) {
@@ -20613,6 +20668,21 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	env->ops = bpf_verifier_ops[env->prog->type];
 	env->fd_array = make_bpfptr(attr->fd_array, uattr.is_kernel);
 	is_priv = bpf_capable();
+
+	/* the program could already have referenced some maps */
+	if (env->prog->aux->used_map_cnt) {
+		if (WARN_ON(env->prog->aux->used_map_cnt > MAX_USED_MAPS ||
+			    !env->prog->aux->used_maps))
+			return -EFAULT;
+
+		memcpy(env->used_maps, env->prog->aux->used_maps,
+		       sizeof(env->used_maps[0]) * env->prog->aux->used_map_cnt);
+		env->used_map_cnt = env->prog->aux->used_map_cnt;
+
+		kfree(env->prog->aux->used_maps);
+		env->prog->aux->used_map_cnt = 0;
+		env->prog->aux->used_maps = NULL;
+	}
 
 	bpf_get_btf_vmlinux();
 
