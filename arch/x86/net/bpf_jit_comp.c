@@ -452,6 +452,32 @@ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
 	return __bpf_arch_text_poke(ip, t, old_addr, new_addr);
 }
 
+int bpf_arch_poke_static_branch(struct bpf_prog *prog,
+				struct bpf_static_branch *branch, bool on)
+{
+	static const u64 bpf_nop = BPF_JMP | BPF_JA;
+	const void *arch_op;
+	const void *bpf_op;
+	bool inverse;
+
+	if (!prog || !branch)
+		return -EINVAL;
+
+	inverse = !!(branch->flags & BPF_F_INVERSE_BRANCH);
+	if (on ^ inverse) {
+		bpf_op = branch->bpf_jmp;
+		arch_op = branch->arch_jmp;
+	} else {
+		bpf_op = &bpf_nop;
+		arch_op = branch->arch_nop;
+	}
+
+	text_poke_bp(branch->arch_addr, arch_op, branch->arch_len, NULL);
+	memcpy(&prog->insnsi[branch->bpf_offset / 8], bpf_op, 8);
+
+	return 0;
+}
+
 #define EMIT_LFENCE()	EMIT3(0x0F, 0xAE, 0xE8)
 
 static void emit_indirect_jump(u8 **pprog, int reg, u8 *ip)
@@ -1008,6 +1034,32 @@ static void emit_nops(u8 **pprog, int len)
 	*pprog = prog;
 }
 
+static __always_inline void copy_nops(u8 *dst, int len)
+{
+	BUILD_BUG_ON(len != 2 && len != 5);
+	memcpy(dst, x86_nops[len], len);
+}
+
+static __always_inline void
+arch_init_static_branch(struct bpf_static_branch *branch,
+			int len, u32 jmp_offset, void *addr)
+{
+	BUILD_BUG_ON(len != 2 && len != 5);
+
+	if (len == 2) {
+		branch->arch_jmp[0] = 0xEB;
+		branch->arch_jmp[1] = jmp_offset;
+	} else {
+		branch->arch_jmp[0] = 0xE9;
+		memcpy(&branch->arch_jmp[1], &jmp_offset, 4);
+	}
+
+	copy_nops(branch->arch_nop, len);
+
+	branch->arch_len = len;
+	branch->arch_addr = addr;
+}
+
 /* emit the 3-byte VEX prefix
  *
  * r: same as rex.r, extra bit for ModRM reg field
@@ -1078,6 +1130,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 {
 	bool tail_call_reachable = bpf_prog->aux->tail_call_reachable;
 	struct bpf_insn *insn = bpf_prog->insnsi;
+	struct bpf_static_branch *branch = NULL;
 	bool callee_regs_used[4] = {};
 	int insn_cnt = bpf_prog->len;
 	bool tail_call_seen = false;
@@ -1928,6 +1981,16 @@ emit_cond_jmp:		/* Convert BPF opcode to x86 */
 				break;
 			}
 emit_jmp:
+			if (bpf_prog->aux->static_branches_len > 0 && bpf_prog->aux->func_info) {
+				int off, idx;
+
+				idx = bpf_prog->aux->func_idx;
+				off = bpf_prog->aux->func_info[idx].insn_off + i - 1;
+				branch = bpf_static_branch_by_offset(bpf_prog, off * 8);
+			} else {
+				branch = bpf_static_branch_by_offset(bpf_prog, (i - 1) * 8);
+			}
+
 			if (is_imm8(jmp_offset)) {
 				if (jmp_padding) {
 					/* To avoid breaking jmp_offset, the extra bytes
@@ -1950,8 +2013,17 @@ emit_jmp:
 					}
 					emit_nops(&prog, INSN_SZ_DIFF - 2);
 				}
+
+				if (branch)
+					arch_init_static_branch(branch, 2, jmp_offset,
+								image + addrs[i-1]);
+
 				EMIT2(0xEB, jmp_offset);
 			} else if (is_simm32(jmp_offset)) {
+				if (branch)
+					arch_init_static_branch(branch, 5, jmp_offset,
+								image + addrs[i-1]);
+
 				EMIT1_off32(0xE9, jmp_offset);
 			} else {
 				pr_err("jmp gen bug %llx\n", jmp_offset);
