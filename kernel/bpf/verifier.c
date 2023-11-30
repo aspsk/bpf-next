@@ -18063,6 +18063,20 @@ static void adjust_insn_aux_data(struct bpf_verifier_env *env,
 	vfree(old_data);
 }
 
+static void adjust_func_info(struct bpf_verifier_env *env, u32 off, u32 len)
+{
+	int i;
+
+	if (len == 1)
+		return;
+
+	for (i = 0; i < env->prog->aux->func_info_cnt; i++) {
+		if (env->prog->aux->func_info[i].insn_off <= off)
+			continue;
+		env->prog->aux->func_info[i].insn_off += len - 1;
+	}
+}
+
 static void adjust_subprog_starts(struct bpf_verifier_env *env, u32 off, u32 len)
 {
 	int i;
@@ -18114,6 +18128,7 @@ static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 of
 		return NULL;
 	}
 	adjust_insn_aux_data(env, new_data, new_prog, off, len);
+	adjust_func_info(env, off, len);
 	adjust_subprog_starts(env, off, len);
 	adjust_poke_descs(new_prog, off, len);
 	return new_prog;
