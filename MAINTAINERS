@@ -3904,6 +3904,7 @@ M:	Anton Protopopov <aspsk@isovalent.com>
 L:	bpf@vger.kernel.org
 S:	Maintained
 F:	kernel/bpf/skey.c
+F:	tools/testing/selftests/bpf/*/*bpf_static_key*
 
 BROADCOM ASP 2.0 ETHERNET DRIVER
 M:	Justin Chen <justin.chen@broadcom.com>
