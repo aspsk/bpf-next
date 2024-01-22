@@ -349,7 +349,7 @@ void dump_xlated_plain(struct dump_data *dd, void *buf, unsigned int len,
 
 		double_insn = insn[i].code == (BPF_LD | BPF_IMM | BPF_DW);
 
-		printf("% 4d: ", i);
+		printf("% 4d[orig %4d -> jit[off=%x, len=%u]]: ", i, dd->orig_idx[i], dd->orig_to_jit[i].off, dd->orig_to_jit[i].len);
 		print_bpf_insn(&cbs, insn + i, true);
 
 		if (opcodes) {

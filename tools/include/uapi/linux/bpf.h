@@ -901,6 +901,7 @@ enum bpf_cmd {
 	BPF_ITER_CREATE,
 	BPF_LINK_DETACH,
 	BPF_PROG_BIND_MAP,
+	BPF_STATIC_BRANCH_UPDATE,
 };
 
 enum bpf_map_type {
@@ -1372,6 +1373,16 @@ struct bpf_stack_build_id {
 	};
 };
 
+/* Flags for JA insn, passed in SRC_REG */
+enum {
+	BPF_STATIC_BRANCH_JA =		1 << 0,
+	BPF_STATIC_BRANCH_INVERSE =	1 << 1,
+};
+
+#define BPF_STATIC_BRANCH_MASK (BPF_STATIC_BRANCH_JA | \
+				BPF_STATIC_BRANCH_INVERSE)
+
+
 #define BPF_OBJ_NAME_LEN 16U
 
 union bpf_attr {
@@ -1713,6 +1724,12 @@ union bpf_attr {
 		__u32		map_fd;
 		__u32		flags;		/* extra flags */
 	} prog_bind_map;
+
+	struct { /* struct used by BPF_STATIC_BRANCH_UPDATE command */
+		__u32		prog_fd;
+		__u32		insn_off;
+		__u32		on;
+	} static_branch;
 
 } __attribute__((aligned(8)));
 
