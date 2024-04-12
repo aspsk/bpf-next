@@ -1567,6 +1567,14 @@ union bpf_attr {
 		 * If provided, prog_flags should have BPF_F_TOKEN_FD flag set.
 		 */
 		__s32		prog_token_fd;
+		/* The bind_fd_array field can be used to pass a set of map file
+		 * descriptors to be bound to the program, even if the maps are
+		 * not referenced directly. The functionality is similar to the
+		 * BPF_PROG_BIND_MAP syscall, but maps can be used by the
+		 * verifier during the program load.
+		 */
+		__aligned_u64	bind_fd_array;
+		__u32		bind_fd_array_cnt;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */

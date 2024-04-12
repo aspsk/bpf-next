@@ -21495,6 +21495,49 @@ struct btf *bpf_get_btf_vmlinux(void)
 	return btf_vmlinux;
 }
 
+static int env_init_fd_array_fd(struct bpf_verifier_env *env, int fd)
+{
+	struct bpf_map *map;
+	struct fd f;
+	int ret;
+
+	f = fdget(fd);
+	map = __bpf_map_get(f);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	ret = env_record_map(env, map, NULL);
+	fdput(f);
+	return ret;
+}
+
+static int env_bind_fd_array_init(struct bpf_verifier_env *env, bpfptr_t bind_fd_array, int cnt)
+{
+	int size = sizeof(int) * cnt;
+	int *copy;
+	int ret;
+	int i;
+
+	copy = kzalloc(size, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+
+	if (copy_from_bpfptr_offset(copy, bind_fd_array, 0, size)) {
+		ret = -EFAULT;
+		goto end;
+	}
+
+	for (i = 0; i < cnt; i++) {
+		ret = env_init_fd_array_fd(env, copy[i]);
+		if (ret)
+			goto end;
+	}
+
+end:
+	kfree(copy);
+	return ret;
+}
+
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
 {
 	u64 start_time = ktime_get_ns();
@@ -21527,6 +21570,14 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	env->prog = *prog;
 	env->ops = bpf_verifier_ops[env->prog->type];
 	env->fd_array = make_bpfptr(attr->fd_array, uattr.is_kernel);
+
+	if (attr->bind_fd_array_cnt) {
+		ret = env_bind_fd_array_init(env,
+					     make_bpfptr(attr->bind_fd_array, uattr.is_kernel),
+					     attr->bind_fd_array_cnt);
+		if (ret)
+			goto err_free_aux_data;
+	}
 
 	env->allow_ptr_leaks = bpf_allow_ptr_leaks(env->prog->aux->token);
 	env->allow_uninit_stack = bpf_allow_uninit_stack(env->prog->aux->token);
@@ -21734,6 +21785,7 @@ err_release_maps:
 err_unlock:
 	if (!is_priv)
 		mutex_unlock(&bpf_verifier_lock);
+err_free_aux_data:
 	vfree(env->insn_aux_data);
 err_free_env:
 	kfree(env);
