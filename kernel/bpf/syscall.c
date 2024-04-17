@@ -1297,6 +1297,7 @@ static int map_create(union bpf_attr *attr)
 	case BPF_MAP_TYPE_USER_RINGBUF:
 	case BPF_MAP_TYPE_CGROUP_STORAGE:
 	case BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE:
+	case BPF_MAP_TYPE_INSN_SET:
 		/* unprivileged */
 		break;
 	case BPF_MAP_TYPE_SK_STORAGE:
