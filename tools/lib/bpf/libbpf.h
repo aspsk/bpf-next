@@ -1880,6 +1880,8 @@ LIBBPF_API int libbpf_register_prog_handler(const char *sec,
  */
 LIBBPF_API int libbpf_unregister_prog_handler(int handler_id);
 
+LIBBPF_API void bpf_program__set_bind_fd_array(struct bpf_program *obj, int *bind_fd_array, size_t bind_fd_array_cnt);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

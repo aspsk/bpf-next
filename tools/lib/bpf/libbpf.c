@@ -470,6 +470,9 @@ struct bpf_program {
 	__u32 line_info_rec_size;
 	__u32 line_info_cnt;
 	__u32 prog_flags;
+
+	int *bind_fd_array;
+	size_t bind_fd_array_cnt;
 };
 
 struct bpf_struct_ops {
@@ -7420,6 +7423,10 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
 	load_attr.prog_flags = prog->prog_flags;
 	load_attr.fd_array = obj->fd_array;
 
+	pr_warn("[libbpf] object %s: prog '%s': bind_fd_array_cnt=%zd\n", obj->name, prog->name, prog->bind_fd_array_cnt);
+	load_attr.bind_fd_array = prog->bind_fd_array;
+	load_attr.bind_fd_array_cnt = prog->bind_fd_array_cnt;
+
 	load_attr.token_fd = obj->token_fd;
 	if (obj->token_fd)
 		load_attr.prog_flags |= BPF_F_TOKEN_FD;
@@ -7440,6 +7447,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
 	load_attr.expected_attach_type = prog->expected_attach_type;
 
 	if (obj->gen_loader) {
+		pr_warn("[libbpf] prog '%s': running bpf_gen__prog_load\n", prog->name);
 		bpf_gen__prog_load(obj->gen_loader, prog->type, prog->name,
 				   license, insns, insns_cnt, &load_attr,
 				   prog - obj->programs);
@@ -7479,6 +7487,7 @@ retry_load:
 	load_attr.log_size = log_buf_size;
 	load_attr.log_level = log_level;
 
+	pr_warn("[libbpf] prog '%s': calling bpf_prog_load: CNT=%zd\n", prog->name, prog->bind_fd_array_cnt);
 	ret = bpf_prog_load(prog->type, prog_name, license, insns, insns_cnt, &load_attr);
 	if (ret >= 0) {
 		if (log_level && own_log_buf) {
@@ -8444,7 +8453,8 @@ static int bpf_object_prepare_struct_ops(struct bpf_object *obj)
 	return 0;
 }
 
-static int bpf_object_load(struct bpf_object *obj, int extra_log_level, const char *target_btf_path)
+static int bpf_object_load(struct bpf_object *obj, int extra_log_level, const char *target_btf_path,
+		void *s, int (*foo_foo)(void*))
 {
 	int err, i;
 
@@ -8469,6 +8479,8 @@ static int bpf_object_load(struct bpf_object *obj, int extra_log_level, const ch
 	err = err ? : bpf_object__relocate(obj, obj->btf_custom_path ? : target_btf_path);
 	err = err ? : bpf_object__sanitize_and_load_btf(obj);
 	err = err ? : bpf_object__create_maps(obj);
+	if (foo_foo)
+		err = err ? : foo_foo(s); // XXX hack
 	err = err ? : bpf_object__load_progs(obj, extra_log_level);
 	err = err ? : bpf_object_init_prog_arrays(obj);
 	err = err ? : bpf_object_prepare_struct_ops(obj);
@@ -8515,7 +8527,7 @@ out:
 
 int bpf_object__load(struct bpf_object *obj)
 {
-	return bpf_object_load(obj, 0, NULL);
+	return bpf_object_load(obj, 0, NULL, NULL, NULL);
 }
 
 static int make_parent_dir(const char *path)
@@ -13827,11 +13839,47 @@ void bpf_object__destroy_subskeleton(struct bpf_object_subskeleton *s)
 	free(s);
 }
 
+#if 0
+
+	int map_cnt;
+	int map_skel_sz; /* sizeof(struct bpf_map_skeleton) */
+	struct bpf_map_skeleton *maps;
+
+	int prog_cnt;
+	int prog_skel_sz; /* sizeof(struct bpf_prog_skeleton) */
+
+	struct bpf_prog_skeleton *progs;
+
+#endif
+
+// XXX hack hack hack
+static int fixup_bind_maps(void *x)
+{
+	struct bpf_object_skeleton *s = x;
+	int i, j, k;
+
+	for (i = 0; i < s->prog_cnt; i++) {
+		struct bpf_program *prog = *(s->progs[i].prog);
+		if (prog->bind_fd_array_cnt)
+			for (j = 0; j < prog->bind_fd_array_cnt; j++) {
+				struct bpf_map *map = *(s->maps[prog->bind_fd_array[j]].map);
+				prog->bind_fd_array[j] = map->fd; // XXX
+
+				// XXX XXX XXX
+				for (k = 0; k < bpf_program__insn_cnt(prog); k++) {
+					bpf_map_update_elem(map->fd, &k, &k, 0);
+				}
+			}
+	}
+
+	return 0;
+}
+
 int bpf_object__load_skeleton(struct bpf_object_skeleton *s)
 {
 	int i, err;
 
-	err = bpf_object__load(*s->obj);
+	err = bpf_object_load(*s->obj, 0, NULL, s, fixup_bind_maps);;
 	if (err) {
 		pr_warn("failed to load BPF skeleton '%s': %d\n", s->name, err);
 		return libbpf_err(err);
@@ -13949,4 +13997,11 @@ void bpf_object__destroy_skeleton(struct bpf_object_skeleton *s)
 	free(s->maps);
 	free(s->progs);
 	free(s);
+}
+
+void bpf_program__set_bind_fd_array(struct bpf_program *prog, int *bind_fd_array, size_t bind_fd_array_cnt)
+{
+	pr_warn("[libbpf] %s(%p, %zd)\n", __func__, bind_fd_array, bind_fd_array_cnt);
+	prog->bind_fd_array = bind_fd_array;
+	prog->bind_fd_array_cnt = bind_fd_array_cnt;
 }

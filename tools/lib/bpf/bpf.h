@@ -86,6 +86,9 @@ struct bpf_prog_load_opts {
 
 	const int *fd_array;
 
+	const int *bind_fd_array;
+	size_t bind_fd_array_cnt;
+
 	/* .BTF.ext func info data */
 	const void *func_info;
 	__u32 func_info_cnt;
