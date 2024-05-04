@@ -1317,6 +1317,8 @@ static void emit_shiftx(u8 **pprog, u32 dst_reg, u8 src_reg, bool is64, u8 op)
 #define RESTORE_TAIL_CALL_CNT(stack)				\
 	EMIT3_off32(0x48, 0x8B, 0x85, -round_up(stack, 8) - 8)
 
+void bpf_prog_update_jitted_insn_offset(struct bpf_prog *bpf_prog, u32 xlated_off, u32 jitted_off, u32 jitted_len, u32 jump_offset, void *ip); // XXX where to declare?
+
 static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image,
 		  int oldproglen, struct jit_context *ctx, bool jmp_padding)
 {
@@ -1372,11 +1374,14 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	prog = temp;
 
 	for (i = 1; i <= insn_cnt; i++, insn++) {
+		u32 func_idx = bpf_prog->aux->func_idx;
 		const s32 imm32 = insn->imm;
 		u32 dst_reg = insn->dst_reg;
 		u32 src_reg = insn->src_reg;
+		int adjust_off = 0;
 		u8 b2 = 0, b3 = 0;
 		u8 *start_of_ldx;
+		int abs_xlated_off;
 		s64 jmp_offset;
 		s16 insn_off;
 		u8 jmp_cond;
@@ -1522,6 +1527,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 			emit_mov_imm64(&prog, dst_reg, insn[1].imm, insn[0].imm);
 			insn++;
 			i++;
+			adjust_off = 1;
 			break;
 
 			/* dst %= src, dst /= src, dst %= imm32, dst /= imm32 */
@@ -2356,6 +2362,15 @@ emit_jmp:
 				return -EFAULT;
 			}
 			memcpy(rw_image + proglen, temp, ilen);
+
+			/*
+			 * Static keys, if present, need to know which jitted
+			 * instructions to patch
+			 */
+			abs_xlated_off = i - 1 - adjust_off;
+			if (func_idx)
+				abs_xlated_off += bpf_prog->aux->func_info[func_idx].insn_off;
+			bpf_prog_update_jitted_insn_offset(bpf_prog, abs_xlated_off, proglen, ilen, jmp_offset, image + proglen);
 		}
 		proglen += ilen;
 		addrs[i] = proglen;
