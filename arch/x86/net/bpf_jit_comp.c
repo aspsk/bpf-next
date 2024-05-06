@@ -3630,3 +3630,32 @@ u64 bpf_arch_uaddress_limit(void)
 {
 	return 0;
 }
+
+int bpf_arch_poke_static_branch(void *ip, int jmp_offset, u32 len, bool on)
+{
+	u8 op[5];
+
+	if (WARN_ON_ONCE(is_imm8(jmp_offset) && len != 2))
+		return -EINVAL;
+
+	if (WARN_ON_ONCE(!is_imm8(jmp_offset) && len != 5))
+		return -EINVAL;
+
+	if (on) {
+		if (len == 2) {
+			op[0] = 0xEB;
+			op[1] = jmp_offset;
+		} else {
+			op[0] = 0xE9;
+			memcpy(&op[1], &jmp_offset, 4);
+		}
+	} else {
+		memcpy(op, x86_nops[len], len);
+	}
+
+	mutex_lock(&text_mutex);
+	text_poke_bp(ip, op, len, NULL);
+	mutex_unlock(&text_mutex);
+
+	return 0;
+}

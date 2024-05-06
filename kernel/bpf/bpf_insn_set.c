@@ -24,7 +24,7 @@ struct insn_ptr {
 		void *jitted_ip;
 		u32 jitted_off;
 		u32 jitted_len;
-		u32 jitted_jump_offset;
+		int jitted_jump_offset;
 	};
 };
 
@@ -236,4 +236,39 @@ void bpf_prog_update_jitted_insn_offset(struct bpf_prog *prog, u32 xlated_off, u
 		ptr->jitted_len = jitted_len;
 		ptr->jitted_jump_offset = jitted_jump_offset;
 	}
+}
+
+int bpf_static_key_set(struct bpf_map *map, bool on); // XXX
+
+int bpf_static_key_set(struct bpf_map *map, bool on)
+{
+	struct bpf_insn_set *insn_set;
+	struct insn_ptr *ptr;
+	int ret = 0;
+	int i;
+
+	if (map->map_type != BPF_MAP_TYPE_INSN_SET)
+		return -EINVAL;
+
+	// XXX if (!(map->map_flags & BPF_F_STATIC_KEY)) return -EINVAL;
+
+	// XXX lock
+	// XXX how can we be sure that IP still points to something reasonable and that the program is not rleased yet?
+
+
+	insn_set = container_of(map, struct bpf_insn_set, map);
+
+	for (i = 0; i < map->max_entries; i++) {
+		bool inverse = false; // XXX: set it
+		on ^= inverse;
+
+		ptr = &insn_set->ptrs[i];
+		ret = bpf_arch_poke_static_branch(ptr->jitted_ip, ptr->jitted_off, ptr->jitted_len, on);
+		if (ret)
+			break;
+	}
+
+	// XXX unlock
+
+	return ret;
 }

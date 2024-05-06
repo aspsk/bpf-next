@@ -903,6 +903,19 @@ union bpf_iter_link_info {
  *		A new file descriptor (a nonnegative integer), or -1 if an
  *		error occurred (in which case, *errno* is set appropriately).
  *
+ * BPF_STATIC_KEY_UPDATE
+ *	Description
+ *		Turn a static key on/off: update jitted code for the specified
+ *		jump instructions controlled by the *map_fd* static key.
+ *		Depending on the type of instruction (goto_or_nop/nop_or_goto)
+ *		and the *on* parameter the binary code of each instruction is
+ *		set to either jump or nop.
+ *
+ *	Return
+ *		Returns zero on success. On error, -1 is returned and *errno*
+ *		is set appropriately.
+ *
+ *
  * NOTES
  *	eBPF objects (maps and programs) can be shared between processes.
  *
@@ -958,6 +971,7 @@ enum bpf_cmd {
 	BPF_LINK_DETACH,
 	BPF_PROG_BIND_MAP,
 	BPF_TOKEN_CREATE,
+	BPF_STATIC_KEY_UPDATE,
 	__MAX_BPF_CMD,
 };
 
@@ -1843,6 +1857,11 @@ union bpf_attr {
 		__u32		flags;
 		__u32		bpffs_fd;
 	} token_create;
+
+	struct { /* struct used by BPF_STATIC_KEY_UPDATE command */
+		__u32		map_fd;
+		__u32		on;
+	} static_key;
 
 } __attribute__((aligned(8)));
 

@@ -1606,6 +1606,31 @@ err_put:
 	return err;
 }
 
+#define BPF_STATIC_KEY_UPDATE_LAST_FIELD static_key.on
+
+int bpf_static_key_set(struct bpf_map *map, bool on); // XXX
+
+static int bpf_static_key_update(const union bpf_attr *attr)
+{
+	bool on = attr->static_key.on & 1;
+	struct bpf_map *map;
+	int ret;
+
+	if (CHECK_ATTR(BPF_STATIC_KEY_UPDATE))
+		return -EINVAL;
+
+	if (attr->static_key.on & ~1)
+		return -EINVAL;
+
+	map = bpf_map_get(attr->static_key.map_fd);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	ret = bpf_static_key_set(map, on);
+
+	bpf_map_put(map);
+	return ret;
+}
 
 #define BPF_MAP_UPDATE_ELEM_LAST_FIELD flags
 
@@ -5804,6 +5829,9 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_TOKEN_CREATE:
 		err = token_create(&attr);
+		break;
+	case BPF_STATIC_KEY_UPDATE:
+		err = bpf_static_key_update(&attr);
 		break;
 	default:
 		err = -EINVAL;
