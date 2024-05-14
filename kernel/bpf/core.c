@@ -532,6 +532,7 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 	BUG_ON(bpf_adj_branches(prog_adj, off, off + 1, off + len, false));
 
 	bpf_adj_linfo(prog_adj, off, insn_delta);
+	// XXX: before the JIT patch we need to adjust fun_info, see 90169990a446d242a88890496b3f63348ef908d7; make this a separate commit
 
 	return prog_adj;
 }
@@ -551,6 +552,8 @@ int bpf_remove_insns(struct bpf_prog *prog, u32 off, u32 cnt)
 	WARN_ON_ONCE(err);
 	if (err)
 		return err;
+
+	// XXX: insn sets
 
 	return 0;
 }
