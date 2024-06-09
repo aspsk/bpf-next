@@ -7457,6 +7457,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
 	load_attr.log_level = log_level;
 	load_attr.prog_flags = prog->prog_flags;
 	load_attr.fd_array = obj->fd_array;
+	load_attr.fd_array_cnt = obj->fd_array_cnt;
 
 	load_attr.token_fd = obj->token_fd;
 	if (obj->token_fd)

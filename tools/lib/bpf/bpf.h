@@ -107,6 +107,9 @@ struct bpf_prog_load_opts {
 	 */
 	__u32 log_true_size;
 	__u32 token_fd;
+
+	/* if set, provides the length of fd_array */
+	__u32 fd_array_cnt;
 	size_t :0;
 };
 #define bpf_prog_load_opts__last_field token_fd
