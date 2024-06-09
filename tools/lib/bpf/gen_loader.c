@@ -187,11 +187,10 @@ static int add_map_fd(struct bpf_gen *gen)
 
 static int add_kfunc_btf_fd(struct bpf_gen *gen)
 {
-	int cur;
-
 	if (gen->nr_fd_array == MAX_KFUNC_DESCS) {
-		cur = add_data(gen, NULL, sizeof(int));
-		return (cur - gen->fd_array) / sizeof(int);
+		pr_warn("Total kfunc descs exceeds %d\n", MAX_KFUNC_DESCS);
+		gen->error = -E2BIG;
+		return 0;
 	}
 	return MAX_USED_MAPS + gen->nr_fd_array++;
 }
