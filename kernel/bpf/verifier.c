@@ -22077,6 +22077,64 @@ struct btf *bpf_get_btf_vmlinux(void)
 	return btf_vmlinux;
 }
 
+static int env_add_map_from_fd_array(struct bpf_verifier_env *env, int fd)
+{
+	struct bpf_map *map;
+	struct fd f;
+	int ret;
+
+	f = fdget(fd);
+
+	/*
+	 * fd_array may contain map_fds, btf_fds, and trash.
+	 * Ignore everything except maps for now.
+	 */
+	map = __bpf_map_get(f);
+	if (IS_ERR(map))
+		return 0;
+
+	ret = env_record_map(env, map, NULL);
+	fdput(f);
+	return ret;
+}
+
+static int env_init_fd_array(struct bpf_verifier_env *env, union bpf_attr *attr, bpfptr_t uattr)
+{
+	int size = sizeof(int) * attr->fd_array_cnt;
+	int ret = 0;
+	int *copy;
+	int i;
+
+	env->fd_array = make_bpfptr(attr->fd_array, uattr.is_kernel);
+
+	/*
+	 * The only difference between old (no fd_array_cnt is given) and new
+	 * APIs is that in the latter case the fd_array is expected to be
+	 * continuous and is scanned for map fds right away
+	 */
+	if (!size)
+		return 0;
+
+	copy = kzalloc(size, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+
+	if (copy_from_bpfptr_offset(copy, env->fd_array, 0, size)) {
+		ret = -EFAULT;
+		goto free_copy;
+	}
+
+	for (i = 0; i < attr->fd_array_cnt; i++) {
+		ret = env_add_map_from_fd_array(env, copy[i]);
+		if (ret)
+			goto free_copy;
+	}
+
+free_copy:
+	kfree(copy);
+	return ret;
+}
+
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
 {
 	u64 start_time = ktime_get_ns();
@@ -22108,7 +22166,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 		env->insn_aux_data[i].orig_idx = i;
 	env->prog = *prog;
 	env->ops = bpf_verifier_ops[env->prog->type];
-	env->fd_array = make_bpfptr(attr->fd_array, uattr.is_kernel);
+	ret = env_init_fd_array(env, attr, uattr);
+	if (ret)
+		goto err_free_aux_data;
 
 	env->allow_ptr_leaks = bpf_allow_ptr_leaks(env->prog->aux->token);
 	env->allow_uninit_stack = bpf_allow_uninit_stack(env->prog->aux->token);
@@ -22326,6 +22386,7 @@ err_release_maps:
 err_unlock:
 	if (!is_priv)
 		mutex_unlock(&bpf_verifier_lock);
+err_free_aux_data:
 	vfree(env->insn_aux_data);
 err_free_env:
 	kfree(env);
