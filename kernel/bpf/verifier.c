@@ -19261,7 +19261,7 @@ static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 of
 	}
 	adjust_insn_aux_data(env, new_data, new_prog, off, len);
 	adjust_subprog_starts(env, off, len);
-	adjust_insn_sets(env, off, len);
+	adjust_insn_sets(env, off, len); // XXX this should be moved to bpf_patch_insn_single, otherwise the verifier breaks; This also means that we need to move tracking of the sets to the program structure. Upd: what did I mean here?
 	adjust_poke_descs(new_prog, off, len);
 	return new_prog;
 }

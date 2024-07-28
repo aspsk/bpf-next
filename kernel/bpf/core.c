@@ -567,6 +567,8 @@ int bpf_remove_insns(struct bpf_prog *prog, u32 off, u32 cnt)
 	if (err)
 		return err;
 
+	// XXX: should we do anything specific about instruction sets here? At the least, we need to check that we don't have instruction pointers pointing to removed instructions. This can happen, for example, if we pass a "full" map which tracks every instruction; should we allow this at all?
+
 	return 0;
 }
 
