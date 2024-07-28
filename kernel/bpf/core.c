@@ -475,6 +475,20 @@ static void bpf_adj_linfo(struct bpf_prog *prog, u32 off, u32 delta)
 		linfo[i].insn_off += delta;
 }
 
+static void adjust_func_info(struct bpf_prog *prog, u32 off, u32 delta)
+{
+	int i;
+
+	if (delta == 0)
+		return;
+
+	for (i = 0; i < prog->aux->func_info_cnt; i++) {
+		if (prog->aux->func_info[i].insn_off <= off)
+			continue;
+		prog->aux->func_info[i].insn_off += delta;
+	}
+}
+
 struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 				       const struct bpf_insn *patch, u32 len)
 {
@@ -532,6 +546,7 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 	BUG_ON(bpf_adj_branches(prog_adj, off, off + 1, off + len, false));
 
 	bpf_adj_linfo(prog_adj, off, insn_delta);
+	adjust_func_info(prog_adj, off, insn_delta);
 
 	return prog_adj;
 }
