@@ -17,14 +17,25 @@
 
 #define MAX_ISET_ENTRIES 64
 
+struct insn_ptr {
+	u32 xlated_off;
+
+	struct {
+		void *jitted_ip;
+		u32 jitted_off;
+		u32 jitted_len;
+		u32 jitted_jump_offset;
+	};
+};
+
 struct bpf_insn_set {
 	struct bpf_map map;
-	DECLARE_FLEX_ARRAY(u32, ptrs);
+	DECLARE_FLEX_ARRAY(struct insn_ptr, ptrs);
 };
 
 static inline u32 insn_set_map_alloc_size(u32 max_entries)
 {
-	return sizeof(struct bpf_insn_set) + 4 * max_entries;
+	return sizeof(struct bpf_insn_set) + sizeof(struct insn_ptr) * max_entries;
 }
 
 static int insn_set_map_alloc_check(union bpf_attr *attr)
@@ -81,7 +92,7 @@ static void *insn_set_map_lookup_elem(struct bpf_map *map, void *key)
 	if (unlikely(index >= insn_set->map.max_entries))
 		return NULL;
 
-	return &insn_set->ptrs[index];
+	return &insn_set->ptrs[index].xlated_off;
 }
 
 static long insn_set_map_update_elem(struct bpf_map *map, void *key, void *value, u64 map_flags)
@@ -98,7 +109,7 @@ static long insn_set_map_update_elem(struct bpf_map *map, void *key, void *value
 	if (unlikely(map_flags & BPF_NOEXIST))
 		return -EEXIST;
 
-	copy_map_value(map, &insn_set->ptrs[index], value);
+	copy_map_value(map, &insn_set->ptrs[index].xlated_off, value);
 
 	return 0;
 }
@@ -178,8 +189,51 @@ void insn_set_map_adjust(struct bpf_map *map, u32 off, u32 len)
 		return;
 
 	for (i = 0; i < map->max_entries; i++) {
-		if (insn_set->ptrs[i] <= off)
+		if (insn_set->ptrs[i].xlated_off <= off)
 			continue;
-		insn_set->ptrs[i] += diff;
+		insn_set->ptrs[i].xlated_off += diff;
+	}
+}
+
+// XXX really stupid brute force implementation
+// XXX is verifier env still alive by this point?
+static struct insn_ptr *insn_ptr_by_offset(struct bpf_prog *prog, u32 xlated_off)
+{
+	struct bpf_insn_set *insn_set;
+	struct bpf_map *map;
+	int i, j;
+
+	for (i = 0; i < prog->aux->used_map_cnt; i++) {
+		map = prog->aux->used_maps[i];
+		if (map->map_type != BPF_MAP_TYPE_INSN_SET)
+			continue;
+/*
+ XXX
+		if (!(map->map_flags & BPF_F_STATIC_KEY))
+			continue;
+*/
+
+		insn_set = container_of(map, struct bpf_insn_set, map);
+		for (j = 0; j < map->max_entries; j++) {
+			if (insn_set->ptrs[j].xlated_off == xlated_off) // XXX subprogs? :hmm:
+				return &insn_set->ptrs[j];
+		}
+	}
+
+	// XXX when adding a map we need to check that only unique offsets are present
+
+	return NULL;
+}
+
+void bpf_prog_update_jitted_insn_offset(struct bpf_prog *prog, u32 xlated_off, u32 jitted_off, u32 jitted_len, u32 jitted_jump_offset, void *jitted_ip)
+{
+	struct insn_ptr *ptr;
+
+	ptr = insn_ptr_by_offset(prog, xlated_off);
+	if (ptr) {
+		ptr->jitted_ip = jitted_ip;
+		ptr->jitted_off = jitted_off;
+		ptr->jitted_len = jitted_len;
+		ptr->jitted_jump_offset = jitted_jump_offset;
 	}
 }

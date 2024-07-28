@@ -3434,4 +3434,7 @@ static inline bool bpf_is_subprog(const struct bpf_prog *prog)
 
 void insn_set_map_adjust(struct bpf_map *map, u32 off, u32 len);
 
+// XXX
+void bpf_prog_update_jitted_insn_offset(struct bpf_prog *prog, u32 xlated_off, u32 jitted_off, u32 jitted_len, u32 jitted_jump_offset, void *jitted_ip);
+
 #endif /* _LINUX_BPF_H */
