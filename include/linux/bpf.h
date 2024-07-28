@@ -3432,4 +3432,6 @@ static inline bool bpf_is_subprog(const struct bpf_prog *prog)
 	return prog->aux->func_idx != 0;
 }
 
+void insn_set_map_adjust(struct bpf_map *map, u32 off, u32 len);
+
 #endif /* _LINUX_BPF_H */

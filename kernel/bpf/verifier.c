@@ -18927,6 +18927,11 @@ static int env_record_map(struct bpf_verifier_env *env, struct bpf_map *map, int
 
 	env->used_maps[env->used_map_cnt++] = map;
 
+	/* XXX What kind of sanity checks should we enforce on this map? Should we
+	 * XXX define a map sub-type to enforce different sets of sanity checks? */
+	if (map->map_type == BPF_MAP_TYPE_INSN_SET)
+		env->insn_set_maps[env->insn_set_map_cnt++] = map;
+
 ret_index:
 	if (index_ptr)
 		*index_ptr = map_index;
@@ -19182,6 +19187,17 @@ static void adjust_subprog_starts(struct bpf_verifier_env *env, u32 off, u32 len
 	}
 }
 
+static void adjust_insn_sets(struct bpf_verifier_env *env, u32 off, u32 len)
+{
+	int i;
+
+	if (len == 1)
+		return;
+
+	for (i = 0; i < env->insn_set_map_cnt; i++)
+		insn_set_map_adjust(env->insn_set_maps[i], off, len);
+}
+
 static void adjust_poke_descs(struct bpf_prog *prog, u32 off, u32 len)
 {
 	struct bpf_jit_poke_descriptor *tab = prog->aux->poke_tab;
@@ -19220,6 +19236,7 @@ static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 of
 	}
 	adjust_insn_aux_data(env, new_data, new_prog, off, len);
 	adjust_subprog_starts(env, off, len);
+	adjust_insn_sets(env, off, len);
 	adjust_poke_descs(new_prog, off, len);
 	return new_prog;
 }
