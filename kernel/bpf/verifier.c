@@ -15950,6 +15950,8 @@ enforce_retval:
 	return 0;
 }
 
+// XXX all comments look outdated
+
 /* non-recursive DFS pseudo code
  * 1  procedure DFS-iterative(G,v):
  * 2      label v as discovered
@@ -16333,6 +16335,57 @@ static int mark_nocsr_patterns(struct bpf_verifier_env *env)
 	return 0;
 }
 
+// XXX
+static struct bpf_map *env_get_map(struct bpf_verifier_env *env, int fd, int *index_ptr);
+
+#define GET_HIGH(STATE)		((u16)((STATE) >> 16))
+#define SET_HIGH(STATE, LAST)	STATE = (STATE & 0xffffU) | ((LAST) << 16)
+
+static int push_goto_void_edge(int t, struct bpf_verifier_env *env, struct bpf_map *map)
+{
+	int *insn_stack = env->cfg.insn_stack;
+	int *insn_state = env->cfg.insn_state;
+	u16 last_edge = GET_HIGH(insn_state[t]);
+	int w;
+
+	mark_prune_point(env, t);
+	// XXX jump point to w?
+
+	if (last_edge == map->max_entries)
+		return DONE_EXPLORING;
+
+	w = insn_set_xlated_offset(map, last_edge);
+	SET_HIGH(insn_state[t], last_edge + 1);
+
+	if (env->cfg.cur_stack >= env->prog->len)
+		return -E2BIG;
+	insn_stack[env->cfg.cur_stack++] = w;
+	return KEEP_EXPLORING;
+}
+
+/* "conditional jump with N edges" */
+static int visit_goto_void_insn(int t, struct bpf_verifier_env *env, int fd)
+{
+	struct bpf_map *map;
+
+	map = env_get_map(env, fd, NULL);
+	if (IS_ERR(map)) {
+		pr_warn("XXX bad map fd=%d: error=%ld\n", fd, PTR_ERR(map));
+		return PTR_ERR(map);
+	}
+
+	// XXX: BUG_ON the map should be fixed (read-only) by this time
+	// XXX: or should we mark it as read-only now, as part of this verification?
+
+	// XXX: sanity check: this should be a map
+	//		* of proper type
+	//		* pointing only inside this particular function
+
+	// XXX, and this should also be done once...
+
+	return push_goto_void_edge(t, env, map);
+}
+
 /* Visits the instruction at index t and returns one of the following:
  *  < 0 - an error occurred
  *  DONE_EXPLORING - the instruction was fully explored
@@ -16403,8 +16456,8 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 		return visit_func_call_insn(t, insns, env, insn->src_reg == BPF_PSEUDO_CALL);
 
 	case BPF_JA:
-		if (BPF_SRC(insn->code) != BPF_K)
-			return -EINVAL;
+		if (BPF_SRC(insn->code) == BPF_X)
+			return visit_goto_void_insn(t, env, insn->imm);
 
 		if (BPF_CLASS(insn->code) == BPF_JMP)
 			off = insn->off;
@@ -16413,7 +16466,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 
 		if (insn->src_reg & BPF_STATIC_BRANCH_JA) {
 			/* static branch - jump with two edges */
-			mark_prune_point(env, t);
+			mark_prune_point(env, t); // XXX ? maybe this is not correct?
 
 			ret = push_insn(t, t + 1, FALLTHROUGH, env);
 			if (ret)
@@ -18486,6 +18539,42 @@ static int do_check(struct bpf_verifier_env *env)
 				struct bpf_verifier_state *other_branch;
 				u32 jmp_offset;
 
+				if (BPF_SRC(insn->code) == BPF_X) {
+					struct bpf_map *map;
+					u64 umin, umax;
+					int fd;
+					u32 i;
+
+					fd = insn->imm;
+					map = env_get_map(env, fd, NULL);
+					if (IS_ERR(map))
+						return PTR_ERR(map);
+
+					// XXX do I need to check if it is bigger than u32_max?
+
+					umin = regs[insn->src_reg].umin_value;
+					umax = regs[insn->src_reg].umax_value;
+
+					if (umin >= map->max_entries || umax >= map->max_entries) {
+						verbose(env, "register R%d=[%llu,%llu] is out of bounds [0,%u)\n",
+								insn->src_reg, umin, umax, map->max_entries);
+						return -EINVAL;
+					}
+
+					for (i = umin + 1; i < map->max_entries; i++) {
+
+						// XXX find map, then, for every entry except the first one, push the other branch
+						// goto the first branch
+
+						other_branch = push_stack(env, insn_set_xlated_offset(map, i), env->insn_idx, false);
+						if (!other_branch)
+							return -EFAULT;
+					}
+
+					env->insn_idx = insn_set_xlated_offset(map, umin);
+					continue;
+				}
+
 				if (BPF_SRC(insn->code) != BPF_K ||
 				    (insn->src_reg & ~BPF_STATIC_BRANCH_MASK) ||
 				    insn->dst_reg != BPF_REG_0 ||
@@ -20464,6 +20553,54 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 				return -ENOMEM;
 
 			delta    += cnt - 1;
+			env->prog = prog = new_prog;
+			insn      = new_prog->insnsi + i + delta;
+			goto next_insn;
+		}
+
+		if ((insn->code == (BPF_JMP | BPF_JA | BPF_X) ||
+		     insn->code == (BPF_JMP32 | BPF_JA | BPF_X)) &&
+		    (insn->dst_reg == 0)) {
+			struct bpf_insn *patch = &insn_buf[0];
+			struct bpf_map *map;
+
+			map = env_get_map(env, insn->imm, NULL);
+			if (IS_ERR(map))
+				return PTR_ERR(map);
+
+			// XXX: rename it and define once!
+			struct insn_ptr {
+				void *jitted_ip; /* should go the first, which will save one
+						    instruction in `goto Rx`, see do_misc_fixups() */
+				u32 jitted_off;
+				u32 jitted_len;
+				int jitted_jump_offset;
+				u32 xlated_off;
+			};
+
+			/*
+			 * Replace BPF_JMP|BPF_JA|BPF,SRC=Rx,DST=0,IMM=fd with
+			 *
+			 * Rt = ldimm64(map_address)
+			 * Rt += "offset to elements"
+			 * Rx *= element size
+			 * Rx += Rt
+			 * BPF_JMP|BPF_JA|BPF,SRC=Rx,DST=1,IMM=fd
+			 */
+
+			*patch++ = BPF_RAW_INSN(BPF_LD | BPF_IMM | BPF_DW, BPF_REG_AX, 0, 0, (u32)(u64)map);
+			*patch++ = BPF_RAW_INSN(0, 0, 0, 0, (u32)((u64)map >> 32));
+			*patch++ = BPF_ALU64_IMM(BPF_ADD, BPF_REG_AX, sizeof(struct bpf_map));
+			*patch++ = BPF_ALU64_IMM(BPF_MUL, insn->src_reg, sizeof(struct insn_ptr));
+			*patch++ = BPF_ALU64_REG(BPF_ADD, insn->src_reg, BPF_REG_AX);
+			*patch++ = BPF_RAW_INSN(BPF_JMP | BPF_JA | BPF_X, 1, insn->src_reg, 0, insn->imm);
+
+			cnt = patch - insn_buf;
+			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+
+			delta    += cnt - 1; // XXX can be patched with other code
 			env->prog = prog = new_prog;
 			insn      = new_prog->insnsi + i + delta;
 			goto next_insn;

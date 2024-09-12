@@ -605,6 +605,18 @@ static void emit_indirect_jump(u8 **pprog, int reg, u8 *ip)
 	*pprog = prog;
 }
 
+static void __emit_indirect_jump(u8 **pprog, int bpf_reg)
+{
+	u8 *prog = *pprog;
+
+	if (is_ereg(bpf_reg))
+		EMIT1(0x41);
+
+	EMIT2(0xFF, 0x20 + reg2hex[bpf_reg]);
+
+	*pprog = prog;
+}
+
 static void emit_return(u8 **pprog, u8 *ip)
 {
 	u8 *prog = *pprog;
@@ -2279,6 +2291,11 @@ emit_cond_jmp:		/* Convert BPF opcode to x86 */
 
 			break;
 
+		case BPF_JMP | BPF_JA | BPF_X:
+		case BPF_JMP32 | BPF_JA | BPF_X:
+			// XXX instead, should we use emit_indirect_jump() in regards to spectre ?
+			__emit_indirect_jump(&prog, insn->src_reg);
+			break;
 		case BPF_JMP | BPF_JA:
 		case BPF_JMP32 | BPF_JA:
 			if (BPF_CLASS(insn->code) == BPF_JMP) {

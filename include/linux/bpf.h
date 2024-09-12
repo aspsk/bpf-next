@@ -3437,4 +3437,6 @@ void insn_set_map_adjust(struct bpf_map *map, u32 off, u32 len);
 // XXX
 void bpf_prog_update_jitted_insn_offset(struct bpf_prog *prog, u32 xlated_off, u32 jitted_off, u32 jitted_len, u32 jitted_jump_offset, void *jitted_ip);
 
+u32 insn_set_xlated_offset(struct bpf_map *map, u32 index);
+
 #endif /* _LINUX_BPF_H */

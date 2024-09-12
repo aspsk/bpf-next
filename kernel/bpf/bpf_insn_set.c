@@ -18,14 +18,12 @@
 #define MAX_ISET_ENTRIES 64
 
 struct insn_ptr {
+	void *jitted_ip; /* should go the first, which will save one
+			    instruction in `goto Rx`, see do_misc_fixups() */
+	u32 jitted_off;
+	u32 jitted_len;
+	int jitted_jump_offset;
 	u32 xlated_off;
-
-	struct {
-		void *jitted_ip;
-		u32 jitted_off;
-		u32 jitted_len;
-		int jitted_jump_offset;
-	};
 };
 
 struct bpf_insn_set {
@@ -84,7 +82,7 @@ static int insn_set_map_get_next_key(struct bpf_map *map, void *key, void *next_
 	return 0;
 }
 
-static void *insn_set_map_lookup_elem(struct bpf_map *map, void *key)
+static void *debug_insn_set_map_lookup_elem(struct bpf_map *map, void *key)
 {
 	struct bpf_insn_set *insn_set = container_of(map, struct bpf_insn_set, map);
 	u32 index = *(u32 *)key;
@@ -93,6 +91,15 @@ static void *insn_set_map_lookup_elem(struct bpf_map *map, void *key)
 		return NULL;
 
 	return &insn_set->ptrs[index].xlated_off;
+}
+
+u32 insn_set_xlated_offset(struct bpf_map *map, u32 index)
+{
+	struct bpf_insn_set *insn_set = container_of(map, struct bpf_insn_set, map);
+
+	BUG_ON(index >= insn_set->map.max_entries);
+
+	return insn_set->ptrs[index].xlated_off;
 }
 
 static long insn_set_map_update_elem(struct bpf_map *map, void *key, void *value, u64 map_flags)
@@ -170,7 +177,11 @@ const struct bpf_map_ops insn_set_map_ops = {
 	.map_alloc = insn_set_map_alloc,
 	.map_free = insn_set_map_free,
 	.map_get_next_key = insn_set_map_get_next_key,
-	.map_lookup_elem = insn_set_map_lookup_elem,
+	/*
+	 * we need to forbid users from getting pointers to map elements
+	 * until we have proper way to stop them from altering contents
+	 */
+	.map_lookup_elem = debug_insn_set_map_lookup_elem,
 	.map_update_elem = insn_set_map_update_elem,
 	.map_delete_elem = insn_set_map_delete_elem,
 	.map_check_btf = insn_set_map_check_btf,
@@ -238,7 +249,7 @@ void bpf_prog_update_jitted_insn_offset(struct bpf_prog *prog, u32 xlated_off, u
 	}
 }
 
-int bpf_static_key_set(struct bpf_map *map, bool on); // XXX
+int bpf_static_key_set(struct bpf_map *map, bool on); // XXX move to i/l/bpf.h
 
 int bpf_static_key_set(struct bpf_map *map, bool on)
 {
