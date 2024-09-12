@@ -322,8 +322,7 @@ static struct bpf_insn_ptr *insn_ptr_by_offset(struct bpf_prog *prog, u32 xlated
 
 	for (i = 0; i < prog->aux->used_map_cnt; i++) {
 		map = prog->aux->used_maps[i];
-		if (!is_static_key(map))
-			continue;
+		// if (!is_static_key(map)) continue;
 
 		insn_set = cast_insn_set(map);
 		for (j = 0; j < map->max_entries; j++) {
@@ -346,6 +345,8 @@ void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
 
 	ptr = insn_ptr_by_offset(prog, xlated_off);
 	if (ptr) {
+		pr_warn("%s: setting IP=%px\n", __func__, jitted_ip);
+
 		ptr->jitted_ip = jitted_ip;
 		ptr->jitted_off = jitted_off;
 		ptr->jitted_len = jitted_len;
@@ -390,4 +391,15 @@ int bpf_static_key_set(struct bpf_map *map, bool on)
 	}
 
 	return ret;
+}
+
+u32 insn_set_xlated_offset(struct bpf_map *map, u32 index)
+{
+	struct bpf_insn_set *insn_set = cast_insn_set(map);
+
+	// XXX: what is the right return value?
+	if (WARN_ONCE(index >= map->max_entries, "index (%u) >= map->max_entries (%u)", index, map->max_entries))
+		return -1;
+
+	return insn_set->ptrs[index].xlated_off;
 }
