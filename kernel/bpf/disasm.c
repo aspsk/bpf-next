@@ -207,6 +207,30 @@ static void print_bpf_ja_insn(bpf_insn_print_t verbose,
 	verbose(private_data, "(%02x) %s pc%+d\n", insn->code, op, off);
 }
 
+static void print_bpf_ja_indirect(bpf_insn_print_t verbose,
+				  void *private_data,
+				  const struct bpf_insn *insn)
+{
+	char op[16];
+
+	switch (insn->dst_reg) {
+	case 0:
+		snprintf(op, sizeof(op), "goto r%d", insn->src_reg);
+		break;
+	case 1:
+		snprintf(op, sizeof(op), "goto *(r%d)", insn->src_reg);
+		break;
+	case 2:
+		snprintf(op, sizeof(op), "goto *r%d", insn->src_reg);
+		break;
+	default:
+		snprintf(op, sizeof(op), "unknown");
+		break;
+	}
+
+	verbose(private_data, "(%02x) %s\n", insn->code, op);
+}
+
 void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 		    const struct bpf_insn *insn,
 		    bool allow_ptr_leaks)
@@ -367,9 +391,12 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 							tmp, sizeof(tmp)),
 					insn->imm);
 			}
-		} else if (insn->code == (BPF_JMP | BPF_JA) ||
-			   insn->code == (BPF_JMP32 | BPF_JA)) {
+		} else if (insn->code == (BPF_JMP | BPF_JA | BPF_K) ||
+			   insn->code == (BPF_JMP32 | BPF_JA | BPF_K)) {
 			print_bpf_ja_insn(verbose, cbs->private_data, insn);
+		} else if (insn->code == (BPF_JMP | BPF_JA | BPF_X) ||
+			   insn->code == (BPF_JMP32 | BPF_JA | BPF_X)) {
+			print_bpf_ja_indirect(verbose, cbs->private_data, insn);
 		} else if (insn->code == (BPF_JMP | BPF_JCOND) &&
 			   insn->src_reg == BPF_MAY_GOTO) {
 			verbose(cbs->private_data, "(%02x) may_goto pc%+d\n",
@@ -378,7 +405,7 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 			verbose(cbs->private_data, "(%02x) exit\n", insn->code);
 		} else if (BPF_SRC(insn->code) == BPF_X) {
 			verbose(cbs->private_data,
-				"(%02x) if %c%d %s %c%d goto pc%+d\n",
+				"(%02x) if XXX %c%d %s %c%d goto pc%+d\n",
 				insn->code, class == BPF_JMP32 ? 'w' : 'r',
 				insn->dst_reg,
 				bpf_jmp_string[BPF_OP(insn->code) >> 4],
