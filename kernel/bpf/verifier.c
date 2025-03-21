@@ -10439,19 +10439,11 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	return 0;
 }
 
-static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
-			   int *insn_idx)
+static int __check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn, int *insn_idx, int subprog)
 {
 	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_func_state *caller;
-	int err, subprog, target_insn;
-
-	target_insn = *insn_idx + insn->imm + 1;
-	subprog = find_subprog(env, target_insn);
-	if (subprog < 0) {
-		verbose(env, "verifier bug. No program starts at insn %d\n", target_insn);
-		return -EFAULT;
-	}
+	int err;
 
 	caller = state->frame[state->curframe];
 	err = btf_check_subprog_call(env, subprog, caller->regs);
@@ -10517,6 +10509,20 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	return 0;
+}
+
+static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn, int *insn_idx)
+{
+	int target_insn, subprog;
+
+	target_insn = *insn_idx + insn->imm + 1;
+	subprog = find_subprog(env, target_insn);
+	if (subprog < 0) {
+		verbose(env, "verifier bug. No program starts at insn %d\n", target_insn);
+		return -EFAULT;
+	}
+
+	return __check_func_call(env, insn, insn_idx, subprog);
 }
 
 int map_set_for_each_callback_args(struct bpf_verifier_env *env,
@@ -19388,14 +19394,12 @@ static int do_check(struct bpf_verifier_env *env)
 
 			env->jmps_processed++;
 			if (opcode == BPF_CALL) {
-				if (BPF_SRC(insn->code) != BPF_K ||
-				    (insn->src_reg != BPF_PSEUDO_KFUNC_CALL
-				     && insn->off != 0) ||
+				if ((insn->src_reg != BPF_PSEUDO_KFUNC_CALL && insn->off != 0) ||
 				    (insn->src_reg != BPF_REG_0 &&
 				     insn->src_reg != BPF_PSEUDO_CALL &&
 				     insn->src_reg != BPF_PSEUDO_KFUNC_CALL) ||
-				    insn->dst_reg != BPF_REG_0 ||
-				    class == BPF_JMP32) {
+				     (insn->dst_reg != BPF_REG_0 && BPF_SRC(insn->code) == BPF_K) ||
+				     class == BPF_JMP32) {
 					verbose(env, "BPF_CALL uses reserved fields\n");
 					return -EINVAL;
 				}
@@ -19416,6 +19420,15 @@ static int do_check(struct bpf_verifier_env *env)
 						exception_exit = true;
 						goto process_bpf_exit_full;
 					}
+				} else if (BPF_SRC(insn->code) == BPF_X) {
+					struct bpf_reg_state *reg = &regs[insn->dst_reg];
+
+					if (reg->type != PTR_TO_FUNC) {
+						verbose(env, "indirect calls allow only PTR_TO_FUNC as dst (got %u)\n", reg->type);
+						return -EINVAL;
+					}
+
+					err = __check_func_call(env, insn, &env->insn_idx, reg->subprogno);
 				} else {
 					err = check_helper_call(env, insn, &env->insn_idx);
 				}
@@ -21776,6 +21789,8 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 		if (insn->code != (BPF_JMP | BPF_CALL))
 			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_CALL)
+			goto next_insn;
+		if (BPF_SRC(insn->code) == BPF_X)
 			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
 			ret = fixup_kfunc_call(env, insn, insn_buf, i + delta, &cnt);
