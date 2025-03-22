@@ -117,7 +117,7 @@ static int bpf_iter_attach_map(struct bpf_prog *prog,
 	    map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH ||
 	    map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
 		is_percpu = true;
-	else if (map->map_type != BPF_MAP_TYPE_HASH &&
+	else if (map->map_type != BPF_MAP_TYPE_HASH && map->map_type != BPF_MAP_TYPE_HASH_NEW &&
 		 map->map_type != BPF_MAP_TYPE_LRU_HASH &&
 		 map->map_type != BPF_MAP_TYPE_ARRAY)
 		goto put_map;

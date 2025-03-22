@@ -1231,7 +1231,7 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 			case 0:
 				continue;
 			case BPF_SPIN_LOCK:
-				if (map->map_type != BPF_MAP_TYPE_HASH &&
+				if (map->map_type != BPF_MAP_TYPE_HASH && map->map_type != BPF_MAP_TYPE_HASH_NEW &&
 				    map->map_type != BPF_MAP_TYPE_ARRAY &&
 				    map->map_type != BPF_MAP_TYPE_CGROUP_STORAGE &&
 				    map->map_type != BPF_MAP_TYPE_SK_STORAGE &&
@@ -1244,7 +1244,7 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 				break;
 			case BPF_TIMER:
 			case BPF_WORKQUEUE:
-				if (map->map_type != BPF_MAP_TYPE_HASH &&
+				if (map->map_type != BPF_MAP_TYPE_HASH && map->map_type != BPF_MAP_TYPE_HASH_NEW &&
 				    map->map_type != BPF_MAP_TYPE_LRU_HASH &&
 				    map->map_type != BPF_MAP_TYPE_ARRAY) {
 					ret = -EOPNOTSUPP;
@@ -1255,7 +1255,7 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 			case BPF_KPTR_REF:
 			case BPF_KPTR_PERCPU:
 			case BPF_REFCOUNT:
-				if (map->map_type != BPF_MAP_TYPE_HASH &&
+				if (map->map_type != BPF_MAP_TYPE_HASH && map->map_type != BPF_MAP_TYPE_HASH_NEW &&
 				    map->map_type != BPF_MAP_TYPE_PERCPU_HASH &&
 				    map->map_type != BPF_MAP_TYPE_LRU_HASH &&
 				    map->map_type != BPF_MAP_TYPE_LRU_PERCPU_HASH &&
@@ -1277,7 +1277,7 @@ static int map_check_btf(struct bpf_map *map, struct bpf_token *token,
 				break;
 			case BPF_LIST_HEAD:
 			case BPF_RB_ROOT:
-				if (map->map_type != BPF_MAP_TYPE_HASH &&
+				if (map->map_type != BPF_MAP_TYPE_HASH && map->map_type != BPF_MAP_TYPE_HASH_NEW &&
 				    map->map_type != BPF_MAP_TYPE_LRU_HASH &&
 				    map->map_type != BPF_MAP_TYPE_ARRAY) {
 					ret = -EOPNOTSUPP;
@@ -1413,6 +1413,7 @@ static int map_create(union bpf_attr *attr, bool kernel)
 	case BPF_MAP_TYPE_CGROUP_ARRAY:
 	case BPF_MAP_TYPE_ARRAY_OF_MAPS:
 	case BPF_MAP_TYPE_HASH:
+	case BPF_MAP_TYPE_HASH_NEW:
 	case BPF_MAP_TYPE_PERCPU_HASH:
 	case BPF_MAP_TYPE_HASH_OF_MAPS:
 	case BPF_MAP_TYPE_RINGBUF:
@@ -2126,7 +2127,7 @@ static int map_lookup_and_delete_elem(union bpf_attr *attr)
 	if (map->map_type == BPF_MAP_TYPE_QUEUE ||
 	    map->map_type == BPF_MAP_TYPE_STACK) {
 		err = map->ops->map_pop_elem(map, value);
-	} else if (map->map_type == BPF_MAP_TYPE_HASH ||
+	} else if (map->map_type == BPF_MAP_TYPE_HASH || map->map_type == BPF_MAP_TYPE_HASH_NEW ||
 		   map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
 		   map->map_type == BPF_MAP_TYPE_LRU_HASH ||
 		   map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH) {
