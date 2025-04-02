@@ -213,21 +213,7 @@ static void print_bpf_ja_indirect(bpf_insn_print_t verbose,
 {
 	char op[16];
 
-	switch (insn->dst_reg) {
-	case 0:
-		snprintf(op, sizeof(op), "goto r%d", insn->src_reg);
-		break;
-	case 1:
-		snprintf(op, sizeof(op), "goto *(r%d)", insn->src_reg);
-		break;
-	case 2:
-		snprintf(op, sizeof(op), "goto *r%d", insn->src_reg);
-		break;
-	default:
-		snprintf(op, sizeof(op), "unknown");
-		break;
-	}
-
+	snprintf(op, sizeof(op), "gotox r%d", insn->dst_reg);
 	verbose(private_data, "(%02x) %s\n", insn->code, op);
 }
 

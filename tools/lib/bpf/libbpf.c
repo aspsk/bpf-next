@@ -6406,8 +6406,13 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 				insn[0].src_reg = BPF_PSEUDO_MAP_IDX;
 				insn[0].imm = relo->map_idx;
 			} else if (map->autocreate) {
-				insn[0].src_reg = BPF_PSEUDO_MAP_FD;
-				insn[0].imm = map->fd;
+				if (insn[0].src_reg == BPF_PSEUDO_MAP_FD) {
+					pr_warn("prog '%s': relo #%d: skipping map autocreate, it already points to a fd=%d\n", prog->name, i, insn[0].imm);
+				} else {
+					pr_warn("[1] prog '%s': relo #%d: current fd=%d\n", prog->name, i, insn[0].imm);
+					insn[0].src_reg = BPF_PSEUDO_MAP_FD;
+					insn[0].imm = map->fd;
+				}
 			} else {
 				poison_map_ldimm64(prog, i, relo->insn_idx, insn,
 						   relo->map_idx, map);
@@ -6420,8 +6425,12 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 				insn[0].src_reg = BPF_PSEUDO_MAP_IDX_VALUE;
 				insn[0].imm = relo->map_idx;
 			} else if (map->autocreate) {
-				insn[0].src_reg = BPF_PSEUDO_MAP_VALUE;
-				insn[0].imm = map->fd;
+				if (insn[0].src_reg == BPF_PSEUDO_MAP_VALUE) {
+					pr_warn("[2] prog '%s': relo #%d: skipping map value autocreate, current fd=%d\n", prog->name, i, insn[0].imm);
+				} else {
+					insn[0].src_reg = BPF_PSEUDO_MAP_VALUE;
+					insn[0].imm = map->fd;
+				}
 			} else {
 				poison_map_ldimm64(prog, i, relo->insn_idx, insn,
 						   relo->map_idx, map);

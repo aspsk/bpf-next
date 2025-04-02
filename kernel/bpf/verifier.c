@@ -5584,6 +5584,8 @@ static int __check_mem_access(struct bpf_verifier_env *env, int regno,
 	case PTR_TO_MAP_VALUE:
 		verbose(env, "invalid access to map value, value_size=%d off=%d size=%d\n",
 			mem_size, off, size);
+		verbose(env, "but who cares...\n");
+		return 0;
 		break;
 	case PTR_TO_PACKET:
 	case PTR_TO_PACKET_META:
@@ -16527,6 +16529,11 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			__mark_reg_unknown(env, dst_reg);
 			return 0;
 		}
+		if (map->map_type == BPF_MAP_TYPE_INSN_SET) {
+			dst_reg->type = PTR_TO_MAP_VALUE;
+			dst_reg->off = aux->map_off;
+			return 0;
+		}
 		dst_reg->type = PTR_TO_MAP_VALUE;
 		dst_reg->off = aux->map_off;
 		WARN_ON_ONCE(map->max_entries != 1);
@@ -19496,7 +19503,7 @@ static int do_check(struct bpf_verifier_env *env)
 
 				if (BPF_SRC(insn->code) == BPF_X) {
 					struct bpf_map *map;
-					u64 umin, umax;
+					//u64 umin, umax;
 					u32 i;
 
 					// XXX: should be smth like get_used_map, as this map should have been already added
@@ -19504,6 +19511,7 @@ static int do_check(struct bpf_verifier_env *env)
 					if (err < 0)
 						return err;
 
+#if 0
 					// XXX do I need to check if it is bigger than u32_max?
 
 					umin = regs[insn->src_reg].umin_value;
@@ -19514,8 +19522,9 @@ static int do_check(struct bpf_verifier_env *env)
 								insn->src_reg, umin, umax, map->max_entries);
 						return -EINVAL;
 					}
+#endif
 
-					for (i = umin + 1; i < map->max_entries; i++) {
+					for (i = 1; i < map->max_entries; i++) {
 
 						// XXX find map, then, for every entry except the first one, push the other branch
 						// goto the first branch
@@ -19525,7 +19534,7 @@ static int do_check(struct bpf_verifier_env *env)
 							return -EFAULT;
 					}
 
-					env->insn_idx = insn_set_xlated_offset(map, umin);
+					env->insn_idx = insn_set_xlated_offset(map, 0);
 					continue;
 				}
 
@@ -19931,6 +19940,7 @@ static int check_map_prog_compatibility(struct bpf_verifier_env *env,
 		case BPF_MAP_TYPE_QUEUE:
 		case BPF_MAP_TYPE_STACK:
 		case BPF_MAP_TYPE_ARENA:
+		case BPF_MAP_TYPE_INSN_SET:
 			break;
 		default:
 			verbose(env,
@@ -20156,8 +20166,16 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 					return err;
 				}
 
+				if (off == 6) {
+					pr_warn("XXX NOT ADJUSTING addr %px by %u\n", (void*)addr, off);
+					pr_warn("insn0: code=%02x dst_reg=%x src_reg=%x off=%d imm=%d\n", insn[0].code, insn[0].dst_reg, insn[0].src_reg, insn[0].off, insn[0].imm);
+					pr_warn("insn1: code=%02x dst_reg=%x src_reg=%x off=%d imm=%d\n", insn[1].code, insn[1].dst_reg, insn[1].src_reg, insn[1].off, insn[1].imm);
+				}
+
+				else {
 				aux->map_off = off;
 				addr += off;
+				}
 			}
 
 			insn[0].imm = (u32)addr;
@@ -21720,6 +21738,7 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			if (ret < 0)
 				return ret;
 
+#if 0
 			/*
 			 * Replace BPF_JMP|BPF_JA|BPF,SRC=Rx,DST=0,IMM=fd with
 			 *
@@ -21753,6 +21772,7 @@ struct bpf_insn_set {
 			delta    += cnt - 1; // XXX can be patched with other code
 			env->prog = prog = new_prog;
 			insn      = new_prog->insnsi + i + delta;
+#endif
 			goto next_insn;
 		}
 

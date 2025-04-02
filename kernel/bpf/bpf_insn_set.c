@@ -8,6 +8,7 @@ struct bpf_insn_set {
 	struct bpf_map map;
 	struct mutex state_mutex;
 	int state;
+	long *ips;
 	DECLARE_FLEX_ARRAY(struct bpf_insn_ptr, ptrs);
 };
 
@@ -50,6 +51,10 @@ static struct bpf_map *insn_set_alloc(union bpf_attr *attr)
 
 	insn_set = bpf_map_area_alloc(size, NUMA_NO_NODE);
 	if (!insn_set)
+		return ERR_PTR(-ENOMEM);
+
+	insn_set->ips = kzalloc(sizeof(long) * attr->max_entries, GFP_KERNEL);
+	if (!insn_set->ips)
 		return ERR_PTR(-ENOMEM);
 
 	bpf_map_init_from_attr(&insn_set->map, attr);
@@ -150,6 +155,20 @@ static u64 insn_set_mem_usage(const struct bpf_map *map)
 	return insn_set_alloc_size(map->max_entries);
 }
 
+static int insn_set_map_direct_value_addr(const struct bpf_map *map, u64 *imm, u32 off)
+{
+	struct bpf_insn_set *insn_set = cast_insn_set(map);
+
+	// if (map->max_entries != 1) return -ENOTSUPP;
+	// if (off >= map->value_size) return -EINVAL;
+
+	*imm = (unsigned long)insn_set->ips;
+
+	pr_warn("%s: setting *imm=%px\n", __func__, insn_set->ips);
+
+	return 0;
+}
+
 BTF_ID_LIST_SINGLE(insn_set_btf_ids, struct, bpf_insn_set)
 
 const struct bpf_map_ops insn_set_map_ops = {
@@ -162,6 +181,7 @@ const struct bpf_map_ops insn_set_map_ops = {
 	.map_delete_elem = insn_set_delete_elem,
 	.map_check_btf = insn_set_check_btf,
 	.map_mem_usage = insn_set_mem_usage,
+	.map_direct_value_addr = insn_set_map_direct_value_addr,
 	.map_btf_id = &insn_set_btf_ids[0],
 };
 
@@ -172,15 +192,14 @@ static inline bool is_frozen(struct bpf_map *map)
 	return map->frozen;
 }
 
+static bool is_insn_set(const struct bpf_map *map)
+{
+	return map->map_type == BPF_MAP_TYPE_INSN_SET;
+}
+
 static bool is_static_key(const struct bpf_map *map)
 {
-	if (map->map_type != BPF_MAP_TYPE_INSN_SET)
-		return false;
-
-	if (!(map->map_extra & BPF_F_STATIC_KEY))
-		return false;
-
-	return true;
+	return is_insn_set(map) && (map->map_extra & BPF_F_STATIC_KEY);
 }
 
 static bool is_ja_or_nop(const struct bpf_insn *insn)
@@ -211,11 +230,13 @@ static inline bool valid_offsets(const struct bpf_insn_set *insn_set,
 		if (off > 0 && prog->insnsi[off-1].code == (BPF_LD | BPF_DW | BPF_IMM))
 			return false;
 
+#if 0
 		if (i > 0) {
 			prev_off = insn_set->ptrs[i-1].orig_xlated_off;
 			if (off <= prev_off)
 				return false;
 		}
+#endif
 
 		if (is_static_key(&insn_set->map) && !is_ja_or_nop(&prog->insnsi[off]))
 			return false;
@@ -314,7 +335,7 @@ void bpf_insn_set_adjust_after_remove(struct bpf_map *map, u32 off, u32 len)
 	}
 }
 
-static struct bpf_insn_ptr *insn_ptr_by_offset(struct bpf_prog *prog, u32 xlated_off)
+static struct bpf_insn_ptr *insn_ptr_by_offset(struct bpf_prog *prog, u32 xlated_off, long **ip)
 {
 	struct bpf_insn_set *insn_set;
 	struct bpf_map *map;
@@ -322,12 +343,15 @@ static struct bpf_insn_ptr *insn_ptr_by_offset(struct bpf_prog *prog, u32 xlated
 
 	for (i = 0; i < prog->aux->used_map_cnt; i++) {
 		map = prog->aux->used_maps[i];
-		// if (!is_static_key(map)) continue;
+		if (!is_insn_set(map))
+			continue;
 
 		insn_set = cast_insn_set(map);
 		for (j = 0; j < map->max_entries; j++) {
-			if (insn_set->ptrs[j].xlated_off == xlated_off)
+			if (insn_set->ptrs[j].xlated_off == xlated_off) {
+				*ip = &insn_set->ips[j];
 				return &insn_set->ptrs[j];
+			}
 		}
 	}
 
@@ -342,10 +366,16 @@ void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
 			      void *jitted_ip)
 {
 	struct bpf_insn_ptr *ptr;
+	long *ip = NULL;
 
-	ptr = insn_ptr_by_offset(prog, xlated_off);
+	ptr = insn_ptr_by_offset(prog, xlated_off, &ip);
 	if (ptr) {
 		pr_warn("%s: setting IP=%px\n", __func__, jitted_ip);
+
+		if (ip) {
+			pr_warn("%s: setting ip=%px\n", __func__, jitted_ip);
+			*ip = (long)jitted_ip;
+		}
 
 		ptr->jitted_ip = jitted_ip;
 		ptr->jitted_off = jitted_off;

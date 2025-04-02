@@ -440,7 +440,7 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 static __always_inline int __bpf_static_branch_nop(void *static_key)
 {
 	asm goto("1:\n\t"
-		"gotol_or_nop %l[l_yes]\n\t"
+		"gotol %l[l_yes]\n\t"
 		".pushsection .static_keys, \"aw\"\n\t"
 		".balign 8\n\t"
 		".long 1b - .\n\t"
@@ -457,7 +457,7 @@ l_yes:
 static __always_inline int __bpf_static_branch_jump(void *static_key)
 {
 	asm goto("1:\n\t"
-		"nop_or_gotol %l[l_yes]\n\t"
+		"gotol %l[l_yes]\n\t"
 		".pushsection .static_keys, \"aw\"\n\t"
 		".balign 8\n\t"
 		".long 1b - .\n\t"

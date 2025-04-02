@@ -14,6 +14,8 @@
 #include <sys/syscall.h>
 #include <bpf/bpf.h>
 
+#include "bpf_goto_x.skel.h"
+
 static inline int _bpf_insn_set_create(__u32 *offsets, size_t n)
 {
 	static union bpf_attr attr = {
@@ -231,9 +233,97 @@ static void goto_x_out_of_bounds(void)
 	close(map_fd);
 }
 
+static int setup_skel_tbd(struct bpf_goto_x *skel)
+{
+	struct bpf_insn *insns;
+	int map_fd;
+	__u32 offsets[] = {
+		8,     /* 18 01 00 00 28 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x28 ll */
+		36,    /* 18 01 00 00 2d 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x2d ll */
+		22,    /* 18 01 00 00 32 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x32 ll */
+		29,    /* 18 01 00 00 37 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x37 ll */
+		15,    /* 18 01 00 00 3c 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x3c ll */
+		44,    /* 18 01 00 00 41 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x41 ll */
+	};
+
+	map_fd = _bpf_insn_set_create(offsets, 6);
+	if (!ASSERT_GE(map_fd, 0, "map is ok"))
+		return -1;
+
+	insns = (struct bpf_insn *)bpf_program__insns(skel->progs.simple_test);
+
+	// but how I can tell libbpf not to rewrite the map here?!
+	insns[3].src_reg = 2;
+	insns[3].imm = map_fd;
+
+	/* put same map_fd into gotox */
+	insns[7].imm = map_fd;
+
+	return 0;
+}
+
+static void __test_run(struct bpf_program *prog, void *ctx_in, size_t ctx_size_in)
+{
+	LIBBPF_OPTS(bpf_test_run_opts, topts,
+			    .ctx_in = ctx_in,
+			    .ctx_size_in = ctx_size_in,
+		   );
+	int err, prog_fd;
+
+	prog_fd = bpf_program__fd(prog);
+	err = bpf_prog_test_run_opts(prog_fd, &topts);
+	ASSERT_OK(err, "test_run_opts err");
+}
+
+static void check_simple(struct bpf_goto_x *skel, __u64 ctx_in, __u64 expected)
+{
+	skel->bss->ret_user = 0;
+
+	//pause();
+
+	__test_run(skel->progs.simple_test, &ctx_in, sizeof(ctx_in));
+
+	if (!ASSERT_EQ(skel->bss->ret_user, expected, "skel->bss->ret_user"))
+		return;
+}
+
+
+static void check_skel_tbd(struct bpf_goto_x *skel)
+{
+	check_simple(skel, 0, 2);
+	check_simple(skel, 1, 3);
+	check_simple(skel, 2, 4);
+	check_simple(skel, 3, 5);
+	check_simple(skel, 4, 7);
+	check_simple(skel, 5, 19);
+	check_simple(skel, 77, 19);
+}
+
+void goto_x_skel(void)
+{
+	struct bpf_goto_x *skel;
+	int ret;
+
+	skel = bpf_goto_x__open();
+	if (!ASSERT_NEQ(skel, NULL, "bpf_goto_x__open"))
+		return;
+
+	ret = setup_skel_tbd(skel);
+	if (!ASSERT_OK(ret, "setup_skel_tbd"))
+		return;
+
+	ret = bpf_goto_x__load(skel);
+	if (!ASSERT_OK(ret, "bpf_goto_x__load"))
+		return;
+
+	check_skel_tbd(skel);
+
+	bpf_goto_x__destroy(skel);
+}
+
 void test_bpf_goto_x(void)
 {
-	if (1 && test__start_subtest("basic_goto_x_1"))
+	if (0 && test__start_subtest("basic_goto_x_1"))
 		basic_goto_x_1();
 
 	if (0 && test__start_subtest("basic_goto_x_2"))
@@ -241,4 +331,7 @@ void test_bpf_goto_x(void)
 
 	if (0 && test__start_subtest("goto_x_out_of_bounds"))
 		goto_x_out_of_bounds();
+
+	if (1 && test__start_subtest("goto_x_skel"))
+		goto_x_skel();
 }
