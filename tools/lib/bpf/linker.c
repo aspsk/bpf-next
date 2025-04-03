@@ -812,6 +812,12 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 		case SHT_REL:
 			/* relocations */
 			break;
+// XXX why i/l/elf.h doesn't get here??
+#define SHT_LLVM_JT_SIZES	0x6fff4c0d
+// XXX
+		case SHT_LLVM_JT_SIZES:
+			/* LLVM jump tables sizes */
+			break;
 		default:
 			pr_warn("unrecognized section #%zu (%s) in %s\n",
 				sec_idx, sec_name, obj->filename);
@@ -899,6 +905,9 @@ static int linker_sanity_check_elf(struct src_obj *obj)
 				return err;
 			break;
 		case SHT_LLVM_ADDRSIG:
+			break;
+		case SHT_LLVM_JT_SIZES:
+			/* LLVM jump tables sizes */
 			break;
 		default:
 			pr_warn("ELF section #%zu (%s) has unrecognized type %zu in %s\n",
@@ -1023,7 +1032,10 @@ static int linker_sanity_check_elf_relos(struct src_obj *obj, struct src_sec *se
 		return 0;
 
 	/* relocatable section is data or instructions */
-	if (link_sec->shdr->sh_type != SHT_PROGBITS && link_sec->shdr->sh_type != SHT_NOBITS) {
+	if (link_sec->shdr->sh_type != SHT_PROGBITS &&
+	    link_sec->shdr->sh_type != SHT_NOBITS &&
+	    link_sec->shdr->sh_type != SHT_LLVM_JT_SIZES
+		) {
 		pr_warn("ELF relo section #%zu points to invalid section #%zu in %s\n",
 			sec->sec_idx, (size_t)sec->shdr->sh_info, obj->filename);
 		return -EINVAL;

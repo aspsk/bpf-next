@@ -243,10 +243,9 @@ static int setup_skel_tbd(struct bpf_goto_x *skel)
 		22,    /* 18 01 00 00 32 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x32 ll */
 		29,    /* 18 01 00 00 37 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x37 ll */
 		15,    /* 18 01 00 00 3c 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x3c ll */
-		44,    /* 18 01 00 00 41 00 00 00 00 00 00 00 00 00 00 00 r1 = 0x41 ll */
 	};
 
-	map_fd = _bpf_insn_set_create(offsets, 6);
+	map_fd = _bpf_insn_set_create(offsets, ARRAY_SIZE(offsets));
 	if (!ASSERT_GE(map_fd, 0, "map is ok"))
 		return -1;
 
