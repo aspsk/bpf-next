@@ -2275,8 +2275,13 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 					else
 						insn->imm += sec->dst_off;
 				} else if (strcmp(src_sec->sec_name, STATIC_KEYS_REL_SEC)) {
-					pr_warn("relocation against STT_SECTION in non-exec section is not supported!\n");
-					return -EINVAL;
+
+					insn = dst_linked_sec->raw_data + dst_rel->r_offset;
+						insn->imm += sec->dst_off;
+
+					pr_warn("insn: %02x dst=%x src=%x off=%d imm=%d\n", insn->code, insn->dst_reg, insn->src_reg, insn->off, insn->imm);
+					pr_warn("relocation against STT_SECTION in non-exec section is not supported! (src_sec->sec_name=%s)\n", src_sec->sec_name);
+					return 0;//-EINVAL;
 				}
 			}
 
