@@ -207,6 +207,13 @@ static void print_bpf_ja_insn(bpf_insn_print_t verbose,
 	verbose(private_data, "(%02x) %s pc%+d\n", insn->code, op, off);
 }
 
+static void print_bpf_ja_indirect(bpf_insn_print_t verbose,
+				  void *private_data,
+				  const struct bpf_insn *insn)
+{
+	verbose(private_data, "(%02x) gotox r%d\n", insn->code, insn->dst_reg);
+}
+
 void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 		    const struct bpf_insn *insn,
 		    bool allow_ptr_leaks)
@@ -379,9 +386,12 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 							tmp, sizeof(tmp)),
 					insn->imm);
 			}
-		} else if (insn->code == (BPF_JMP | BPF_JA) ||
-			   insn->code == (BPF_JMP32 | BPF_JA)) {
+		} else if (insn->code == (BPF_JMP | BPF_JA | BPF_K) ||
+			   insn->code == (BPF_JMP32 | BPF_JA | BPF_K)) {
 			print_bpf_ja_insn(verbose, cbs->private_data, insn);
+		} else if (insn->code == (BPF_JMP | BPF_JA | BPF_X) ||
+			   insn->code == (BPF_JMP32 | BPF_JA | BPF_X)) {
+			print_bpf_ja_indirect(verbose, cbs->private_data, insn);
 		} else if (insn->code == (BPF_JMP | BPF_JCOND) &&
 			   insn->src_reg == BPF_MAY_GOTO) {
 			verbose(cbs->private_data, "(%02x) may_goto pc%+d\n",
