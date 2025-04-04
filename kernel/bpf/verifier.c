@@ -5584,6 +5584,8 @@ static int __check_mem_access(struct bpf_verifier_env *env, int regno,
 	case PTR_TO_MAP_VALUE:
 		verbose(env, "invalid access to map value, value_size=%d off=%d size=%d\n",
 			mem_size, off, size);
+		verbose(env, "but who cares...\n");
+		return 0;
 		break;
 	case PTR_TO_PACKET:
 	case PTR_TO_PACKET_META:
@@ -16527,6 +16529,11 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			__mark_reg_unknown(env, dst_reg);
 			return 0;
 		}
+		if (map->map_type == BPF_MAP_TYPE_INSN_SET) {
+			dst_reg->type = PTR_TO_MAP_VALUE;
+			dst_reg->off = aux->map_off;
+			return 0;
+		}
 		dst_reg->type = PTR_TO_MAP_VALUE;
 		dst_reg->off = aux->map_off;
 		WARN_ON_ONCE(map->max_entries != 1);
@@ -17282,6 +17289,60 @@ static int mark_fastcall_patterns(struct bpf_verifier_env *env)
 	return 0;
 }
 
+u32 insn_set_xlated_offset(struct bpf_map *map, u32 index);
+
+#define GET_HIGH(STATE)		((u16)((STATE) >> 16))
+#define SET_HIGH(STATE, LAST)	STATE = (STATE & 0xffffU) | ((LAST) << 16)
+
+static int push_goto_void_edge(int t, struct bpf_verifier_env *env, struct bpf_map *map)
+{
+	int *insn_stack = env->cfg.insn_stack;
+	int *insn_state = env->cfg.insn_state;
+	u16 last_edge = GET_HIGH(insn_state[t]);
+	int w;
+
+	mark_prune_point(env, t);
+	// XXX jump point to w?
+
+	if (last_edge == map->max_entries)
+		return DONE_EXPLORING;
+
+	w = insn_set_xlated_offset(map, last_edge);
+	SET_HIGH(insn_state[t], last_edge + 1);
+
+	if (env->cfg.cur_stack >= env->prog->len)
+		return -E2BIG;
+	insn_stack[env->cfg.cur_stack++] = w;
+	return KEEP_EXPLORING;
+}
+
+// XXX
+static int add_used_map(struct bpf_verifier_env *env, int fd, struct bpf_map **map_ptr);
+
+/* "conditional jump with N edges" */
+static int visit_goto_void_insn(int t, struct bpf_verifier_env *env, int fd)
+{
+	struct bpf_map *map;
+	int ret;
+
+	ret = add_used_map(env, fd, &map);
+	if (ret < 0) {
+		pr_warn("XXX bad map fd=%d: error=%d\n", fd, ret);
+		return ret;
+	}
+
+	// XXX: BUG_ON the map should be fixed (read-only) by this time
+	// XXX: or should we mark it as read-only now, as part of this verification?
+
+	// XXX: sanity check: this should be a map
+	//		* of proper type
+	//		* pointing only inside this particular function
+
+	// XXX, and this should also be done once...
+
+	return push_goto_void_edge(t, env, map);
+}
+
 /* Visits the instruction at index t and returns one of the following:
  *  < 0 - an error occurred
  *  DONE_EXPLORING - the instruction was fully explored
@@ -17372,8 +17433,8 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 		return visit_func_call_insn(t, insns, env, insn->src_reg == BPF_PSEUDO_CALL);
 
 	case BPF_JA:
-		if (BPF_SRC(insn->code) != BPF_K)
-			return -EINVAL;
+		if (BPF_SRC(insn->code) == BPF_X)
+			return visit_goto_void_insn(t, env, insn->imm);
 
 		if (BPF_CLASS(insn->code) == BPF_JMP)
 			off = insn->off;
@@ -17382,7 +17443,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 
 		if (insn->src_reg & BPF_STATIC_BRANCH_JA) {
 			/* static branch - jump with two edges */
-			mark_prune_point(env, t);
+			mark_prune_point(env, t); // XXX ? maybe this is not correct?
 
 			ret = push_insn(t, t + 1, FALLTHROUGH, env);
 			if (ret)
@@ -19440,6 +19501,43 @@ static int do_check(struct bpf_verifier_env *env)
 				struct bpf_verifier_state *other_branch;
 				u32 jmp_offset;
 
+				if (BPF_SRC(insn->code) == BPF_X) {
+					struct bpf_map *map;
+					//u64 umin, umax;
+					u32 i;
+
+					// XXX: should be smth like get_used_map, as this map should have been already added
+					err = add_used_map(env, insn->imm, &map);
+					if (err < 0)
+						return err;
+
+#if 0
+					// XXX do I need to check if it is bigger than u32_max?
+
+					umin = regs[insn->src_reg].umin_value;
+					umax = regs[insn->src_reg].umax_value;
+
+					if (umin >= map->max_entries || umax >= map->max_entries) {
+						verbose(env, "register R%d=[%llu,%llu] is out of bounds [0,%u)\n",
+								insn->src_reg, umin, umax, map->max_entries);
+						return -EINVAL;
+					}
+#endif
+
+					for (i = 1; i < map->max_entries; i++) {
+
+						// XXX find map, then, for every entry except the first one, push the other branch
+						// goto the first branch
+
+						other_branch = push_stack(env, insn_set_xlated_offset(map, i), env->insn_idx, false);
+						if (!other_branch)
+							return -EFAULT;
+					}
+
+					env->insn_idx = insn_set_xlated_offset(map, 0);
+					continue;
+				}
+
 				if (BPF_SRC(insn->code) != BPF_K ||
 				    (insn->src_reg & ~BPF_STATIC_BRANCH_MASK) ||
 				    insn->dst_reg != BPF_REG_0 ||
@@ -19842,6 +19940,7 @@ static int check_map_prog_compatibility(struct bpf_verifier_env *env,
 		case BPF_MAP_TYPE_QUEUE:
 		case BPF_MAP_TYPE_STACK:
 		case BPF_MAP_TYPE_ARENA:
+		case BPF_MAP_TYPE_INSN_SET:
 			break;
 		default:
 			verbose(env,
@@ -19927,10 +20026,11 @@ static int __add_used_map(struct bpf_verifier_env *env, struct bpf_map *map)
  * its index.
  * Returns <0 on error, or >= 0 index, on success.
  */
-static int add_used_map(struct bpf_verifier_env *env, int fd)
+static int add_used_map(struct bpf_verifier_env *env, int fd, struct bpf_map **map_ptr)
 {
 	struct bpf_map *map;
 	CLASS(fd, f)(fd);
+	int ret;
 
 	map = __bpf_map_get(f);
 	if (IS_ERR(map)) {
@@ -19938,7 +20038,10 @@ static int add_used_map(struct bpf_verifier_env *env, int fd)
 		return PTR_ERR(map);
 	}
 
-	return __add_used_map(env, map);
+	ret = __add_used_map(env, map);
+	if (ret >= 0 && map_ptr)
+		*map_ptr = map;
+	return ret;
 }
 
 /* find and rewrite pseudo imm in ld_imm64 instructions:
@@ -20032,7 +20135,7 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 				break;
 			}
 
-			map_idx = add_used_map(env, fd);
+			map_idx = add_used_map(env, fd, NULL);
 			if (map_idx < 0)
 				return map_idx;
 			map = env->used_maps[map_idx];
@@ -20063,8 +20166,16 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 					return err;
 				}
 
+				if (off == 6) {
+					pr_warn("XXX NOT ADJUSTING addr %px by %u\n", (void*)addr, off);
+					pr_warn("insn0: code=%02x dst_reg=%x src_reg=%x off=%d imm=%d\n", insn[0].code, insn[0].dst_reg, insn[0].src_reg, insn[0].off, insn[0].imm);
+					pr_warn("insn1: code=%02x dst_reg=%x src_reg=%x off=%d imm=%d\n", insn[1].code, insn[1].dst_reg, insn[1].src_reg, insn[1].off, insn[1].imm);
+				}
+
+				else {
 				aux->map_off = off;
 				addr += off;
+				}
 			}
 
 			insn[0].imm = (u32)addr;
@@ -21614,6 +21725,54 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			delta    += cnt - 1;
 			env->prog = prog = new_prog;
 			insn      = new_prog->insnsi + i + delta;
+			goto next_insn;
+		}
+
+		if ((insn->code == (BPF_JMP | BPF_JA | BPF_X) ||
+		     insn->code == (BPF_JMP32 | BPF_JA | BPF_X)) &&
+		    (insn->dst_reg == 0)) {
+			struct bpf_insn *patch = &insn_buf[0];
+			struct bpf_map *map;
+
+			ret = add_used_map(env, insn->imm, &map); // XXX: get_used_map
+			if (ret < 0)
+				return ret;
+
+#if 0
+			/*
+			 * Replace BPF_JMP|BPF_JA|BPF,SRC=Rx,DST=0,IMM=fd with
+			 *
+			 * Rt = ldimm64(map_address)
+			 * Rt += "offset to elements"
+			 * Rx *= element size
+			 * Rx += Rt
+			 * BPF_JMP|BPF_JA|BPF,SRC=Rx,DST=1,IMM=fd
+			 */
+
+// XXX
+struct bpf_insn_set {
+	struct bpf_map map;
+	struct mutex state_mutex;
+	int state;
+	DECLARE_FLEX_ARRAY(struct bpf_insn_ptr, ptrs);
+};
+
+			*patch++ = BPF_RAW_INSN(BPF_LD | BPF_IMM | BPF_DW, BPF_REG_AX, 0, 0, (u32)(u64)map);
+			*patch++ = BPF_RAW_INSN(0, 0, 0, 0, (u32)((u64)map >> 32));
+			*patch++ = BPF_ALU64_IMM(BPF_ADD, BPF_REG_AX, offsetof(struct bpf_insn_set, ptrs));
+			*patch++ = BPF_ALU64_IMM(BPF_MUL, insn->src_reg, sizeof(struct bpf_insn_ptr));
+			*patch++ = BPF_ALU64_REG(BPF_ADD, insn->src_reg, BPF_REG_AX);
+			*patch++ = BPF_RAW_INSN(BPF_JMP | BPF_JA | BPF_X, 1, insn->src_reg, 0, insn->imm);
+
+			cnt = patch - insn_buf;
+			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+
+			delta    += cnt - 1; // XXX can be patched with other code
+			env->prog = prog = new_prog;
+			insn      = new_prog->insnsi + i + delta;
+#endif
 			goto next_insn;
 		}
 

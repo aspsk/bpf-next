@@ -3582,4 +3582,6 @@ void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
 int bpf_static_key_set(struct bpf_map *map, bool on);
 int bpf_arch_poke_static_branch(struct bpf_insn_ptr *ptr, bool on);
 
+u32 insn_set_xlated_offset(struct bpf_map *map, u32 index);
+
 #endif /* _LINUX_BPF_H */
