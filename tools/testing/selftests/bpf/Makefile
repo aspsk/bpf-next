@@ -451,6 +451,7 @@ BPF_CFLAGS = -g -Wall -Werror -D__TARGET_ARCH_$(SRCARCH) $(MENDIAN)	\
 	     -std=gnu11		 					\
 	     -fno-strict-aliasing 					\
 	     -Wno-compare-distinct-pointer-types			\
+	     -mllvm=-emit-jump-table-sizes-section			\
 	     -Wno-initializer-overrides					\
 	     #
 # TODO: enable me -Wsign-compare
