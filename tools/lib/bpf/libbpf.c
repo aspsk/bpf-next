@@ -538,6 +538,7 @@ struct bpf_struct_ops {
 #define STRUCT_OPS_LINK_SEC ".struct_ops.link"
 #define ARENA_SEC ".addr_space.1"
 #define STATIC_KEYS_SEC ".static_keys"
+#define LLVM_JT_SIZES_SEC ".llvm_jump_table_sizes"
 
 enum libbpf_map_type {
 	LIBBPF_MAP_UNSPEC,
@@ -672,6 +673,7 @@ struct elf_state {
 	Elf_Data *symbols;
 	Elf_Data *arena_data;
 	Elf_Data *static_keys_data;
+	Elf_Data *jt_sizes_data;
 	size_t shstrndx; /* section index for section name strings */
 	size_t strtabidx;
 	struct elf_sec_desc *secs;
@@ -683,6 +685,7 @@ struct elf_state {
 	bool has_st_ops;
 	int arena_data_shndx;
 	int static_keys_data_shndx;
+	int jt_sizes_data_shndx;
 };
 
 struct usdt_manager;
@@ -691,6 +694,13 @@ enum bpf_object_state {
 	OBJ_OPEN,
 	OBJ_PREPARED,
 	OBJ_LOADED,
+};
+
+struct jt {
+	__u64 insn_off; /* [unique] offset within .rodata */
+
+	size_t jump_target_cnt;
+	__u64 jump_target[];
 };
 
 struct bpf_object {
@@ -711,7 +721,14 @@ struct bpf_object {
 	int kconfig_map_idx;
 
 	bool has_subcalls;
+
 	bool has_rodata;
+	const void *rodata;
+	size_t rodata_size;
+	int rodata_map_fd;
+
+	struct jt **jt;
+	size_t jt_cnt;
 
 	struct bpf_gen *gen_loader;
 
@@ -2120,6 +2137,96 @@ bpf_object__collect_static_keys_relos(struct bpf_object *obj,
 	return 0;
 }
 
+static const struct jt *bpf_object__find_jt(struct bpf_object *obj, __u64 insn_off)
+{
+	size_t i;
+
+	for (i = 0; i < obj->jt_cnt; i++)
+		if (obj->jt[i]->insn_off == insn_off)
+			return obj->jt[i];
+
+	return ERR_PTR(-ENOENT);
+}
+
+static int bpf_object__alloc_jt(struct bpf_object *obj, __u64 insn_off, __u64 size)
+{
+	__u64 i, jump_target;
+	struct jt *jt;
+	void *x;
+
+	jt = calloc(1, sizeof(struct jt) + 8*size);
+	if (!jt)
+		return -ENOMEM;
+
+	jt->insn_off = insn_off;
+	jt->jump_target_cnt = size;
+
+	for (i = 0; i < size; i++) {
+		if (i*8 > obj->rodata_size) {
+			pr_warn("\tNO .rodata[%llu], size is %lu!\n", i, obj->rodata_size);
+			free(jt);
+			return -EINVAL;
+		}
+
+		jump_target = ((__u64*)(obj->rodata + insn_off * 8))[i] / 8;
+		pr_warn("\t%lld\n", jump_target);
+		jt->jump_target[i] = jump_target;
+	}
+
+	x = realloc(obj->jt, (obj->jt_cnt + 1) * sizeof(long));
+	if (!x) {
+		free(jt);
+		return -ENOMEM;
+	}
+	obj->jt = x;
+	obj->jt[obj->jt_cnt++] = jt;
+	return 0;
+}
+
+static int bpf_object__add_jt(struct bpf_object *obj, __u64 insn_off, __u64 size)
+{
+	if (!obj->rodata) {
+		pr_warn("NO .rodata!\n");
+		return -EINVAL;
+	}
+
+	if (!IS_ERR(bpf_object__find_jt(obj, insn_off)))
+		return -EINVAL;
+
+	return bpf_object__alloc_jt(obj, insn_off, size);
+}
+
+static int
+bpf_object__collect_jt_relos(struct bpf_object *obj, Elf64_Shdr *shdr, Elf_Data *relo_data)
+{
+	Elf_Data *data = obj->efile.jt_sizes_data;
+	size_t i;
+	int err;
+	const size_t SSZZ = 16;
+	__u64 *x;
+
+	if (!data)
+		return 0;
+
+	pr_warn("NOW ME HERE SIZE=%zd\n", data->d_size);
+
+	x = (__u64 *)data->d_buf;
+
+	for (i = 0; i < data->d_size / SSZZ; i++) {
+		__u64 off = x[2*i];
+		__u64 size = x[2*i+1];
+
+		pr_warn("JT[%zd]: off=0x%16llx size=%llu\n", i, off, size); // XXX debug
+		err = bpf_object__add_jt(obj, off / 8, size);
+		if (err)
+			return err;
+	}
+
+	//bpf_object__pr_jt(obj); // XXX debug
+
+	return 0;
+}
+
 static int
 map_fill_btf_type_info(struct bpf_object *obj, struct bpf_map *map);
 
@@ -2166,6 +2273,9 @@ bpf_object__init_internal_map(struct bpf_object *obj, enum libbpf_map_type type,
 	map = bpf_object__add_map(obj);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+
+	if (type == LIBBPF_MAP_RODATA)
+		obj->rodata_map_fd = map->fd;
 
 	map->libbpf_type = type;
 	map->sec_idx = sec_idx;
@@ -2240,6 +2350,8 @@ static int bpf_object__init_global_data_maps(struct bpf_object *obj)
 			break;
 		case SEC_RODATA:
 			obj->has_rodata = true;
+			obj->rodata = sec_desc->data->d_buf;
+			obj->rodata_size = sec_desc->data->d_size;
 			sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
 			err = bpf_object__init_internal_map(obj, LIBBPF_MAP_RODATA,
 							    sec_name, sec_idx,
@@ -4197,7 +4309,9 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			    strcmp(name, ".rel?" STRUCT_OPS_SEC) &&
 			    strcmp(name, ".rel?" STRUCT_OPS_LINK_SEC) &&
 			    strcmp(name, ".rel" MAPS_ELF_SEC) &&
-			    strcmp(name, ".rel" STATIC_KEYS_SEC)) {
+			    strcmp(name, ".rel" STATIC_KEYS_SEC) &&
+			    strcmp(name, ".rel" LLVM_JT_SIZES_SEC) &&
+			    strcmp(name, ".rel" RODATA_SEC)) {
 				pr_info("elf: skipping relo section(%d) %s for section(%d) %s\n",
 					idx, name, targ_sec_idx,
 					elf_sec_name(obj, elf_sec_by_idx(obj, targ_sec_idx)) ?: "<?>");
@@ -4212,6 +4326,14 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			sec_desc->sec_type = SEC_BSS;
 			sec_desc->shdr = sh;
 			sec_desc->data = data;
+
+		} else if (sh->sh_type == SHT_LLVM_JT_SIZES) {
+			pr_warn("sh->sh_type == SHT_LLVM_JT_SIZES, idx=%d\n", idx);
+			obj->efile.jt_sizes_data = data;
+			obj->efile.jt_sizes_data_shndx = idx;
+			//sec_desc->sec_type = SHT_LLVM_JT_SIZES;
+			//sec_desc->shdr = sh;
+			//sec_desc->data = data;
 		} else {
 			pr_info("elf: skipping section(%d) %s (size %zu)\n", idx, name,
 				(size_t)sh->sh_size);
@@ -6383,6 +6505,45 @@ static void poison_kfunc_call(struct bpf_program *prog, int relo_idx,
 	insn->imm = POISON_CALL_KFUNC_BASE + ext_idx;
 }
 
+static bool hack_is_rodata(struct bpf_object *obj, int map_fd)
+{
+	return map_fd == obj->rodata_map_fd;
+}
+
+static int __this_map_fd = -1;
+
+static int create_jt_map(const struct jt *jt)
+{
+        static union bpf_attr attr = {
+                .map_type = BPF_MAP_TYPE_INSN_SET,
+                .key_size = 4,                                                                                                                                                                      .value_size = 4,
+                .max_entries = 0,
+        };                                                                                                                                                                                  int map_fd;
+        int ret;
+        __u32 i;
+
+        attr.max_entries = jt->jump_target_cnt;
+
+        map_fd = syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
+        if (map_fd < 0)
+                return map_fd;
+
+        for (i = 0; i < jt->jump_target_cnt; i++) {
+                ret = bpf_map_update_elem(map_fd, &i, &jt->jump_target[i], 0);
+                if (ret) {
+                        close(map_fd);
+                        return ret;
+                }
+        }
+
+        bpf_map_freeze(map_fd);
+
+	__this_map_fd = map_fd; // XXX wow
+
+        return map_fd;
+
+}
+
 /* Relocate data references within program code:
  *  - map references;
  *  - global variable references;
@@ -6420,8 +6581,16 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 				insn[0].src_reg = BPF_PSEUDO_MAP_IDX_VALUE;
 				insn[0].imm = relo->map_idx;
 			} else if (map->autocreate) {
+				const struct jt *jt;
 				insn[0].src_reg = BPF_PSEUDO_MAP_VALUE;
-				insn[0].imm = map->fd;
+				jt = bpf_object__find_jt(obj, insn[1].imm);
+				if (hack_is_rodata(obj, map->fd) && !IS_ERR(jt)) {
+					pr_warn("XXX please replace me by a JT map :)\n");
+					insn[0].imm = create_jt_map(jt);
+				} else {
+					insn[0].imm = map->fd;
+				}
+				pr_warn("XXX hoi aus relo->insn_idx=%d, relo->type=%d map->fd=%d relo->sym_off=%d\n", relo->insn_idx, relo->type, map->fd, relo->sym_off);
 			} else {
 				poison_map_ldimm64(prog, i, relo->insn_idx, insn,
 						   relo->map_idx, map);
@@ -7685,6 +7854,45 @@ static int bpf_object__collect_relos(struct bpf_object *obj)
 	return 0;
 }
 
+static int bpf_object__collect_jt(struct bpf_object *obj)
+{
+	int err;//, i;
+
+	pr_warn("ME HERE\n");
+
+	err = bpf_object__collect_jt_relos(obj, NULL, obj->efile.jt_sizes_data);
+
+#if 0
+	for (i = 0; i < obj->efile.sec_cnt; i++) {
+		struct elf_sec_desc *sec_desc = &obj->efile.secs[i];
+		Elf64_Shdr *shdr = sec_desc->shdr;
+		Elf_Data *data;
+		int idx;
+
+		if (!shdr || shdr->sh_type != SHT_LLVM_JT_SIZES)
+			continue;
+
+		data = sec_desc->data;
+		idx = shdr->sh_info;
+
+		if (idx < 0 || idx >= obj->efile.sec_cnt) {
+			pr_warn("internal error at %d\n", __LINE__);
+			return -LIBBPF_ERRNO__INTERNAL;
+		}
+
+		pr_warn("ME HERE checking section type=%x idx=%d\n", shdr ? shdr->sh_type : 0, idx);
+		if (idx == obj->efile.jt_sizes_data_shndx)
+			err = bpf_object__collect_jt_relos(obj, shdr, data);
+		else
+			err = -EINVAL;
+		if (err)
+			return err;
+	}
+#endif
+
+	return err;
+}
+
 static bool insn_is_helper_call(struct bpf_insn *insn, enum bpf_func_id *func_id)
 {
 	if (BPF_CLASS(insn->code) == BPF_JMP &&
@@ -7730,6 +7938,41 @@ static int bpf_object__sanitize_prog(struct bpf_object *obj, struct bpf_program 
 			break;
 		}
 	}
+	return 0;
+}
+
+static bool insn_is_gotox(struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_JMP && BPF_OP(insn->code) == BPF_JA && BPF_SRC(insn->code) == BPF_X;
+}
+
+static int find_jt_map_fd(struct bpf_program *prog, int insn_idx)
+{
+	// XXX very smart
+	return __this_map_fd;
+}
+
+static int bpf_object__patch_gotox(struct bpf_object *obj, struct bpf_program *prog)
+{
+	struct bpf_insn *insn = prog->insns;
+	int map_fd;
+	int i;
+
+	if (obj->gen_loader)
+		return -EBUSY;
+
+	for (i = 0; i < prog->insns_cnt; i++, insn++) {
+		if (!insn_is_gotox(insn))
+			continue;
+
+		map_fd = find_jt_map_fd(prog, i);
+		if (map_fd < 0)
+			return map_fd;
+
+		pr_warn("replacing insn[%d]->imm with %d\n", i, map_fd);
+		insn->imm = map_fd;
+	}
+
 	return 0;
 }
 
@@ -8298,6 +8541,14 @@ static int bpf_object_prepare_progs(struct bpf_object *obj)
 		if (err)
 			return err;
 	}
+
+	for (i = 0; i < obj->nr_programs; i++) {
+		prog = &obj->programs[i];
+		err = bpf_object__patch_gotox(obj, prog);
+		if (err)
+			pr_warn("return err;");
+	}
+
 	return 0;
 }
 
@@ -8430,6 +8681,7 @@ static struct bpf_object *bpf_object_open(const char *path, const void *obj_buf,
 	err = err ? : bpf_object__init_maps(obj, opts);
 	err = err ? : bpf_object_init_progs(obj, opts);
 	err = err ? : bpf_object__collect_relos(obj);
+	err = err ? : bpf_object__collect_jt(obj);
 	if (err)
 		goto out;
 
