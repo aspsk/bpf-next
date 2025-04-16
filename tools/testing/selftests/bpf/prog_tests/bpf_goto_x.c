@@ -244,11 +244,22 @@ static void __attribute__((unused)) __test_run(struct bpf_program *prog, void *c
 	ASSERT_OK(err, "test_run_opts err");
 }
 
-static void __attribute__((unused)) check_simple(struct bpf_goto_x *skel, struct bpf_program *prog, __u64 ctx_in, __u64 expected)
+static void check_simple(struct bpf_goto_x *skel, struct bpf_program *prog, __u64 ctx_in, __u64 expected)
 {
 	skel->bss->ret_user = 0;
 
 	__test_run(prog, &ctx_in, sizeof(ctx_in));
+
+	if (!ASSERT_EQ(skel->bss->ret_user, expected, "skel->bss->ret_user"))
+		return;
+}
+
+static void check_simple_fentry(struct bpf_goto_x *skel, struct bpf_program *prog, __u64 ctx_in, __u64 expected)
+{
+	skel->bss->in_user = ctx_in;
+	skel->bss->ret_user = 0;
+
+	usleep(1);
 
 	if (!ASSERT_EQ(skel->bss->ret_user, expected, "skel->bss->ret_user"))
 		return;
@@ -286,6 +297,18 @@ static void check_goto_x_skel(struct bpf_goto_x *skel)
 
 	for (i = 0; i < ARRAY_SIZE(in); i++)
 		check_simple(skel, skel->progs.use_nonstatic_global2, in[i], out[i]);
+
+	bpf_program__attach(skel->progs.simple_test_other_sec);
+	for (i = 0; i < ARRAY_SIZE(in); i++)
+		check_simple_fentry(skel, skel->progs.simple_test_other_sec, in[i], out[i]);
+
+	bpf_program__attach(skel->progs.use_static_global_other_sec);
+	for (i = 0; i < ARRAY_SIZE(in); i++)
+		check_simple_fentry(skel, skel->progs.use_static_global_other_sec, in[i], out[i]);
+
+	bpf_program__attach(skel->progs.use_nonstatic_global_other_sec);
+	for (i = 0; i < ARRAY_SIZE(in); i++)
+		check_simple_fentry(skel, skel->progs.use_nonstatic_global_other_sec, in[i], out[i]);
 }
 
 void goto_x_skel(void)

@@ -17289,8 +17289,6 @@ static int mark_fastcall_patterns(struct bpf_verifier_env *env)
 	return 0;
 }
 
-u32 insn_set_xlated_offset(struct bpf_map *map, u32 index);
-
 #define GET_HIGH(STATE)		((u16)((STATE) >> 16))
 #define SET_HIGH(STATE, LAST)	STATE = (STATE & 0xffffU) | ((LAST) << 16)
 
@@ -17298,17 +17296,16 @@ static int push_goto_void_edge(int t, struct bpf_verifier_env *env, struct bpf_m
 {
 	int *insn_stack = env->cfg.insn_stack;
 	int *insn_state = env->cfg.insn_state;
-	u16 last_edge = GET_HIGH(insn_state[t]);
+	u16 prev_edge = GET_HIGH(insn_state[t]);
 	int w;
 
 	mark_prune_point(env, t);
 	// XXX jump point to w?
 
-	if (last_edge == map->max_entries)
+	w = insn_set_get_unique_xlated_offset(map, prev_edge);
+	if (w == -ENOENT)
 		return DONE_EXPLORING;
-
-	w = insn_set_xlated_offset(map, last_edge);
-	SET_HIGH(insn_state[t], last_edge + 1);
+	SET_HIGH(insn_state[t], prev_edge + 1);
 
 	if (env->cfg.cur_stack >= env->prog->len)
 		return -E2BIG;
@@ -17320,7 +17317,7 @@ static int push_goto_void_edge(int t, struct bpf_verifier_env *env, struct bpf_m
 static int add_used_map(struct bpf_verifier_env *env, int fd, struct bpf_map **map_ptr);
 
 /* "conditional jump with N edges" */
-static int visit_goto_void_insn(int t, struct bpf_verifier_env *env, int fd)
+static int visit_goto_x_insn(int t, struct bpf_verifier_env *env, int fd)
 {
 	struct bpf_map *map;
 	int ret;
@@ -17434,7 +17431,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 
 	case BPF_JA:
 		if (BPF_SRC(insn->code) == BPF_X)
-			return visit_goto_void_insn(t, env, insn->imm);
+			return visit_goto_x_insn(t, env, insn->imm);
 
 		if (BPF_CLASS(insn->code) == BPF_JMP)
 			off = insn->off;
@@ -17494,7 +17491,7 @@ static int check_cfg(struct bpf_verifier_env *env)
 		return -ENOMEM;
 	}
 
-	insn_postorder = env->cfg.insn_postorder = kvcalloc(insn_cnt, sizeof(int), GFP_KERNEL);
+	insn_postorder = env->cfg.insn_postorder = kvcalloc(insn_cnt * 10 /* XXX: indirect jumps corrupt this */, sizeof(int), GFP_KERNEL);
 	if (!insn_postorder) {
 		kvfree(insn_state);
 		kvfree(insn_stack);
@@ -17516,6 +17513,7 @@ walk_cfg:
 		ret = visit_insn(t, env);
 		switch (ret) {
 		case DONE_EXPLORING:
+			pr_warn("DONE_EXPLORING: writing to t=%d env->cfg.cur_postorder=%d\n", t, env->cfg.cur_postorder);
 			insn_state[t] = EXPLORED;
 			env->cfg.cur_stack--;
 			insn_postorder[env->cfg.cur_postorder++] = t;
@@ -17548,6 +17546,11 @@ walk_cfg:
 		struct bpf_insn *insn = &env->prog->insnsi[i];
 
 		if (insn_state[i] != EXPLORED) {
+			if ((insn->code == 0x05) && (insn->src_reg == 0) && (insn->dst_reg == 0) && (insn->imm == 0) && (insn->off == 0)) {
+				pr_warn("skipping insn[%d]: it is JA+0\n", i);
+
+				continue;
+			}
 			verbose(env, "unreachable insn %d\n", i);
 			ret = -EINVAL;
 			goto err_free;
@@ -17566,9 +17569,13 @@ walk_cfg:
 	env->prog->aux->might_sleep = env->subprog_info[0].might_sleep;
 
 err_free:
+		pr_warn("ok 2\n");
 	kvfree(insn_state);
+		pr_warn("ok 3\n");
 	kvfree(insn_stack);
+		pr_warn("ok 4\n");
 	env->cfg.insn_state = env->cfg.insn_stack = NULL;
+		pr_warn("ok 5\n");
 	return ret;
 }
 
@@ -19504,6 +19511,7 @@ static int do_check(struct bpf_verifier_env *env)
 				if (BPF_SRC(insn->code) == BPF_X) {
 					struct bpf_map *map;
 					//u64 umin, umax;
+					int xoff;
 					u32 i;
 
 					// XXX: should be smth like get_used_map, as this map should have been already added
@@ -19523,18 +19531,21 @@ static int do_check(struct bpf_verifier_env *env)
 						return -EINVAL;
 					}
 #endif
-
 					for (i = 1; i < map->max_entries; i++) {
 
 						// XXX find map, then, for every entry except the first one, push the other branch
 						// goto the first branch
 
-						other_branch = push_stack(env, insn_set_xlated_offset(map, i), env->insn_idx, false);
+						xoff = insn_set_get_unique_xlated_offset(map, i);
+						if (xoff == -ENOENT) /* ok, non-unique elements are over */
+							break;
+
+						other_branch = push_stack(env, xoff, env->insn_idx, false);
 						if (!other_branch)
 							return -EFAULT;
 					}
 
-					env->insn_idx = insn_set_xlated_offset(map, 0);
+					env->insn_idx = insn_set_get_unique_xlated_offset(map, 0);
 					continue;
 				}
 
@@ -20166,15 +20177,15 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 					return err;
 				}
 
-				if (off == 6) {
+				if (map->map_type == BPF_MAP_TYPE_INSN_SET) {
 					pr_warn("XXX NOT ADJUSTING addr %px by %u\n", (void*)addr, off);
 					pr_warn("insn0: code=%02x dst_reg=%x src_reg=%x off=%d imm=%d\n", insn[0].code, insn[0].dst_reg, insn[0].src_reg, insn[0].off, insn[0].imm);
 					pr_warn("insn1: code=%02x dst_reg=%x src_reg=%x off=%d imm=%d\n", insn[1].code, insn[1].dst_reg, insn[1].src_reg, insn[1].off, insn[1].imm);
 				}
 
 				else {
-				aux->map_off = off;
-				addr += off;
+					aux->map_off = off;
+					addr += off;
 				}
 			}
 
@@ -21152,6 +21163,8 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->jited_linfo = prog->aux->jited_linfo;
 		func[i]->aux->linfo_idx = env->subprog_info[i].linfo_idx;
 		func[i]->aux->arena = prog->aux->arena;
+		func[i]->aux->used_maps = env->used_maps;
+		func[i]->aux->used_map_cnt = env->used_map_cnt;
 		num_exentries = 0;
 		insn = func[i]->insnsi;
 		for (j = 0; j < func[i]->len; j++, insn++) {

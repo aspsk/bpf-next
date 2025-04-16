@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/bpf.h>
+#include <linux/sort.h>
 
 #define MAX_ISET_ENTRIES 256
 
@@ -8,6 +9,8 @@ struct bpf_insn_set {
 	struct bpf_map map;
 	struct mutex state_mutex;
 	int state;
+	u32 **unique_offsets;
+	u32 unique_offsets_cnt;
 	long *ips;
 	DECLARE_FLEX_ARRAY(struct bpf_insn_ptr, ptrs);
 };
@@ -44,6 +47,15 @@ static int insn_set_alloc_check(union bpf_attr *attr)
 	return 0;
 }
 
+static void insn_set_free(struct bpf_map *map)
+{
+	struct bpf_insn_set *insn_set = cast_insn_set(map);
+
+	kfree(insn_set->unique_offsets);
+	kfree(insn_set->ips);
+	bpf_map_area_free(insn_set);
+}
+
 static struct bpf_map *insn_set_alloc(union bpf_attr *attr)
 {
 	u64 size = insn_set_alloc_size(attr->max_entries);
@@ -54,8 +66,16 @@ static struct bpf_map *insn_set_alloc(union bpf_attr *attr)
 		return ERR_PTR(-ENOMEM);
 
 	insn_set->ips = kzalloc(sizeof(long) * attr->max_entries, GFP_KERNEL);
-	if (!insn_set->ips)
+	if (!insn_set->ips) {
+		insn_set_free(&insn_set->map);
 		return ERR_PTR(-ENOMEM);
+	}
+
+	insn_set->unique_offsets = kzalloc(sizeof(long) * attr->max_entries, GFP_KERNEL);
+	if (!insn_set->unique_offsets) {
+		insn_set_free(&insn_set->map);
+		return ERR_PTR(-ENOMEM);
+	}
 
 	bpf_map_init_from_attr(&insn_set->map, attr);
 
@@ -143,13 +163,6 @@ static int insn_set_check_btf(const struct bpf_map *map,
 	return 0;
 }
 
-static void insn_set_free(struct bpf_map *map)
-{
-	struct bpf_insn_set *insn_set = cast_insn_set(map);
-
-	bpf_map_area_free(insn_set);
-}
-
 static u64 insn_set_mem_usage(const struct bpf_map *map)
 {
 	return insn_set_alloc_size(map->max_entries);
@@ -164,7 +177,7 @@ static int insn_set_map_direct_value_addr(const struct bpf_map *map, u64 *imm, u
 
 	*imm = (unsigned long)insn_set->ips;
 
-	pr_warn("%s: setting *imm=%px\n", __func__, insn_set->ips);
+	pr_warn("%s: setting *imm=%px off=%u\n", __func__, insn_set->ips, off);
 
 	return 0;
 }
@@ -218,7 +231,7 @@ static bool is_inverse_ja_or_nop(const struct bpf_insn *insn)
 static inline bool valid_offsets(const struct bpf_insn_set *insn_set,
 				 const struct bpf_prog *prog)
 {
-	u32 off, prev_off;
+	u32 off;//, prev_off;
 	int i;
 
 	for (i = 0; i < insn_set->map.max_entries; i++) {
@@ -243,6 +256,42 @@ static inline bool valid_offsets(const struct bpf_insn_set *insn_set,
 	}
 
 	return true;
+}
+
+static int cmp_unique_offsets(const void *a, const void *b)
+{
+	return *(u32 *)a - *(u32 *)b;
+}
+
+/*
+ * ptr_addr:        
+ * ptr_addr_srted:  
+ * ptr_addr_unique: 
+ */
+static int bpf_insn_set_init_unique_offsets(struct bpf_insn_set *insn_set)
+{
+	u32 cnt = insn_set->map.max_entries, ucnt = 1;
+	u32 **off = insn_set->unique_offsets;
+	int i;
+
+	/* [0,3,2,4,6,5,5,5,1,1,0,0] */
+	for (i = 0; i < cnt; i++)
+		off[i] = &insn_set->ptrs[i].xlated_off;
+
+	/* [0,0,0,1,1,2,3,4,5,5,5,6] */
+	sort(off, cnt, sizeof(off[0]), cmp_unique_offsets, NULL);
+
+	/*
+	 * [0,1,2,3,4,5,6,x,x,x,x,x]
+         *  \.........../
+         8    unique_offsets_cnt
+	 */
+	for (i = 1; i < cnt; i++)
+		if (*off[i] != *off[ucnt-1])
+			off[ucnt++] = off[i];
+
+	insn_set->unique_offsets_cnt = ucnt;
+	return 0;
 }
 
 int bpf_insn_set_init(struct bpf_map *map, const struct bpf_prog *prog)
@@ -281,7 +330,10 @@ int bpf_insn_set_init(struct bpf_map *map, const struct bpf_prog *prog)
 		insn_set->ptrs[i].inverse_ja_or_nop = is_inverse_ja_or_nop(insn);
 	}
 
-	return 0;
+	/*
+	 * Prepare a set of unique offsets
+	 */
+	return bpf_insn_set_init_unique_offsets(insn_set);
 }
 
 void bpf_insn_set_ready(struct bpf_map *map)
@@ -335,7 +387,26 @@ void bpf_insn_set_adjust_after_remove(struct bpf_map *map, u32 off, u32 len)
 	}
 }
 
-static struct bpf_insn_ptr *insn_ptr_by_offset(struct bpf_prog *prog, u32 xlated_off, long **ip)
+__attribute__((unused)) static const char *pr_insn_set(struct bpf_insn_set *insn_set)
+{
+	static char s[256];
+	int i, n = 0;
+
+	for (i = 0; i < insn_set->map.max_entries; i++) {
+		if (i)
+			n += snprintf(s+n, 256-n, ", ");
+		n += snprintf(s+n, 256-n, "%u", insn_set->ptrs[i].xlated_off);
+	}
+
+	return s;
+}
+
+void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
+			      u32 xlated_off,
+			      u32 jitted_off,
+			      u32 jitted_len,
+			      int jitted_jump_offset,
+			      void *jitted_ip)
 {
 	struct bpf_insn_set *insn_set;
 	struct bpf_map *map;
@@ -349,38 +420,14 @@ static struct bpf_insn_ptr *insn_ptr_by_offset(struct bpf_prog *prog, u32 xlated
 		insn_set = cast_insn_set(map);
 		for (j = 0; j < map->max_entries; j++) {
 			if (insn_set->ptrs[j].xlated_off == xlated_off) {
-				*ip = &insn_set->ips[j];
-				return &insn_set->ptrs[j];
+				pr_warn("%s: setting (map %s)[%d].JITTED_IP=%px\n", __func__, map->name, j, jitted_ip);
+				insn_set->ips[j] = (long)jitted_ip;
+				insn_set->ptrs[j].jitted_ip = jitted_ip;
+				insn_set->ptrs[j].jitted_off = jitted_off;
+				insn_set->ptrs[j].jitted_len = jitted_len;
+				insn_set->ptrs[j].jitted_jump_offset = jitted_jump_offset;
 			}
 		}
-	}
-
-	return NULL;
-}
-
-void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
-			      u32 xlated_off,
-			      u32 jitted_off,
-			      u32 jitted_len,
-			      int jitted_jump_offset,
-			      void *jitted_ip)
-{
-	struct bpf_insn_ptr *ptr;
-	long *ip = NULL;
-
-	ptr = insn_ptr_by_offset(prog, xlated_off, &ip);
-	if (ptr) {
-		pr_warn("%s: setting IP=%px\n", __func__, jitted_ip);
-
-		if (ip) {
-			pr_warn("%s: setting ip=%px\n", __func__, jitted_ip);
-			*ip = (long)jitted_ip;
-		}
-
-		ptr->jitted_ip = jitted_ip;
-		ptr->jitted_off = jitted_off;
-		ptr->jitted_len = jitted_len;
-		ptr->jitted_jump_offset = jitted_jump_offset;
 	}
 }
 
@@ -423,13 +470,12 @@ int bpf_static_key_set(struct bpf_map *map, bool on)
 	return ret;
 }
 
-u32 insn_set_xlated_offset(struct bpf_map *map, u32 index)
+int insn_set_get_unique_xlated_offset(struct bpf_map *map, u32 iter_no)
 {
 	struct bpf_insn_set *insn_set = cast_insn_set(map);
 
-	// XXX: what is the right return value?
-	if (WARN_ONCE(index >= map->max_entries, "index (%u) >= map->max_entries (%u)", index, map->max_entries))
-		return -1;
+	if (iter_no >= insn_set->unique_offsets_cnt)
+		return -ENOENT;
 
-	return insn_set->ptrs[index].xlated_off;
+	return *insn_set->unique_offsets[iter_no];
 }
