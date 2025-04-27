@@ -37,7 +37,8 @@ static int insn_set_alloc_check(union bpf_attr *attr)
 	if (attr->max_entries == 0 ||
 	    attr->key_size != 4 ||
 	    attr->value_size != sizeof(long) ||
-	    attr->map_flags != 0)
+	    attr->map_flags != 0 ||
+	    attr->map_extra & ~BPF_F_STATIC_KEY)
 		return -EINVAL;
 
 	if (attr->max_entries > MAX_ISET_ENTRIES)
@@ -207,6 +208,24 @@ static bool is_insn_set(const struct bpf_map *map)
 	return map->map_type == BPF_MAP_TYPE_INSN_SET;
 }
 
+static bool is_static_key(const struct bpf_map *map)
+{
+	return is_insn_set(map) && (map->map_extra & BPF_F_STATIC_KEY);
+}
+
+static bool is_ja_or_nop(const struct bpf_insn *insn)
+{
+	u8 code = insn->code;
+
+	return (code == (BPF_JMP | BPF_JA) || code == (BPF_JMP32 | BPF_JA)) &&
+		(insn->src_reg & BPF_STATIC_BRANCH_JA);
+}
+
+static bool is_inverse_ja_or_nop(const struct bpf_insn *insn)
+{
+	return insn->src_reg & BPF_STATIC_BRANCH_NOP;
+}
+
 static inline bool valid_offsets(const struct bpf_insn_set *insn_set,
 				 const struct bpf_prog *prog)
 {
@@ -223,6 +242,9 @@ static inline bool valid_offsets(const struct bpf_insn_set *insn_set,
 			if (prog->insnsi[off-1].code == (BPF_LD | BPF_DW | BPF_IMM))
 				return false;
 		}
+
+		if (is_static_key(&insn_set->map) && !is_ja_or_nop(&prog->insnsi[off]))
+			return false;
 	}
 
 	return true;
@@ -262,6 +284,7 @@ static int bpf_insn_set_init_unique_offsets(struct bpf_insn_set *insn_set)
 int bpf_insn_set_init(struct bpf_map *map, const struct bpf_prog *prog)
 {
 	struct bpf_insn_set *insn_set = cast_insn_set(map);
+	const struct bpf_insn *insn;
 	int i;
 
 	if (!is_frozen(map))
@@ -284,10 +307,15 @@ int bpf_insn_set_init(struct bpf_map *map, const struct bpf_prog *prog)
 	/*
 	 * Reset all the map indexes to the original values.  This is needed,
 	 * e.g., when a replay of verification with different log level should
-	 * be performed.
+	 * be performed
 	 */
 	for (i = 0; i < map->max_entries; i++)
 		insn_set->ptrs[i].xlated_off = insn_set->ptrs[i].orig_xlated_off;
+
+	for (i = 0; i < map->max_entries; i++) {
+		insn = &prog->insnsi[insn_set->ptrs[i].xlated_off];
+		insn_set->ptrs[i].inverse_ja_or_nop = is_inverse_ja_or_nop(insn);
+	}
 
 	/*
 	 * Prepare a set of unique offsets
@@ -383,4 +411,43 @@ int bpf_insn_set_iter_xlated_offset(struct bpf_map *map, u32 iter_no)
 		return -ENOENT;
 
 	return *insn_set->unique_offsets[iter_no];
+}
+
+static int check_state(struct bpf_insn_set *insn_set)
+{
+	guard(mutex)(&insn_set->state_mutex);
+
+	if (insn_set->state == INSN_SET_STATE_FREE)
+		return -EINVAL;
+	if (insn_set->state == INSN_SET_STATE_INIT)
+		return -EBUSY;
+
+	return 0;
+}
+
+int bpf_static_key_set(struct bpf_map *map, bool on)
+{
+	struct bpf_insn_set *insn_set = cast_insn_set(map);
+	struct bpf_insn_ptr *ptr;
+	int ret = 0;
+	int i;
+
+	if (!is_static_key(map))
+		return -EINVAL;
+
+	ret = check_state(insn_set);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < map->max_entries && ret == 0; i++) {
+		ptr = &insn_set->ptrs[i];
+		if (ptr->xlated_off == INSN_DELETED)
+			continue;
+
+		ret = bpf_arch_poke_static_branch(ptr, on ^ ptr->inverse_ja_or_nop);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
 }

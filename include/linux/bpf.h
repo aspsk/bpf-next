@@ -3584,6 +3584,7 @@ struct bpf_insn_ptr {
 
 	u64 orig_xlated_off;
 	u64 xlated_off;
+	bool inverse_ja_or_nop;
 };
 
 void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
@@ -3592,5 +3593,8 @@ void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
 			      u32 jitted_len,
 			      int jitted_jump_offset,
 			      void *jitted_ip);
+
+int bpf_static_key_set(struct bpf_map *map, bool on);
+int bpf_arch_poke_static_branch(struct bpf_insn_ptr *ptr, bool on);
 
 #endif /* _LINUX_BPF_H */
