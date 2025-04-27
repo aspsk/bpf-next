@@ -20053,8 +20053,10 @@ static int __add_used_map(struct bpf_verifier_env *env, struct bpf_map *map)
 
 	if (map->map_type == BPF_MAP_TYPE_INSN_SET) {
 		err = bpf_insn_set_init(map, env->prog);
-		if (err)
+		if (err) {
+			verbose(env, "Failed to properly initialize insn set\n");
 			return err;
+		}
 		env->insn_set_maps[env->insn_set_map_cnt++] = map;
 	}
 
