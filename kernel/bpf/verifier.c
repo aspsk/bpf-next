@@ -17704,6 +17704,16 @@ walk_cfg:
 		struct bpf_insn *insn = &env->prog->insnsi[i];
 
 		if (insn_state[i] != EXPLORED) {
+			/*
+			 * This is a hacky workaround to overcome LLVM bug(?).
+			 * See https://github.com/llvm/llvm-project/pull/133856#issuecomment-2801228215
+			 * (libbpf should have replaced this instruction by JA+0)
+			 */
+			if ((insn->code == 0x05) && (insn->src_reg == 0) && (insn->dst_reg == 0) && (insn->imm == 0) && (insn->off == 0)) {
+				pr_warn("skipping insn[%d]: it is a magic JA+0\n", i);
+				continue;
+			}
+
 			verbose(env, "unreachable insn %d\n", i);
 			ret = -EINVAL;
 			goto err_free;
