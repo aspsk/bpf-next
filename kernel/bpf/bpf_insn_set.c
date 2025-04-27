@@ -374,3 +374,13 @@ void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
 		}
 	}
 }
+
+int bpf_insn_set_iter_xlated_offset(struct bpf_map *map, u32 iter_no)
+{
+	struct bpf_insn_set *insn_set = cast_insn_set(map);
+
+	if (iter_no >= insn_set->unique_offsets_cnt)
+		return -ENOENT;
+
+	return *insn_set->unique_offsets[iter_no];
+}

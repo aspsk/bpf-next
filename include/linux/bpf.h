@@ -3574,6 +3574,7 @@ void bpf_insn_set_ready(struct bpf_map *map);
 void bpf_insn_set_release(struct bpf_map *map);
 void bpf_insn_set_adjust(struct bpf_map *map, u32 off, u32 len);
 void bpf_insn_set_adjust_after_remove(struct bpf_map *map, u32 off, u32 len);
+int bpf_insn_set_iter_xlated_offset(struct bpf_map *map, u32 iter_no);
 
 struct bpf_insn_ptr {
 	void *jitted_ip;
