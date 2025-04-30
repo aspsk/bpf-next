@@ -4299,7 +4299,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				 */
 				if (bt_reg_mask(bt) & ~BPF_REGMASK_ARGS) {
 					verbose(env, "BUG regs %x\n", bt_reg_mask(bt));
-					WARN_ONCE(1, "verifier backtracking bug");
+					WARN_ONCE(1, "verifier backtracking bug"); // XXX hitting this bug with "./test_progs -a tcp_hdr_options"
 					return -EFAULT;
 				}
 				/* we are now tracking register spills correctly,
@@ -4378,7 +4378,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 					bt_clear_reg(bt, i);
 			if (bt_reg_mask(bt) & BPF_REGMASK_ARGS) {
 				verbose(env, "BUG regs %x\n", bt_reg_mask(bt));
-				WARN_ONCE(1, "verifier backtracking bug");
+				WARN_ONCE(1, "verifier backtracking bug"); // XXX triggering this bug now
 				return -EFAULT;
 			}
 
@@ -17475,6 +17475,7 @@ static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct bpf_map 
 	// XXX jump point to w?
 
 	w = bpf_insn_set_iter_xlated_offset(map, prev_edge);
+	pr_warn("bpf_insn_set_iter_xlated_offset(%s, prev_edge=%d)=%d\n", map->name, prev_edge, w);
 	if (w == -ENOENT)
 		return DONE_EXPLORING;
 	else if (w < 0)
@@ -17714,7 +17715,7 @@ walk_cfg:
 				continue;
 			}
 
-			verbose(env, "unreachable insn %d\n", i);
+			verbose(env, "unreachable insn %d {code=%02x}\n", i, insn->code);
 			ret = -EINVAL;
 			goto err_free;
 		}

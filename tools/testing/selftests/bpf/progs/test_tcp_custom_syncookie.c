@@ -219,7 +219,8 @@ static __always_inline void *next(struct tcp_syncookie *ctx, __u32 sz)
 
 static int tcp_parse_option(__u32 index, struct tcp_syncookie *ctx)
 {
-	__u8 *opcode, *opsize, *wscale;
+	volatile __u8 *opcode;
+	__u8 *opsize, *wscale;
 	__u32 *tsval, *tsecr;
 	__u16 *mss;
 	__u32 off;
