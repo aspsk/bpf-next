@@ -120,6 +120,7 @@ enum bpf_enum_value_kind {
  */
 #define BPF_CORE_WRITE_BITFIELD(s, field, new_val) ({			\
 	void *p = (void *)s + __CORE_RELO(s, field, BYTE_OFFSET);	\
+	XXX \
 	unsigned int byte_size = __CORE_RELO(s, field, BYTE_SIZE);	\
 	unsigned int lshift = __CORE_RELO(s, field, LSHIFT_U64);	\
 	unsigned int rshift = __CORE_RELO(s, field, RSHIFT_U64);	\
