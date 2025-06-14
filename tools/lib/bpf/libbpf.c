@@ -372,6 +372,7 @@ enum reloc_type {
 	RELO_EXTERN_CALL,
 	RELO_SUBPROG_ADDR,
 	RELO_CORE,
+	RELO_INSN_ARRAY,
 };
 
 struct reloc_desc {
@@ -383,6 +384,7 @@ struct reloc_desc {
 			int map_idx;
 			int sym_off;
 			int ext_idx;
+			int sym_size;
 		};
 	};
 };
@@ -496,6 +498,10 @@ struct bpf_program {
 	__u32 line_info_rec_size;
 	__u32 line_info_cnt;
 	__u32 prog_flags;
+
+	__u32 subprog_offset[256];
+	__u32 subprog_sec_offst[256];
+	__u32 subprog_cnt;
 };
 
 struct bpf_struct_ops {
@@ -658,6 +664,7 @@ struct elf_state {
 	Elf64_Ehdr *ehdr;
 	Elf_Data *symbols;
 	Elf_Data *arena_data;
+	Elf_Data *jumptables_data;
 	size_t shstrndx; /* section index for section name strings */
 	size_t strtabidx;
 	struct elf_sec_desc *secs;
@@ -668,6 +675,7 @@ struct elf_state {
 	int symbols_shndx;
 	bool has_st_ops;
 	int arena_data_shndx;
+	int jumptables_data_shndx;
 };
 
 struct usdt_manager;
@@ -3945,6 +3953,11 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			} else if (strcmp(name, ARENA_SEC) == 0) {
 				obj->efile.arena_data = data;
 				obj->efile.arena_data_shndx = idx;
+			} else if (strcmp(name, ".jumptables") == 0) {
+				// XXX, do it properly, otherwise ->d_buf is eventually corrupted
+				obj->efile.jumptables_data = calloc(1, sizeof(*data));
+				memcpy(obj->efile.jumptables_data, data, sizeof(*data));
+				obj->efile.jumptables_data_shndx = idx;
 			} else {
 				pr_info("elf: skipping unrecognized data section(%d) %s\n",
 					idx, name);
@@ -4596,6 +4609,16 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 		pr_debug("prog '%s': found arena map %d (%s, sec %d, off %zu) for insn %u\n",
 			 prog->name, obj->arena_map_idx, map->name, map->sec_idx,
 			 map->sec_offset, insn_idx);
+		return 0;
+	}
+
+	/* jump table data relocation */
+	if (shdr_idx == obj->efile.jumptables_data_shndx) {
+		reloc_desc->type = RELO_INSN_ARRAY;
+		reloc_desc->insn_idx = insn_idx;
+		reloc_desc->map_idx = -1;
+		reloc_desc->sym_off = sym->st_value; // XXX ?
+		reloc_desc->sym_size = sym->st_size;
 		return 0;
 	}
 
@@ -6091,6 +6114,60 @@ static void poison_kfunc_call(struct bpf_program *prog, int relo_idx,
 	insn->imm = POISON_CALL_KFUNC_BASE + ext_idx;
 }
 
+static int create_jt_map(struct bpf_object *obj, int off, int size, int adjust_off)
+{
+	static union bpf_attr attr = {
+		.map_type = BPF_MAP_TYPE_INSN_ARRAY,
+		.key_size = 4,
+		.value_size = sizeof(struct bpf_insn_array_value),
+		.max_entries = 0,
+	};
+	struct bpf_insn_array_value val = {};
+	int map_fd;
+	int err;
+	__u32 i;
+	__u32 *jt;
+
+	attr.max_entries = size / 8;
+
+	map_fd = syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
+	if (map_fd < 0)
+		return map_fd;
+
+	jt = (__u32 *)(obj->efile.jumptables_data->d_buf + off);
+	if (!jt)
+		return -EINVAL;
+
+	for (i = 0; i < attr.max_entries; i++) {
+		val.xlated_off = jt[2*i]/8 + adjust_off;
+		err = bpf_map_update_elem(map_fd, &i, &val, 0);
+		if (err) {
+			close(map_fd);
+			return err;
+		}
+	}
+
+	err = bpf_map_freeze(map_fd);
+	if (err) {
+		close(map_fd);
+		return err;
+	}
+
+	return map_fd;
+}
+
+static int subprog_insn_off(struct bpf_program *prog, int insn_idx)
+{
+	int i;
+
+	for (i = prog->subprog_cnt - 1; i >= 0; i--)
+		if (insn_idx >= prog->subprog_offset[i])
+			return prog->subprog_offset[i] - prog->subprog_sec_offst[i];
+
+	return -prog->sec_insn_off;
+}
+
+
 /* Relocate data references within program code:
  *  - map references;
  *  - global variable references;
@@ -6181,6 +6258,21 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 			break;
 		case RELO_CORE:
 			/* will be handled by bpf_program_record_relos() */
+			break;
+		case RELO_INSN_ARRAY: {
+			int map_fd;
+
+			map_fd = create_jt_map(obj, relo->sym_off, relo->sym_size,
+					       subprog_insn_off(prog, relo->insn_idx));
+			if (map_fd < 0) {
+				pr_warn("prog '%s': relo #%d: failed to create a jt map for sym_off=%u\n",
+						prog->name, i, relo->sym_off);
+				return map_fd;
+			}
+			insn[0].src_reg = BPF_PSEUDO_MAP_VALUE;
+			insn->imm = map_fd;
+			insn->off = 0;
+		}
 			break;
 		default:
 			pr_warn("prog '%s': relo #%d: bad relo type %d\n",
@@ -6380,35 +6472,57 @@ static int append_subprog_relos(struct bpf_program *main_prog, struct bpf_progra
 }
 
 static int
-bpf_object__append_subprog_code(struct bpf_object *obj, struct bpf_program *main_prog,
-				struct bpf_program *subprog)
+bpf_prog__append_subprog_offsets(struct bpf_program *prog, __u32 sec_insn_off, __u32 sub_insn_off)
 {
-       struct bpf_insn *insns;
-       size_t new_cnt;
-       int err;
+	if (prog->subprog_cnt == ARRAY_SIZE(prog->subprog_sec_offst)) {
+		pr_warn("prog '%s': number of subprogs exceeds %zu\n",
+			prog->name, ARRAY_SIZE(prog->subprog_sec_offst));
+		return -E2BIG;
+	}
 
-       subprog->sub_insn_off = main_prog->insns_cnt;
+	prog->subprog_sec_offst[prog->subprog_cnt] = sec_insn_off;
+	prog->subprog_offset[prog->subprog_cnt] = sub_insn_off;
 
-       new_cnt = main_prog->insns_cnt + subprog->insns_cnt;
-       insns = libbpf_reallocarray(main_prog->insns, new_cnt, sizeof(*insns));
-       if (!insns) {
-               pr_warn("prog '%s': failed to realloc prog code\n", main_prog->name);
-               return -ENOMEM;
-       }
-       main_prog->insns = insns;
-       main_prog->insns_cnt = new_cnt;
+	prog->subprog_cnt += 1;
+	return 0;
+}
 
-       memcpy(main_prog->insns + subprog->sub_insn_off, subprog->insns,
-              subprog->insns_cnt * sizeof(*insns));
+static int
+bpf_object__append_subprog_code(struct bpf_object *obj, struct bpf_program *main_prog,
+		struct bpf_program *subprog)
+{
+	struct bpf_insn *insns;
+	size_t new_cnt;
+	int err;
 
-       pr_debug("prog '%s': added %zu insns from sub-prog '%s'\n",
-                main_prog->name, subprog->insns_cnt, subprog->name);
+	subprog->sub_insn_off = main_prog->insns_cnt;
 
-       /* The subprog insns are now appended. Append its relos too. */
-       err = append_subprog_relos(main_prog, subprog);
-       if (err)
-               return err;
-       return 0;
+	new_cnt = main_prog->insns_cnt + subprog->insns_cnt;
+	insns = libbpf_reallocarray(main_prog->insns, new_cnt, sizeof(*insns));
+	if (!insns) {
+		pr_warn("prog '%s': failed to realloc prog code\n", main_prog->name);
+		return -ENOMEM;
+	}
+	main_prog->insns = insns;
+	main_prog->insns_cnt = new_cnt;
+
+	memcpy(main_prog->insns + subprog->sub_insn_off, subprog->insns,
+			subprog->insns_cnt * sizeof(*insns));
+
+	pr_debug("prog '%s': added %zu insns from sub-prog '%s'\n",
+			main_prog->name, subprog->insns_cnt, subprog->name);
+
+	/* The subprog insns are now appended. Append its relos too. */
+	err = append_subprog_relos(main_prog, subprog);
+	if (err)
+		return err;
+
+	err = bpf_prog__append_subprog_offsets(main_prog, subprog->sec_insn_off,
+					       subprog->sub_insn_off);
+	if (err)
+		return err;
+
+	return 0;
 }
 
 static int
@@ -7401,6 +7515,58 @@ static int bpf_object__sanitize_prog(struct bpf_object *obj, struct bpf_program 
 	return 0;
 }
 
+static bool insn_is_gotox(struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_JMP &&
+	       BPF_OP(insn->code) == BPF_JA &&
+	       BPF_SRC(insn->code) == BPF_X;
+}
+
+/*
+ * This one is too dumb, of course. TBD to make it smarter.
+ */
+static int find_jt_map_fd(struct bpf_program *prog, int insn_idx)
+{
+	struct bpf_insn *insn = &prog->insns[insn_idx];
+	__u8 dst_reg = insn->dst_reg;
+
+	/* TBD: this function is such smart for now that it even ignores this
+	 * register. Instead, it should backtrack the load more carefully.
+	 * (So far even this dumb version works with all selftests.)
+	 */
+	pr_debug("searching for a load instruction which populated dst_reg=r%u\n", dst_reg);
+
+	while (--insn >= prog->insns) {
+		if (insn->code == (BPF_LD|BPF_DW|BPF_IMM))
+			return insn[0].imm;
+	}
+
+	return -ENOENT;
+}
+
+static int bpf_object__patch_gotox(struct bpf_object *obj, struct bpf_program *prog)
+{
+	struct bpf_insn *insn = prog->insns;
+	int map_fd;
+	int i;
+
+	for (i = 0; i < prog->insns_cnt; i++, insn++) {
+		if (!insn_is_gotox(insn))
+			continue;
+
+		if (obj->gen_loader)
+			return -EFAULT;
+
+		map_fd = find_jt_map_fd(prog, i);
+		if (map_fd < 0)
+			return map_fd;
+
+		insn->imm = map_fd;
+	}
+
+	return 0;
+}
+
 static int libbpf_find_attach_btf_id(struct bpf_program *prog, const char *attach_name,
 				     int *btf_obj_fd, int *btf_type_id);
 
@@ -7944,6 +8110,14 @@ static int bpf_object_prepare_progs(struct bpf_object *obj)
 		if (err)
 			return err;
 	}
+
+	for (i = 0; i < obj->nr_programs; i++) {
+		prog = &obj->programs[i];
+		err = bpf_object__patch_gotox(obj, prog);
+		if (err)
+			return err;
+	}
+
 	return 0;
 }
 
