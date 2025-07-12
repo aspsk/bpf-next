@@ -19925,22 +19925,24 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 		return err;
 
 	dst_reg = reg_state(env, insn->dst_reg);
-	if (dst_reg->type != PTR_TO_INSN) {
-		verbose(env, "BPF_JA|BPF_X R%d has type %d, expected PTR_TO_INSN\n",
+	if (dst_reg->type != SCALAR_VALUE) {
+		verbose(env, "BPF_JA|BPF_X R%d has type %d, expected SCALAR_VALUE\n",
 				insn->dst_reg, dst_reg->type);
 		return -EINVAL;
 	}
 
+#if 0
 	if (dst_reg->map_ptr != map) {
 		verbose(env, "BPF_JA|BPF_X R%d was loaded from map id=%u, expected id=%u\n",
 				insn->dst_reg, dst_reg->map_ptr->id, map->id);
 		return -EINVAL;
 	}
+#endif
 
 	if (dst_reg->max_index >= map->max_entries)
 		return -EINVAL;
 
-	for (i = dst_reg->min_index + 1; i <= dst_reg->max_index; i++) {
+	for (i = dst_reg->umin_value + 1; i <= dst_reg->umax_value; i++) {
 		xoff = bpf_insn_array_iter_xlated_offset(map, i);
 		if (xoff == -ENOENT)
 			break;
@@ -19952,7 +19954,7 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 			return -EFAULT;
 	}
 
-	env->insn_idx = bpf_insn_array_iter_xlated_offset(map, dst_reg->min_index);
+	env->insn_idx = bpf_insn_array_iter_xlated_offset(map, dst_reg->umin_value);
 	if (env->insn_idx < 0)
 		return env->insn_idx;
 
@@ -22359,6 +22361,52 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 				return -ENOMEM;
 
 			delta    += cnt - 1;
+			env->prog = prog = new_prog;
+			insn      = new_prog->insnsi + i + delta;
+			goto next_insn;
+		}
+
+		if ((insn->code == (BPF_JMP | BPF_JA | BPF_X) || insn->code == (BPF_JMP32 | BPF_JA | BPF_X))) {
+			struct bpf_insn *patch = &insn_buf[0];
+			struct bpf_map *map;
+
+			ret = add_used_map(env, insn->imm, &map);
+			if (ret < 0)
+				return ret;
+
+			/*
+			 * Replace BPF_JMP|BPF_JA|BPF,SRC=Rx,DST=0,IMM=fd with
+			 *
+			 * Rt = ldimm64(map_address)
+			 * Rt += "offset to elements"
+			 * Rx *= element size
+			 * Rx += Rt
+			 * BPF_JMP|BPF_JA|BPF,SRC=Rx,DST=1,IMM=fd
+			 */
+struct bpf_insn_array {
+	struct bpf_map map;
+	struct mutex state_mutex;
+	int state;
+	u32 **unique_offsets;
+	u32 unique_offsets_cnt;
+	long *ips;
+	DECLARE_FLEX_ARRAY(struct bpf_insn_ptr, ptrs);
+};
+
+			*patch++ = BPF_RAW_INSN(BPF_LD | BPF_IMM | BPF_DW, BPF_REG_AX, 0, 0, (u32)(u64)map);
+			*patch++ = BPF_RAW_INSN(0, 0, 0, 0, (u32)((u64)map >> 32));
+			*patch++ = BPF_ALU64_IMM(BPF_ADD, BPF_REG_AX, sizeof(struct bpf_insn_array));
+			*patch++ = BPF_ALU64_IMM(BPF_MUL, insn->dst_reg, sizeof(struct bpf_insn_ptr));
+			*patch++ = BPF_ALU64_REG(BPF_ADD, insn->dst_reg, BPF_REG_AX);
+			*patch++ = BPF_RAW_INSN(BPF_LDX | BPF_DW | BPF_MEM, insn->dst_reg, insn->dst_reg, 0, 0);
+			*patch++ = BPF_RAW_INSN(BPF_JMP | BPF_JA | BPF_X, insn->dst_reg, 0, 0, insn->imm);
+
+			cnt = patch - insn_buf;
+			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+
+			delta    += cnt - 1; // XXX can be patched with other code
 			env->prog = prog = new_prog;
 			insn      = new_prog->insnsi + i + delta;
 			goto next_insn;

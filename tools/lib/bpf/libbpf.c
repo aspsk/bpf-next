@@ -372,6 +372,7 @@ enum reloc_type {
 	RELO_EXTERN_CALL,
 	RELO_SUBPROG_ADDR,
 	RELO_CORE,
+	RELO_INSN_ARRAY,
 };
 
 struct reloc_desc {
@@ -382,6 +383,7 @@ struct reloc_desc {
 		struct {
 			int map_idx;
 			int sym_off;
+			int sym_size;
 			int ext_idx;
 		};
 	};
@@ -664,6 +666,7 @@ struct elf_state {
 	Elf_Data *symbols;
 	Elf_Data *arena_data;
 	Elf_Data *jt_sizes_data;
+	Elf_Data *jumptables_data;
 	size_t shstrndx; /* section index for section name strings */
 	size_t strtabidx;
 	struct elf_sec_desc *secs;
@@ -675,6 +678,7 @@ struct elf_state {
 	bool has_st_ops;
 	int arena_data_shndx;
 	int jt_sizes_data_shndx;
+	int jumptables_data_shndx;
 };
 
 struct usdt_manager;
@@ -823,6 +827,13 @@ static bool is_call_insn(const struct bpf_insn *insn)
 static bool insn_is_pseudo_func(struct bpf_insn *insn)
 {
 	return is_ldimm64_insn(insn) && insn->src_reg == BPF_PSEUDO_FUNC;
+}
+
+static bool is_goto_x(const struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_JMP &&
+	       BPF_OP(insn->code) == BPF_JA &&
+	       BPF_SRC(insn->code) == BPF_X;
 }
 
 static int
@@ -4064,6 +4075,10 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			} else if (strcmp(name, ARENA_SEC) == 0) {
 				obj->efile.arena_data = data;
 				obj->efile.arena_data_shndx = idx;
+			} else if (strcmp(name, ".jumptables") == 0) {
+				obj->efile.jumptables_data = calloc(1, sizeof(*data)); // XXX, do it properly, otherwise ->d_buf is corrupted
+				memcpy(obj->efile.jumptables_data, data, sizeof(*data));
+				obj->efile.jumptables_data_shndx = idx;
 			} else {
 				pr_info("elf: skipping unrecognized data section(%d) %s\n",
 					idx, name);
@@ -4621,7 +4636,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	const char *sym_sec_name;
 	struct bpf_map *map;
 
-	if (!is_call_insn(insn) && !is_ldimm64_insn(insn)) {
+	if (!is_call_insn(insn) && !is_ldimm64_insn(insn) && !is_goto_x(insn)) {
 		pr_warn("prog '%s': invalid relo against '%s' for insns[%d].code 0x%x\n",
 			prog->name, sym_name, insn_idx, insn->code);
 		return -LIBBPF_ERRNO__RELOC;
@@ -4709,6 +4724,16 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 		reloc_desc->insn_idx = insn_idx;
 		reloc_desc->map_idx = obj->arena_map - obj->maps;
 		reloc_desc->sym_off = sym->st_value;
+		return 0;
+	}
+
+	/* jump table data relocation */
+	if (shdr_idx == obj->efile.jumptables_data_shndx) {
+		reloc_desc->type = RELO_INSN_ARRAY;
+		reloc_desc->insn_idx = insn_idx;
+		reloc_desc->map_idx = -1;
+		reloc_desc->sym_off = sym->st_value; // XXX ?
+		reloc_desc->sym_size = sym->st_size;
 		return 0;
 	}
 
@@ -6204,12 +6229,7 @@ static void poison_kfunc_call(struct bpf_program *prog, int relo_idx,
 	insn->imm = POISON_CALL_KFUNC_BASE + ext_idx;
 }
 
-static bool map_fd_is_rodata(struct bpf_object *obj, int map_fd)
-{
-	return map_fd == obj->rodata_map_fd;
-}
-
-static int create_jt_map(const struct jt *jt, int adjust_off)
+static int create_jt_map(struct bpf_object *obj, int off, int size, int adjust_off)
 {
 	static union bpf_attr attr = {
 		.map_type = BPF_MAP_TYPE_INSN_ARRAY,
@@ -6221,15 +6241,20 @@ static int create_jt_map(const struct jt *jt, int adjust_off)
 	int map_fd;
 	int err;
 	__u32 i;
+	__u32 *jt;
 
-	attr.max_entries = jt->jump_target_cnt;
+	attr.max_entries = size / 4;
 
 	map_fd = syscall(__NR_bpf, BPF_MAP_CREATE, &attr, sizeof(attr));
 	if (map_fd < 0)
 		return map_fd;
 
-	for (i = 0; i < jt->jump_target_cnt; i++) {
-		val.xlated_off = jt->jump_target[i] + adjust_off;
+	jt = (__u32 *)(obj->efile.jumptables_data->d_buf + off);
+	if (!jt)
+		return -EINVAL;
+
+	for (i = 0; i < attr.max_entries; i++) {
+		val.xlated_off = jt[i] + adjust_off;
 		err = bpf_map_update_elem(map_fd, &i, &val, 0);
 		if (err) {
 			close(map_fd);
@@ -6244,17 +6269,6 @@ static int create_jt_map(const struct jt *jt, int adjust_off)
 	}
 
 	return map_fd;
-}
-
-static int subprog_insn_off(struct bpf_program *prog, int insn_idx)
-{
-	int i;
-
-	for (i = prog->subprog_cnt - 1; i >= 0; i--)
-		if (insn_idx >= prog->subprog_offset[i])
-			return prog->subprog_offset[i] - prog->subprog_sec_offst[i];
-
-	return -prog->sec_insn_off;
 }
 
 /* Relocate data references within program code:
@@ -6294,31 +6308,8 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 				insn[0].src_reg = BPF_PSEUDO_MAP_IDX_VALUE;
 				insn[0].imm = relo->map_idx;
 			} else if (map->autocreate) {
-				const struct jt *jt;
-				int ajdust_insn_off;
-				int map_fd = map->fd;
-
-				/*
-				 * Set imm to proper map file descriptor. In normal case,
-				 * it is just map->fd. However, in case of a jump table,
-				 * a new map file descriptor should be created
-				 */
-				jt = bpf_object__find_jt(obj, insn[1].imm / 8);
-				if (map_fd_is_rodata(obj, map_fd) && !IS_ERR(jt)) {
-					ajdust_insn_off = subprog_insn_off(prog, relo->insn_idx);
-					map_fd = create_jt_map(jt, ajdust_insn_off);
-					if (map_fd < 0) {
-						pr_warn("prog '%s': relo #%d: failed to create a jt map for .rodata offset %u\n",
-								prog->name, i, insn[1].imm / 8);
-						return map_fd;
-					}
-
-					/* a new map is created, so offset should be 0 */
-					insn[1].imm = 0;
-				}
-
 				insn[0].src_reg = BPF_PSEUDO_MAP_VALUE;
-				insn[0].imm = map_fd;
+				insn[0].imm = map->fd;
 			} else {
 				poison_map_ldimm64(prog, i, relo->insn_idx, insn,
 						   relo->map_idx, map);
@@ -6370,6 +6361,19 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 			break;
 		case RELO_CORE:
 			/* will be handled by bpf_program_record_relos() */
+			break;
+		case RELO_INSN_ARRAY: {
+			int map_fd;
+
+			map_fd = create_jt_map(obj, relo->sym_off, relo->sym_size, relo->insn_idx + 1);
+			if (map_fd < 0) {
+				pr_warn("prog '%s': relo #%d: failed to create a jt map for .rodata offset %u\n",
+						prog->name, i, relo->sym_off);
+				return map_fd;
+			}
+			insn->imm = map_fd;
+			insn->off = 0;
+		}
 			break;
 		default:
 			pr_warn("prog '%s': relo #%d: bad relo type %d\n",
@@ -7612,58 +7616,6 @@ static int bpf_object__sanitize_prog(struct bpf_object *obj, struct bpf_program 
 	return 0;
 }
 
-static bool insn_is_gotox(struct bpf_insn *insn)
-{
-	return BPF_CLASS(insn->code) == BPF_JMP &&
-	       BPF_OP(insn->code) == BPF_JA &&
-	       BPF_SRC(insn->code) == BPF_X;
-}
-
-/*
- * This one is too dumb, of course. TBD to make it smarter.
- */
-static int find_jt_map_fd(struct bpf_program *prog, int insn_idx)
-{
-	struct bpf_insn *insn = &prog->insns[insn_idx];
-	__u8 dst_reg = insn->dst_reg;
-
-	/* TBD: this function is such smart for now that it even ignores this
-	 * register. Instead, it should backtrack the load more carefully.
-	 * (So far even this dumb version works with all selftests.)
-	 */
-	pr_debug("searching for a load instruction which populated dst_reg=r%u\n", dst_reg);
-
-	while (--insn >= prog->insns) {
-		if (insn->code == (BPF_LD|BPF_DW|BPF_IMM))
-			return insn[0].imm;
-	}
-
-	return -ENOENT;
-}
-
-static int bpf_object__patch_gotox(struct bpf_object *obj, struct bpf_program *prog)
-{
-	struct bpf_insn *insn = prog->insns;
-	int map_fd;
-	int i;
-
-	for (i = 0; i < prog->insns_cnt; i++, insn++) {
-		if (!insn_is_gotox(insn))
-			continue;
-
-		if (obj->gen_loader)
-			return -EFAULT;
-
-		map_fd = find_jt_map_fd(prog, i);
-		if (map_fd < 0)
-			return map_fd;
-
-		insn->imm = map_fd;
-	}
-
-	return 0;
-}
-
 static int libbpf_find_attach_btf_id(struct bpf_program *prog, const char *attach_name,
 				     int *btf_obj_fd, int *btf_type_id);
 
@@ -8204,13 +8156,6 @@ static int bpf_object_prepare_progs(struct bpf_object *obj)
 	for (i = 0; i < obj->nr_programs; i++) {
 		prog = &obj->programs[i];
 		err = bpf_object__sanitize_prog(obj, prog);
-		if (err)
-			return err;
-	}
-
-	for (i = 0; i < obj->nr_programs; i++) {
-		prog = &obj->programs[i];
-		err = bpf_object__patch_gotox(obj, prog);
 		if (err)
 			return err;
 	}
