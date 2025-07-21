@@ -29,6 +29,7 @@
 
 #define BTF_EXTERN_SEC ".extern"
 #define RODATA_REL_SEC ".rel.rodata"
+#define JUMPTABLES_REL_SEC ".rel.jumptables"
 #define LLVM_JT_SIZES_REL_SEC ".rel.llvm_jump_table_sizes"
 
 struct src_sec {
@@ -2084,6 +2085,9 @@ static int linker_append_elf_sym(struct bpf_linker *linker, struct src_obj *obj,
 			obj->sym_map[src_sym_idx] = dst_sec->sec_sym_idx;
 			return 0;
 		}
+
+		if (!strcmp(src_sec->sec_name, ".jumptables"))
+			goto add_sym;
 	}
 
 	if (sym_bind == STB_LOCAL)
@@ -2331,7 +2335,8 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 					else
 						insn->imm += sec->dst_off;
 				} else if (strcmp(src_sec->sec_name, LLVM_JT_SIZES_REL_SEC) &&
-					   strcmp(src_sec->sec_name, RODATA_REL_SEC)) {
+					   strcmp(src_sec->sec_name, RODATA_REL_SEC) &&
+					   strcmp(src_sec->sec_name, JUMPTABLES_REL_SEC)) {
 					pr_warn("relocation against STT_SECTION in section %s is not supported!\n",
 						src_sec->sec_name);
 					return -EINVAL;
