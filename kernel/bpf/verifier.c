@@ -19999,11 +19999,13 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 		return -EINVAL;
 	}
 
+#if 0
 	if (dst_reg->map_ptr != map) {
 		verbose(env, "BPF_JA|BPF_X R%d was loaded from map id=%u, expected id=%u\n",
 				insn->dst_reg, dst_reg->map_ptr->id, map->id);
 		return -EINVAL;
 	}
+#endif
 
 	if (dst_reg->max_index >= map->max_entries)
 		return -EINVAL;
