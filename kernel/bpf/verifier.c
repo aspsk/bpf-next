@@ -17765,15 +17765,20 @@ static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct bpf_map 
 {
 	int *insn_stack = env->cfg.insn_stack;
 	int *insn_state = env->cfg.insn_state;
-	u16 prev_edge = GET_HIGH(insn_state[t]);
+	u16 prev_edge;
 	int err;
 	int w;
 
-	w = bpf_insn_array_iter_xlated_offset(map, prev_edge);
-	if (w == -ENOENT)
-		return DONE_EXPLORING;
-	else if (w < 0)
-		return w;
+	for (prev_edge = GET_HIGH(insn_state[t]); ; prev_edge++) {
+		w = bpf_insn_array_iter_xlated_offset(map, prev_edge);
+		if (w == -ENOENT)
+			return DONE_EXPLORING;
+		else if (w < 0)
+			return w;
+
+		if (insn_state[w] != EXPLORED) /* XXX: also DISCOVERED? */
+			break;
+	}
 
 	err = gotox_sanity_check(env, t, w);
 	if (err)
