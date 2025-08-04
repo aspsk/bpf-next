@@ -399,3 +399,17 @@ int bpf_insn_array_iter_xlated_offset(struct bpf_map *map, u32 iter_no)
 
 	return *insn_array->unique_offsets[iter_no];
 }
+
+int bpf_insn_array_unique_offsets(struct bpf_map *map, u32 **off)
+{
+	struct bpf_insn_array *insn_array = cast_insn_array(map);
+	u32 cnt = insn_array->unique_offsets_cnt;
+	int i;
+
+	*off = kvcalloc(cnt, sizeof(u32), GFP_KERNEL_ACCOUNT);
+	if (!*off)
+		return -ENOMEM;
+	for (i = 0; i < cnt; i++)
+		(*off)[i] = *insn_array->unique_offsets[i];
+	return insn_array->unique_offsets_cnt;
+}

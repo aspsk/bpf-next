@@ -24391,11 +24391,16 @@ static bool can_jump(struct bpf_insn *insn)
 	return false;
 }
 
-static int insn_successors(struct bpf_prog *prog, u32 idx, u32 succ[2])
+static int insn_successors_regular(struct bpf_prog *prog, u32 idx, u32 **succ_ret)
 {
 	struct bpf_insn *insn = &prog->insnsi[idx];
 	int i = 0, insn_sz;
+	u32 *succ;
 	u32 dst;
+
+	succ = kvcalloc(2, sizeof(u32), GFP_KERNEL_ACCOUNT);
+	if (!succ)
+		return -ENOMEM;
 
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
 	if (can_fallthrough(insn) && idx + 1 < prog->len)
@@ -24407,7 +24412,59 @@ static int insn_successors(struct bpf_prog *prog, u32 idx, u32 succ[2])
 			succ[i++] = dst;
 	}
 
+	*succ_ret = succ;
 	return i;
+}
+
+static int insn_successors_gotox(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 idx, u32 **succ_ret)
+{
+	struct bpf_insn *insn = &prog->insnsi[idx];
+	struct bpf_map *map;
+	int ret;
+
+	// XXX: if present, should be in aux->XXX
+	ret = add_used_map(env, insn->imm, &map);
+	if (ret < 0)
+		return ret;
+
+	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
+		return -EINVAL;
+
+	// XXX: should this be adjusted by function offset?!
+	return bpf_insn_array_unique_offsets(map, succ_ret);
+}
+
+static int __insn_successors(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 idx, u32 **succ_ret)
+{
+	struct bpf_insn *insn = &prog->insnsi[idx];
+
+	if (unlikely(insn_is_gotox(insn)))
+		return insn_successors_gotox(env, prog, idx, succ_ret);
+
+	return insn_successors_regular(prog, idx, succ_ret);
+}
+
+static int insn_successors(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 idx, u32 **succ_ret)
+{
+	int n;
+#ifdef WOKKA
+	int i;
+	char s[128];
+#endif
+
+	n = __insn_successors(env, prog, idx, succ_ret);
+	if (n < 0)
+		return n;
+
+#ifdef WOKKA
+	snprintf(s, sizeof(s), "prog '%s': insn[%d] successors are: {", prog->aux->name, idx);
+	for (i = 0; i < n; i++)
+		snprintf(s + strlen(s), sizeof(s) - strlen(s), "%u%s", (*succ_ret)[i], i == n-1 ? "" : ",");
+	snprintf(s + strlen(s), sizeof(s) - strlen(s), "}");
+	pr_warn("%s\n", s);
+#endif
+
+	return n;
 }
 
 /* Each field is a register bitmask */
@@ -24603,13 +24660,19 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 			int insn_idx = env->cfg.insn_postorder[i];
 			struct insn_live_regs *live = &state[insn_idx];
 			int succ_num;
-			u32 succ[2];
+			u32 *succ;
 			u16 new_out = 0;
 			u16 new_in = 0;
 
-			succ_num = insn_successors(env->prog, insn_idx, succ);
+			succ_num = insn_successors(env, env->prog, insn_idx, &succ);
+			if (succ_num < 0) {
+				err = succ_num;
+				goto out;
+
+			}
 			for (int s = 0; s < succ_num; ++s)
 				new_out |= state[succ[s]].in;
+			kvfree(succ);
 			new_in = (new_out & ~live->def) | live->use;
 			if (new_out != live->out || new_in != live->in) {
 				live->in = new_in;
@@ -24669,7 +24732,7 @@ static int compute_scc(struct bpf_verifier_env *env)
 	u32 next_preorder_num;
 	u32 next_scc_id;
 	bool assign_scc;
-	u32 succ[2];
+	u32 *succ;
 
 	next_preorder_num = 1;
 	next_scc_id = 1;
@@ -24776,12 +24839,18 @@ dfs_continue:
 				stack[stack_sz++] = w;
 			}
 			/* Visit 'w' successors */
-			succ_cnt = insn_successors(env->prog, w, succ);
+			succ_cnt = insn_successors(env, env->prog, w, &succ);
+			if (succ_cnt < 0) {
+				err = succ_cnt;
+				goto exit;
+
+			}
 			for (j = 0; j < succ_cnt; ++j) {
 				if (pre[succ[j]]) {
 					low[w] = min(low[w], low[succ[j]]);
 				} else {
 					dfs[dfs_sz++] = succ[j];
+					kvfree(succ);
 					goto dfs_continue;
 				}
 			}
@@ -24791,6 +24860,7 @@ dfs_continue:
 			 */
 			if (low[w] < pre[w]) {
 				dfs_sz--;
+				kvfree(succ);
 				goto dfs_continue;
 			}
 			/*
@@ -24804,6 +24874,7 @@ dfs_continue:
 					break;
 				}
 			}
+			kvfree(succ);
 			/* Pop component elements from stack */
 			do {
 				t = stack[--stack_sz];
