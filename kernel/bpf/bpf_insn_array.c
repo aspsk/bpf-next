@@ -234,7 +234,7 @@ static inline bool valid_offsets(const struct bpf_insn_array *insn_array,
 
 static int cmp_unique_offsets(const void *a, const void *b)
 {
-	return *(u32 *)a - *(u32 *)b;
+	return **(u32 **)a - **(u32 **)b;
 }
 
 static int bpf_insn_array_init_unique_offsets(struct bpf_insn_array *insn_array)
