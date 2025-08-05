@@ -19999,8 +19999,8 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 			return xoff;
 
 		other_branch = push_stack(env, xoff, env->insn_idx, false);
-		if (!other_branch)
-			return -EFAULT;
+		if (IS_ERR(other_branch))
+			return PTR_ERR(other_branch);
 	}
 
 	env->insn_idx = bpf_insn_array_iter_xlated_offset(map, dst_reg->min_index);
