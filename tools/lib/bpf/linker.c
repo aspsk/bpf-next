@@ -30,7 +30,6 @@
 #define BTF_EXTERN_SEC ".extern"
 #define RODATA_REL_SEC ".rel.rodata"
 #define JUMPTABLES_REL_SEC ".rel.jumptables"
-#define LLVM_JT_SIZES_REL_SEC ".rel.llvm_jump_table_sizes"
 
 struct src_sec {
 	const char *sec_name;
@@ -181,7 +180,6 @@ static int linker_sanity_check_btf(struct src_obj *obj);
 static int linker_sanity_check_btf_ext(struct src_obj *obj);
 static int linker_fixup_btf(struct src_obj *obj);
 static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj);
-static int linker_append_sec_jt(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_elf_syms(struct bpf_linker *linker, struct src_obj *obj);
 static int linker_append_elf_sym(struct bpf_linker *linker, struct src_obj *obj,
 				 Elf64_Sym *sym, const char *sym_name, int src_sym_idx);
@@ -503,7 +501,6 @@ static int bpf_linker_add_file(struct bpf_linker *linker, int fd,
 
 	err = err ?: linker_load_obj_file(linker, &obj);
 	err = err ?: linker_append_sec_data(linker, &obj);
-	err = err ?: linker_append_sec_jt(linker, &obj);
 	err = err ?: linker_append_elf_syms(linker, &obj);
 	err = err ?: linker_append_elf_relos(linker, &obj);
 	err = err ?: linker_append_btf(linker, &obj);
@@ -816,9 +813,6 @@ static int linker_load_obj_file(struct bpf_linker *linker,
 		case SHT_REL:
 			/* relocations */
 			break;
-		case SHT_LLVM_JT_SIZES:
-			/* LLVM jump tables sizes */
-			break;
 		default:
 			pr_warn("unrecognized section #%zu (%s) in %s\n",
 				sec_idx, sec_name, obj->filename);
@@ -906,9 +900,6 @@ static int linker_sanity_check_elf(struct src_obj *obj)
 				return err;
 			break;
 		case SHT_LLVM_ADDRSIG:
-			break;
-		case SHT_LLVM_JT_SIZES:
-			/* LLVM jump tables sizes */
 			break;
 		default:
 			pr_warn("ELF section #%zu (%s) has unrecognized type %zu in %s\n",
@@ -1033,10 +1024,7 @@ static int linker_sanity_check_elf_relos(struct src_obj *obj, struct src_sec *se
 		return 0;
 
 	/* relocatable section is data or instructions */
-	if (link_sec->shdr->sh_type != SHT_PROGBITS &&
-	    link_sec->shdr->sh_type != SHT_NOBITS &&
-	    link_sec->shdr->sh_type != SHT_LLVM_JT_SIZES
-		) {
+	if (link_sec->shdr->sh_type != SHT_PROGBITS && link_sec->shdr->sh_type != SHT_NOBITS) {
 		pr_warn("ELF relo section #%zu points to invalid section #%zu in %s\n",
 			sec->sec_idx, (size_t)sec->shdr->sh_info, obj->filename);
 		return -EINVAL;
@@ -1365,13 +1353,6 @@ static bool is_relo_sec(struct src_sec *sec)
 	return sec->shdr->sh_type == SHT_REL;
 }
 
-static bool is_jt_sec(struct src_sec *sec)
-{
-	if (!sec || sec->skipped || !sec->shdr)
-		return false;
-	return sec->shdr->sh_type == SHT_LLVM_JT_SIZES;
-}
-
 static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj)
 {
 	int i, err;
@@ -1411,44 +1392,6 @@ static int linker_append_sec_data(struct bpf_linker *linker, struct src_obj *obj
 				src_sec->dst_id = dst_sec->id;
 				continue;
 			}
-		}
-
-		/* record mapped section index */
-		src_sec->dst_id = dst_sec->id;
-
-		err = extend_sec(linker, dst_sec, src_sec);
-		if (err)
-			return err;
-	}
-
-	return 0;
-}
-
-static int linker_append_sec_jt(struct bpf_linker *linker, struct src_obj *obj)
-{
-	int i, err;
-
-	for (i = 1; i < obj->sec_cnt; i++) {
-		struct src_sec *src_sec;
-		struct dst_sec *dst_sec;
-
-		src_sec = &obj->secs[i];
-		if (!is_jt_sec(src_sec))
-			continue;
-
-		dst_sec = find_dst_sec_by_name(linker, src_sec->sec_name);
-		if (!dst_sec) {
-			dst_sec = add_dst_sec(linker, src_sec->sec_name);
-			if (!dst_sec)
-				return -ENOMEM;
-			err = init_sec(linker, dst_sec, src_sec);
-			if (err) {
-				pr_warn("failed to init section '%s'\n", src_sec->sec_name);
-				return err;
-			}
-		} else if (!secs_match(dst_sec, src_sec)) {
-			pr_warn("ELF sections %s are incompatible\n", src_sec->sec_name);
-			return -EINVAL;
 		}
 
 		/* record mapped section index */
@@ -2334,9 +2277,8 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 						insn->imm += sec->dst_off / sizeof(struct bpf_insn);
 					else
 						insn->imm += sec->dst_off;
-				} else if (strcmp(src_sec->sec_name, LLVM_JT_SIZES_REL_SEC) &&
-					   strcmp(src_sec->sec_name, RODATA_REL_SEC) &&
-					   strcmp(src_sec->sec_name, JUMPTABLES_REL_SEC)) {
+				} else if (strcmp(src_sec->sec_name, JUMPTABLES_REL_SEC) &&
+					   strcmp(src_sec->sec_name, RODATA_REL_SEC)) {
 					pr_warn("relocation against STT_SECTION in section %s is not supported!\n",
 						src_sec->sec_name);
 					return -EINVAL;
