@@ -120,6 +120,7 @@ static long insn_array_update_elem(struct bpf_map *map, void *key, void *value, 
 	struct bpf_insn_array *insn_array = cast_insn_array(map);
 	u32 index = *(u32 *)key;
 	struct bpf_insn_array_value val = {};
+	guard(mutex)(&insn_array->state_mutex);
 
 	if (unlikely((map_flags & ~BPF_F_LOCK) > BPF_EXIST))
 		return -EINVAL;
@@ -129,6 +130,10 @@ static long insn_array_update_elem(struct bpf_map *map, void *key, void *value, 
 
 	if (unlikely(map_flags & BPF_NOEXIST))
 		return -EEXIST;
+
+	/* No updates for maps in use */
+	if (insn_array->state != INSN_ARRAY_STATE_FREE)
+		return -EBUSY;
 
 	copy_map_value(map, &val, value);
 	if (val.jitted_off || val.xlated_off == INSN_DELETED)
@@ -199,13 +204,6 @@ const struct bpf_map_ops insn_array_map_ops = {
 	.map_btf_id = &insn_array_btf_ids[0],
 };
 
-static inline bool is_frozen(struct bpf_map *map)
-{
-	guard(mutex)(&map->freeze_mutex);
-
-	return map->frozen;
-}
-
 static bool is_insn_array(const struct bpf_map *map)
 {
 	return map->map_type == BPF_MAP_TYPE_INSN_ARRAY;
@@ -267,9 +265,6 @@ int bpf_insn_array_init(struct bpf_map *map, const struct bpf_prog *prog)
 {
 	struct bpf_insn_array *insn_array = cast_insn_array(map);
 	int i;
-
-	if (!is_frozen(map))
-		return -EINVAL;
 
 	if (!valid_offsets(insn_array, prog))
 		return -EINVAL;
