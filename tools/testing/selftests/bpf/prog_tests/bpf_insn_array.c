@@ -51,9 +51,6 @@ static void check_one_to_one_mapping(void)
 			goto cleanup;
 	}
 
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
-
 	prog_fd = prog_load(insns, ARRAY_SIZE(insns), &map_fd, 1);
 	if (!ASSERT_GE(prog_fd, 0, "bpf(BPF_PROG_LOAD)"))
 		goto cleanup;
@@ -96,9 +93,6 @@ static void check_out_of_bounds_index(void)
 	if (!ASSERT_EQ(bpf_map_update_elem(map_fd, &key, &val, 0), 0, "bpf_map_update_elem"))
 		goto cleanup;
 
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
-
 	errno = 0;
 	prog_fd = prog_load(insns, ARRAY_SIZE(insns), &map_fd, 1);
 	if (!ASSERT_EQ(prog_fd, -EINVAL, "program should have been rejected (prog_fd != -EINVAL)")) {
@@ -130,9 +124,6 @@ static void check_mid_insn_index(void)
 	key = 0;
 	val.xlated_off = 1; /* middle of 16-byte instruction */
 	if (!ASSERT_EQ(bpf_map_update_elem(map_fd, &key, &val, 0), 0, "bpf_map_update_elem"))
-		goto cleanup;
-
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
 		goto cleanup;
 
 	errno = 0;
@@ -184,9 +175,6 @@ static void check_simple(void)
 			goto cleanup;
 	}
 
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
-
 	prog_fd = prog_load(insns, ARRAY_SIZE(insns), &map_fd, 1);
 	if (!ASSERT_GE(prog_fd, 0, "bpf(BPF_PROG_LOAD)"))
 		goto cleanup;
@@ -235,9 +223,6 @@ static void check_deletions(void)
 			goto cleanup;
 	}
 
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
-
 	prog_fd = prog_load(insns, ARRAY_SIZE(insns), &map_fd, 1);
 	if (!ASSERT_GE(prog_fd, 0, "bpf(BPF_PROG_LOAD)"))
 		goto cleanup;
@@ -285,9 +270,6 @@ static void check_with_functions(void)
 			       "bpf_map_update_elem"))
 			goto cleanup;
 	}
-
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
 
 	prog_fd = prog_load(insns, ARRAY_SIZE(insns), &map_fd, 1);
 	if (!ASSERT_GE(prog_fd, 0, "bpf(BPF_PROG_LOAD)"))
@@ -365,9 +347,6 @@ static void check_blindness(void)
 			goto cleanup;
 	}
 
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
-
 	bpf_jit_harden = '2';
 	if (set_bpf_jit_harden(&bpf_jit_harden)) {
 		bpf_jit_harden = '@'; /* open, read or write failed => no write was done */
@@ -397,53 +376,6 @@ cleanup:
 	close(map_fd);
 }
 
-/* Once map was initialized, it should be frozen */
-static void check_load_unfrozen_map(void)
-{
-	struct bpf_insn insns[] = {
-		BPF_MOV64_IMM(BPF_REG_0, 0),
-		BPF_EXIT_INSN(),
-	};
-	int prog_fd = -1, map_fd;
-	struct bpf_insn_array_value val = {};
-	int i;
-
-	map_fd = map_create(BPF_MAP_TYPE_INSN_ARRAY, ARRAY_SIZE(insns));
-	if (!ASSERT_GE(map_fd, 0, "map_create"))
-		return;
-
-	for (i = 0; i < ARRAY_SIZE(insns); i++) {
-		val.xlated_off = i;
-		if (!ASSERT_EQ(bpf_map_update_elem(map_fd, &i, &val, 0), 0, "bpf_map_update_elem"))
-			goto cleanup;
-	}
-
-	errno = 0;
-	prog_fd = prog_load(insns, ARRAY_SIZE(insns), &map_fd, 1);
-	if (!ASSERT_EQ(prog_fd, -EINVAL, "program should have been rejected (prog_fd != -EINVAL)"))
-		goto cleanup;
-
-	/* correctness: now freeze the map, the program should load fine */
-
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
-
-	prog_fd = prog_load(insns, ARRAY_SIZE(insns), &map_fd, 1);
-	if (!ASSERT_GE(prog_fd, 0, "bpf(BPF_PROG_LOAD)"))
-		goto cleanup;
-
-	for (i = 0; i < ARRAY_SIZE(insns); i++) {
-		if (!ASSERT_EQ(bpf_map_lookup_elem(map_fd, &i, &val), 0, "bpf_map_lookup_elem"))
-			goto cleanup;
-
-		ASSERT_EQ(val.xlated_off, i, "val should be equal i");
-	}
-
-cleanup:
-	close(prog_fd);
-	close(map_fd);
-}
-
 /* Map can be used only by one BPF program */
 static void check_no_map_reuse(void)
 {
@@ -464,9 +396,6 @@ static void check_no_map_reuse(void)
 		if (!ASSERT_EQ(bpf_map_update_elem(map_fd, &i, &val, 0), 0, "bpf_map_update_elem"))
 			goto cleanup;
 	}
-
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
 
 	prog_fd = prog_load(insns, ARRAY_SIZE(insns), &map_fd, 1);
 	if (!ASSERT_GE(prog_fd, 0, "bpf(BPF_PROG_LOAD)"))
@@ -510,10 +439,6 @@ static void check_bpf_no_lookup(void)
 	map_fd = map_create(BPF_MAP_TYPE_INSN_ARRAY, 1);
 	if (!ASSERT_GE(map_fd, 0, "map_create"))
 		return;
-
-	/* otherwise will be rejected as unfrozen */
-	if (!ASSERT_EQ(bpf_map_freeze(map_fd), 0, "bpf_map_freeze"))
-		goto cleanup;
 
 	insns[0].imm = map_fd;
 
@@ -564,9 +489,6 @@ void test_bpf_insn_array_ops(void)
 {
 	if (test__start_subtest("incorrect-index"))
 		check_incorrect_index();
-
-	if (test__start_subtest("load-unfrozen-map"))
-		check_load_unfrozen_map();
 
 	if (test__start_subtest("no-map-reuse"))
 		check_no_map_reuse();
