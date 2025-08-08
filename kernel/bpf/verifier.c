@@ -16991,14 +16991,10 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			__mark_reg_unknown(env, dst_reg);
 			return 0;
 		}
-		if (map->map_type == BPF_MAP_TYPE_INSN_ARRAY) {
-			dst_reg->type = PTR_TO_MAP_VALUE;
-			dst_reg->off = aux->map_off;
-			return 0;
-		}
 		dst_reg->type = PTR_TO_MAP_VALUE;
 		dst_reg->off = aux->map_off;
-		WARN_ON_ONCE(map->max_entries != 1);
+		WARN_ON_ONCE(map->map_type != BPF_MAP_TYPE_INSN_ARRAY &&
+			     map->max_entries != 1);
 		/* We want reg->id to be same (0) as map_value is not distinct */
 	} else if (insn->src_reg == BPF_PSEUDO_MAP_FD ||
 		   insn->src_reg == BPF_PSEUDO_MAP_IDX) {
