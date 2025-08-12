@@ -17757,24 +17757,26 @@ static int gotox_sanity_check(struct bpf_verifier_env *env, int from, int to)
 	return 0;
 }
 
-static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct bpf_map *map)
+static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct jt *jt)
 {
 	int *insn_stack = env->cfg.insn_stack;
 	int *insn_state = env->cfg.insn_state;
-	u16 prev_edge;
+	u16 prev;
 	int err;
 	int w;
 
-	for (prev_edge = GET_HIGH(insn_state[t]); ; prev_edge++) {
-		w = bpf_insn_array_iter_xlated_offset(map, prev_edge);
-		if (w == -ENOENT)
-			return DONE_EXPLORING;
-		else if (w < 0)
-			return w;
+	for (prev = GET_HIGH(insn_state[t]); prev < jt->off_cnt; prev++) {
+		w = jt->off[prev];
 
-		if (insn_state[w] != EXPLORED) /* XXX: also DISCOVERED? */
-			break;
+		/* EXPLORED || DISCOVERED */
+		if (insn_state[w])
+			continue;
+
+		break;
 	}
+
+	if (prev == jt->off_cnt)
+		return DONE_EXPLORING;
 
 	err = gotox_sanity_check(env, t, w);
 	if (err)
@@ -17788,29 +17790,66 @@ static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct bpf_map 
 
 	mark_jmp_point(env, w);
 
-	SET_HIGH(insn_state[t], prev_edge + 1);
+	SET_HIGH(insn_state[t], prev + 1);
 	return KEEP_EXPLORING;
+}
+
+/*
+ * Copy all unique offsets from the map
+ */
+static int jt_from_map(struct bpf_map *map, struct jt *jt)
+ {
+	int ret;
+
+	ret = bpf_insn_array_unique_offsets(map, &jt->off);
+	if (ret < 0)
+		return ret;
+	jt->off_cnt = ret;
+	return 0;
+}
+
+/*
+ * Find and collect all maps which fit in the sub-function containing insn[t]
+ */
+static int jt_from_air(struct bpf_verifier_env *env, int t, struct jt *jt)
+{
+	return -EFAULT;
 }
 
 /* "conditional jump with N edges" */
 static int visit_goto_x_insn(int t, struct bpf_verifier_env *env, int fd)
 {
-	struct bpf_map *map;
+	struct jt *jt = &env->insn_aux_data[t].jt;
 	int map_idx;
 	int ret;
 
 	map_idx = add_used_map(env, fd);
-	if (map_idx < 0)
-		return ret;
+	if (map_idx >= 0) {
+		struct bpf_map *map = env->used_maps[map_idx];
 
-	env->insn_aux_data[t].map_index = map_idx;
+		if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
+			return -EINVAL;
 
-	map = env->used_maps[map_idx];
-	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
-		return -EINVAL;
+		env->insn_aux_data[t].map_index = map_idx;
 
-	return push_goto_x_edge(t, env, map);
-}
+		ret = jt_from_map(map, jt);
+		if (ret)
+			return ret;
+	} else {
+		/*
+			XXX: the very next thingy here: support this case, cache info, etc.
+			in the check_indirect_jump do the thingy to either use this cached info (if map is valid),
+			or copy info from map. We also need to iterate in push_goto_x_edge through the allocated array,
+			no need to copy stuff
+
+			так победим!
+		*/
+		ret = jt_from_air(env, t, jt);
+		if (ret)
+			return ret;
+	}
+	return push_goto_x_edge(t, env, jt);
+ }
 
 /* Visits the instruction at index t and returns one of the following:
  *  < 0 - an error occurred
@@ -24370,82 +24409,53 @@ static bool can_jump(struct bpf_insn *insn)
 	return false;
 }
 
-static int insn_successors_regular(struct bpf_prog *prog, u32 idx, u32 **succ_ret)
+static int insn_successors_regular(struct bpf_prog *prog, u32 insn_idx, u32 *succ)
 {
-	struct bpf_insn *insn = &prog->insnsi[idx];
+	struct bpf_insn *insn = &prog->insnsi[insn_idx];
 	int i = 0, insn_sz;
-	u32 *succ;
 	u32 dst;
 
-	succ = kvcalloc(2, sizeof(u32), GFP_KERNEL_ACCOUNT);
-	if (!succ)
-		return -ENOMEM;
-
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
-	if (can_fallthrough(insn) && idx + 1 < prog->len)
-		succ[i++] = idx + insn_sz;
+	if (can_fallthrough(insn) && insn_idx + 1 < prog->len)
+		succ[i++] = insn_idx + insn_sz;
 
 	if (can_jump(insn)) {
-		dst = idx + jmp_offset(insn) + 1;
+		dst = insn_idx + jmp_offset(insn) + 1;
 		if (i == 0 || succ[0] != dst)
 			succ[i++] = dst;
 	}
 
-	*succ_ret = succ;
 	return i;
 }
 
-static int insn_successors_gotox(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 insn_idx, u32 **succ_ret)
+static int insn_successors_gotox(struct bpf_verifier_env *env,
+				 struct bpf_prog *prog,
+				 u32 insn_idx, u32 **succ)
 {
-	struct bpf_map *map;
-	int map_idx;
+	struct jt *jt = &env->insn_aux_data[insn_idx].jt;
 
-	map_idx = env->insn_aux_data[insn_idx].map_index;
-	if (map_idx < 0 || map_idx >= env->used_map_cnt) {
-		// XXX support this case!
+	if (WARN_ON_ONCE(!jt->off || !jt->off_cnt))
 		return -EFAULT;
-	}
 
-	map = env->used_maps[map_idx];
-
-	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
-		return -EINVAL;
-
-	// XXX: should this be adjusted by function offset?!
-	return bpf_insn_array_unique_offsets(map, succ_ret);
+	*succ = jt->off;
+	return jt->off_cnt;
 }
 
-static int __insn_successors(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 idx, u32 **succ_ret)
+/*
+ * Fill in *succ[0],...,*succ[n-1] with successors. The default *succ
+ * pointer (of size 2) may be replaced with a custom one if more
+ * elements are required (i.e., an indirect jump).
+ */
+static int insn_successors(struct bpf_verifier_env *env,
+			   struct bpf_prog *prog,
+			   u32 insn_idx, u32 **succ)
 {
-	struct bpf_insn *insn = &prog->insnsi[idx];
+	struct bpf_insn *insn = &prog->insnsi[insn_idx];
 
 	if (unlikely(insn_is_gotox(insn)))
-		return insn_successors_gotox(env, prog, idx, succ_ret);
+		return insn_successors_gotox(env, prog, insn_idx, succ);
 
-	return insn_successors_regular(prog, idx, succ_ret);
-}
-
-static int insn_successors(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 idx, u32 **succ_ret)
-{
-	int n;
-#ifdef WOKKA
-	int i;
-	char s[128];
-#endif
-
-	n = __insn_successors(env, prog, idx, succ_ret);
-	if (n < 0)
-		return n;
-
-#ifdef WOKKA
-	snprintf(s, sizeof(s), "prog '%s': insn[%d] successors are: {", prog->aux->name, idx);
-	for (i = 0; i < n; i++)
-		snprintf(s + strlen(s), sizeof(s) - strlen(s), "%u%s", (*succ_ret)[i], i == n-1 ? "" : ",");
-	snprintf(s + strlen(s), sizeof(s) - strlen(s), "}");
-	pr_warn("%s\n", s);
-#endif
-
-	return n;
+	return insn_successors_regular(prog, insn_idx, *succ);
 }
 
 /* Each field is a register bitmask */
@@ -24641,7 +24651,8 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 			int insn_idx = env->cfg.insn_postorder[i];
 			struct insn_live_regs *live = &state[insn_idx];
 			int succ_num;
-			u32 *succ;
+			u32 _succ[2];
+			u32 *succ = &_succ[0];
 			u16 new_out = 0;
 			u16 new_in = 0;
 
@@ -24653,7 +24664,6 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 			}
 			for (int s = 0; s < succ_num; ++s)
 				new_out |= state[succ[s]].in;
-			kvfree(succ);
 			new_in = (new_out & ~live->def) | live->use;
 			if (new_out != live->out || new_in != live->in) {
 				live->in = new_in;
@@ -24713,7 +24723,8 @@ static int compute_scc(struct bpf_verifier_env *env)
 	u32 next_preorder_num;
 	u32 next_scc_id;
 	bool assign_scc;
-	u32 *succ;
+	u32 _succ[2];
+	u32 *succ = &_succ[0];
 
 	next_preorder_num = 1;
 	next_scc_id = 1;
@@ -24831,7 +24842,6 @@ dfs_continue:
 					low[w] = min(low[w], low[succ[j]]);
 				} else {
 					dfs[dfs_sz++] = succ[j];
-					kvfree(succ);
 					goto dfs_continue;
 				}
 			}
@@ -24841,7 +24851,6 @@ dfs_continue:
 			 */
 			if (low[w] < pre[w]) {
 				dfs_sz--;
-				kvfree(succ);
 				goto dfs_continue;
 			}
 			/*
@@ -24855,7 +24864,6 @@ dfs_continue:
 					break;
 				}
 			}
-			kvfree(succ);
 			/* Pop component elements from stack */
 			do {
 				t = stack[--stack_sz];

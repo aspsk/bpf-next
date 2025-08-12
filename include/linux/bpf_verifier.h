@@ -609,6 +609,12 @@ struct bpf_insn_aux_data {
 	u32 scc;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+
+	/* XXX: do not grow the structure, but redo this later */
+	struct jt { // XXX: also this leaks memory currently, needs to be cleaned up when aux_data is cleaned up
+		u32 *off;
+		int off_cnt;
+	} jt;
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
