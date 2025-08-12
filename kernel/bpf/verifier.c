@@ -212,7 +212,7 @@ static int ref_set_non_owning(struct bpf_verifier_env *env,
 static void specialize_kfunc(struct bpf_verifier_env *env,
 			     u32 func_id, u16 offset, unsigned long *addr);
 static bool is_trusted_reg(const struct bpf_reg_state *reg);
-static int add_used_map(struct bpf_verifier_env *env, int fd, struct bpf_map **map_ptr);
+static int add_used_map(struct bpf_verifier_env *env, int fd);
 
 static bool bpf_map_ptr_poisoned(const struct bpf_insn_aux_data *aux)
 {
@@ -17796,12 +17796,16 @@ static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct bpf_map 
 static int visit_goto_x_insn(int t, struct bpf_verifier_env *env, int fd)
 {
 	struct bpf_map *map;
+	int map_idx;
 	int ret;
 
-	ret = add_used_map(env, fd, &map);
-	if (ret < 0)
+	map_idx = add_used_map(env, fd);
+	if (map_idx < 0)
 		return ret;
 
+	env->insn_aux_data[t].map_index = map_idx;
+
+	map = env->used_maps[map_idx];
 	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
 		return -EINVAL;
 
@@ -19960,14 +19964,20 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 	struct bpf_verifier_state *other_branch;
 	struct bpf_reg_state *dst_reg;
 	struct bpf_map *map;
+	int map_idx;
 	int xoff;
-	int err;
 	u32 i;
 
-	/* this map should already have been added */
-	err = add_used_map(env, insn->imm, &map);
-	if (err < 0)
-		return err;
+	map_idx = env->insn_aux_data[env->insn_idx].map_index;
+	if (map_idx < 0 || map_idx >= env->used_map_cnt) {
+		// XXX support this case!
+		return -EFAULT;
+	}
+
+	map = env->used_maps[map_idx];
+
+	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
+		return -EINVAL;
 
 	dst_reg = reg_state(env, insn->dst_reg);
 	if (dst_reg->type != PTR_TO_INSN) {
@@ -20695,11 +20705,10 @@ static int __add_used_map(struct bpf_verifier_env *env, struct bpf_map *map)
  * its index.
  * Returns <0 on error, or >= 0 index, on success.
  */
-static int add_used_map(struct bpf_verifier_env *env, int fd, struct bpf_map **map_ptr)
+static int add_used_map(struct bpf_verifier_env *env, int fd)
 {
 	struct bpf_map *map;
 	CLASS(fd, f)(fd);
-	int ret;
 
 	map = __bpf_map_get(f);
 	if (IS_ERR(map)) {
@@ -20707,10 +20716,7 @@ static int add_used_map(struct bpf_verifier_env *env, int fd, struct bpf_map **m
 		return PTR_ERR(map);
 	}
 
-	ret = __add_used_map(env, map);
-	if (ret >= 0 && map_ptr)
-		*map_ptr = map;
-	return ret;
+	return __add_used_map(env, map);
 }
 
 /* find and rewrite pseudo imm in ld_imm64 instructions:
@@ -20804,7 +20810,7 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 				break;
 			}
 
-			map_idx = add_used_map(env, fd, NULL);
+			map_idx = add_used_map(env, fd);
 			if (map_idx < 0)
 				return map_idx;
 			map = env->used_maps[map_idx];
@@ -24389,16 +24395,18 @@ static int insn_successors_regular(struct bpf_prog *prog, u32 idx, u32 **succ_re
 	return i;
 }
 
-static int insn_successors_gotox(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 idx, u32 **succ_ret)
+static int insn_successors_gotox(struct bpf_verifier_env *env, struct bpf_prog *prog, u32 insn_idx, u32 **succ_ret)
 {
-	struct bpf_insn *insn = &prog->insnsi[idx];
 	struct bpf_map *map;
-	int ret;
+	int map_idx;
 
-	// XXX: if present, should be in aux->XXX
-	ret = add_used_map(env, insn->imm, &map);
-	if (ret < 0)
-		return ret;
+	map_idx = env->insn_aux_data[insn_idx].map_index;
+	if (map_idx < 0 || map_idx >= env->used_map_cnt) {
+		// XXX support this case!
+		return -EFAULT;
+	}
+
+	map = env->used_maps[map_idx];
 
 	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
 		return -EINVAL;
