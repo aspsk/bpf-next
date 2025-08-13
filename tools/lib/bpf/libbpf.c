@@ -7515,58 +7515,6 @@ static int bpf_object__sanitize_prog(struct bpf_object *obj, struct bpf_program 
 	return 0;
 }
 
-static bool insn_is_gotox(struct bpf_insn *insn)
-{
-	return BPF_CLASS(insn->code) == BPF_JMP &&
-	       BPF_OP(insn->code) == BPF_JA &&
-	       BPF_SRC(insn->code) == BPF_X;
-}
-
-/*
- * This one is too dumb, of course. TBD to make it smarter.
- */
-static int find_jt_map_fd(struct bpf_program *prog, int insn_idx)
-{
-	struct bpf_insn *insn = &prog->insns[insn_idx];
-	__u8 dst_reg = insn->dst_reg;
-
-	/* TBD: this function is such smart for now that it even ignores this
-	 * register. Instead, it should backtrack the load more carefully.
-	 * (So far even this dumb version works with all selftests.)
-	 */
-	pr_debug("searching for a load instruction which populated dst_reg=r%u\n", dst_reg);
-
-	while (--insn >= prog->insns) {
-		if (insn->code == (BPF_LD|BPF_DW|BPF_IMM))
-			return insn[0].imm;
-	}
-
-	return -ENOENT;
-}
-
-static int bpf_object__patch_gotox(struct bpf_object *obj, struct bpf_program *prog)
-{
-	struct bpf_insn *insn = prog->insns;
-	int map_fd;
-	int i;
-
-	for (i = 0; i < prog->insns_cnt; i++, insn++) {
-		if (!insn_is_gotox(insn))
-			continue;
-
-		if (obj->gen_loader)
-			return -EFAULT;
-
-		map_fd = find_jt_map_fd(prog, i);
-		if (map_fd < 0)
-			return map_fd;
-
-		insn->imm = map_fd;
-	}
-
-	return 0;
-}
-
 static int libbpf_find_attach_btf_id(struct bpf_program *prog, const char *attach_name,
 				     int *btf_obj_fd, int *btf_type_id);
 
@@ -8107,13 +8055,6 @@ static int bpf_object_prepare_progs(struct bpf_object *obj)
 	for (i = 0; i < obj->nr_programs; i++) {
 		prog = &obj->programs[i];
 		err = bpf_object__sanitize_prog(obj, prog);
-		if (err)
-			return err;
-	}
-
-	for (i = 0; i < obj->nr_programs; i++) {
-		prog = &obj->programs[i];
-		err = bpf_object__patch_gotox(obj, prog);
 		if (err)
 			return err;
 	}
