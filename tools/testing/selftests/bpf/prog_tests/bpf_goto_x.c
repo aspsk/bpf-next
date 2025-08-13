@@ -62,8 +62,10 @@ static void check_goto_x_skel(struct bpf_goto_x *skel)
 	__u64 in[]   = {0, 1, 2, 3, 4,  5, 77};
 	__u64 out[]  = {2, 3, 4, 5, 7, 19, 19};
 	__u64 out2[] = {103, 104, 107, 205, 115, 1019, 1019};
-	__u64 in3[]  = {0, 11, 27, 31, 447, 22, 45, 999};
-	__u64 out3[] = {2,  3,  4,  5,   7, 19, 19,  19};
+	__u64 in3[]  = {0, 11, 27, 31, 22, 45, 99};
+	__u64 out3[] = {2,  3,  4,  5, 19, 19, 19};
+	__u64 in4[]  = {0, 1, 2, 3, 4,  5, 77};
+	__u64 out4[] = {12, 15, 7 , 15, 12, 15, 15};
 
 	for (i = 0; i < ARRAY_SIZE(in); i++)
 		check_simple(skel, skel->progs.simple_test, in[i], out[i]);
@@ -76,6 +78,9 @@ static void check_goto_x_skel(struct bpf_goto_x *skel)
 
 	for (i = 0; i < ARRAY_SIZE(in); i++)
 		check_simple(skel, skel->progs.big_jump_table, in3[i], out3[i]);
+
+	for (i = 0; i < ARRAY_SIZE(in); i++)
+		check_simple(skel, skel->progs.one_jump_two_maps, in4[i], out4[i]);
 
 	for (i = 0; i < ARRAY_SIZE(in); i++)
 		check_simple(skel, skel->progs.use_static_global1, in[i], out[i]);

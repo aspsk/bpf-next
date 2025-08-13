@@ -189,38 +189,67 @@ int two_switches(struct simple_ctx *ctx)
 SEC("syscall")
 int big_jump_table(struct simple_ctx *ctx)
 {
-	/*
-	 * LLVM will create a JT of size 32, and consider 447
-	 * and 'default' as special cases
-	 */
-	switch (ctx->x) {
-	case 0:
-		adjust_insns(ctx->x + 1);
-		ret_user = 2;
-		break;
-	case 11:
-		adjust_insns(ctx->x + 7);
-		ret_user = 3;
-		break;
-	case 27:
-		adjust_insns(ctx->x + 9);
-		ret_user = 4;
-		break;
-	case 31:
-		adjust_insns(ctx->x + 11);
-		ret_user = 5;
-		break;
-	case 447:
-		adjust_insns(ctx->x + 17);
-		ret_user = 7;
-		break;
-	default:
-		adjust_insns(ctx->x + 177);
-		ret_user = 19;
-		break;
-	}
+	const void *const jt[256] = {
+		[0 ... 255] = &&default_label,
+		[0] = &&l0,
+		[11] = &&l11,
+		[27] = &&l27,
+		[31] = &&l31,
+	};
 
+	goto *jt[ctx->x & 0xff];
+
+l0:
+	adjust_insns(ctx->x + 1);
+	ret_user = 2;
 	return 0;
+
+l11:
+	adjust_insns(ctx->x + 7);
+	ret_user = 3;
+	return 0;
+
+l27:
+	adjust_insns(ctx->x + 9);
+	ret_user = 4;
+	return 0;
+
+l31:
+	adjust_insns(ctx->x + 11);
+	ret_user = 5;
+	return 0;
+
+default_label:
+	adjust_insns(ctx->x + 177);
+	ret_user = 19;
+	return 0;
+}
+
+SEC("syscall")
+int one_jump_two_maps(struct simple_ctx *ctx)
+{
+        __label__ l1, l2, l3, l4;
+        void *jt1[2] = { &&l1, &&l2 };
+        void *jt2[2] = { &&l3, &&l4 };
+	unsigned int a = ctx->x % 2;
+	unsigned int b = (ctx->x / 2) % 2;
+        volatile int ret = 0;
+
+	if (!(a < 2 && b < 2))
+		return 19;
+
+	if (ctx->x % 2)
+		goto *jt1[a];
+	else
+		goto *jt2[b];
+
+	l1: ret += 1;
+	l2: ret += 3;
+	l3: ret += 5;
+	l4: ret += 7;
+
+	ret_user = ret;
+        return ret;
 }
 
 /* Just to introduce some non-zero offsets in .text */
