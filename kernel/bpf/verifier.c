@@ -17794,14 +17794,64 @@ static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct jt *jt)
 	return KEEP_EXPLORING;
 }
 
+static int cmp_ptr_to_u32(const void *a, const void *b)
+{
+	return *(u32 *)a - *(u32 *)b;
+}
+
+/*
+ * sort_unique({map[start], ..., map[end]}) into [newly allocated] *xoff_ret
+ */
+static int insn_array_unique_offsets(struct bpf_verifier_env *env, struct bpf_map *map, u32 start, u32 end, u32 **xoff_ret)
+{
+	struct bpf_insn_array_value *value;
+	u32 n_total = end - start + 1;
+	u32 n_unique = 1;
+	u32 *off;
+	int err;
+	u32 i;
+
+	off = kvcalloc(n_total, sizeof(u32), GFP_KERNEL_ACCOUNT);
+	if (!off)
+		return -ENOMEM;
+
+	for (i = start; i <= end; i++) {
+		value = map->ops->map_lookup_elem(map, &i);
+		if (!value) {
+			verbose(env, "incorrect key %d in the map id=%d", i, map->id);
+			err = -EINVAL;
+			goto err_free;
+		}
+		if (value->xlated_off == ((u32)-1)) {
+			verbose(env, "pointer to a deleted key %d in the map id=%d", i, map->id);
+			err = -EINVAL;
+			goto err_free;
+		}
+		off[i - start] = value->xlated_off;
+	}
+
+	/* sort uniquely in-place */
+	sort(off, n_total, sizeof(off[0]), cmp_ptr_to_u32, NULL);
+	for (i = 1; i < n_total; i++)
+		if (off[i] != off[n_unique-1])
+			off[n_unique++] = off[i];
+
+	*xoff_ret = off;
+	return n_unique;
+
+err_free:
+	kvfree(off);
+	return err;
+}
+
 /*
  * Copy all unique offsets from the map
  */
-static int jt_from_map(struct bpf_map *map, struct jt *jt)
+static int jt_from_map(struct bpf_verifier_env *env, struct bpf_map *map, struct jt *jt)
  {
 	int ret;
 
-	ret = bpf_insn_array_unique_offsets(map, &jt->off);
+	ret = insn_array_unique_offsets(env, map, 0, map->max_entries - 1, &jt->off);
 	if (ret < 0)
 		return ret;
 	jt->off_cnt = ret;
@@ -17827,12 +17877,15 @@ static int visit_goto_x_insn(int t, struct bpf_verifier_env *env, int fd)
 	if (map_idx >= 0) {
 		struct bpf_map *map = env->used_maps[map_idx];
 
-		if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
+		if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY) {
+			verbose(env, "map type %d in the gotox insn %d is incorrect\n",
+				     map->map_type, t);
 			return -EINVAL;
+		}
 
 		env->insn_aux_data[t].map_index = map_idx;
 
-		ret = jt_from_map(map, jt);
+		ret = jt_from_map(env, map, jt);
 		if (ret)
 			return ret;
 	} else {
@@ -19998,25 +20051,17 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 	return PROCESS_BPF_EXIT;
 }
 
+/* gotox *dst_reg */
 static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	struct bpf_verifier_state *other_branch;
 	struct bpf_reg_state *dst_reg;
 	struct bpf_map *map;
 	int map_idx;
-	int xoff;
-	u32 i;
-
-	map_idx = env->insn_aux_data[env->insn_idx].map_index;
-	if (map_idx < 0 || map_idx >= env->used_map_cnt) {
-		// XXX support this case!
-		return -EFAULT;
-	}
-
-	map = env->used_maps[map_idx];
-
-	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
-		return -EINVAL;
+	int err = 0;
+	u32 *xoff;
+	int n;
+	int i;
 
 	dst_reg = reg_state(env, insn->dst_reg);
 	if (dst_reg->type != PTR_TO_INSN) {
@@ -20025,34 +20070,53 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 		return -EINVAL;
 	}
 
-#if 0
-	if (dst_reg->map_ptr != map) {
+	map = dst_reg->map_ptr;
+	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
+		return -EINVAL;
+
+	// XXX this check currently fails for the dev test, because libbpf inserts map fd
+	if (0) {
+	/*
+	 * The gotox instruction may, optionally, contain a reference to the
+	 * INSN_ARRAY map. If it is present, then it must be the same map as
+	 * in the DST. If not, then just use DST
+	 */
+	map_idx = env->insn_aux_data[env->insn_idx].map_index;
+	if (map_idx >= 0 && map_idx < env->used_map_cnt && map != env->used_maps[map_idx]) {
 		verbose(env, "BPF_JA|BPF_X R%d was loaded from map id=%u, expected id=%u\n",
 				insn->dst_reg, dst_reg->map_ptr->id, map->id);
 		return -EINVAL;
 	}
-#endif
-
-	if (dst_reg->max_index >= map->max_entries)
-		return -EINVAL;
-
-	for (i = dst_reg->min_index + 1; i <= dst_reg->max_index; i++) {
-		xoff = bpf_insn_array_iter_xlated_offset(map, i);
-		if (xoff == -ENOENT)
-			break;
-		if (xoff < 0)
-			return xoff;
-
-		other_branch = push_stack(env, xoff, env->insn_idx, false);
-		if (IS_ERR(other_branch))
-			return PTR_ERR(other_branch);
 	}
 
-	env->insn_idx = bpf_insn_array_iter_xlated_offset(map, dst_reg->min_index);
-	if (env->insn_idx < 0)
-		return env->insn_idx;
+	if (dst_reg->max_index >= map->max_entries) {
+		verbose(env, "BPF_JA|BPF_X R%d is out of map boundaries: index=%u, max_index=%u\n",
+				insn->dst_reg, dst_reg->max_index, map->max_entries-1);
+		return -EINVAL;
+	}
 
-	return 0;
+	n = insn_array_unique_offsets(env, map, dst_reg->min_index, dst_reg->max_index, &xoff);
+	if (n < 0)
+		return n;
+	if (n == 0) {
+		verbose(env, "register R%d doesn't point to any offset in map id=%d\n",
+			     insn->dst_reg, map->id);
+		err = -EINVAL;
+		goto free_off;
+	}
+
+	for (i = 0; i < n - 1; i++) {
+		other_branch = push_stack(env, xoff[i], env->insn_idx, false);
+		if (IS_ERR(other_branch)) {
+			err = PTR_ERR(other_branch);
+			goto free_off;
+		}
+	}
+	env->insn_idx = xoff[n-1];
+
+free_off:
+	kvfree(xoff);
+	return err;
 }
 
 static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
@@ -20936,6 +21000,26 @@ static void convert_pseudo_ld_imm64(struct bpf_verifier_env *env)
 	}
 }
 
+// XXX: this must be carefully called
+// XXX: another thing here is that when we're patching aux data, it can be
+// overwritten, or multiplied (when an instruction is patched with more
+// instructions)
+// or can it? Only if gotox is removed
+// XXX: also see the bug which I've listed. In this case it might hide memory leak if `z` disappears
+
+static void clear_insn_aux_data(struct bpf_insn_aux_data *aux_data, int start, int end)
+{
+	int i;
+
+	for (i = start; i <= end; i++) {
+		if (aux_data[i].jt.off) {
+			kvfree(aux_data[i].jt.off);
+			aux_data[i].jt.off = NULL;
+			aux_data[i].jt.off_cnt = 0;
+		}
+	}
+}
+
 /* single env->prog->insni[off] instruction was replaced with the range
  * insni[off, off + cnt).  Adjust corresponding insn_aux_data by copying
  * [0, off) and [off, end) to new locations, so the patched range stays zero
@@ -21237,6 +21321,8 @@ static int verifier_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
 		return err;
 
 	adjust_insn_arrays_after_remove(env, off, cnt);
+
+	clear_insn_aux_data(aux_data, off, off + cnt - 1);
 
 	memmove(aux_data + off,	aux_data + off + cnt,
 		sizeof(*aux_data) * (orig_prog_len - off - cnt));
@@ -24723,8 +24809,6 @@ static int compute_scc(struct bpf_verifier_env *env)
 	u32 next_preorder_num;
 	u32 next_scc_id;
 	bool assign_scc;
-	u32 _succ[2];
-	u32 *succ = &_succ[0];
 
 	next_preorder_num = 1;
 	next_scc_id = 1;
@@ -24823,6 +24907,9 @@ static int compute_scc(struct bpf_verifier_env *env)
 		dfs[0] = i;
 dfs_continue:
 		while (dfs_sz) {
+			u32 _succ[2];
+			u32 *succ = &_succ[0];
+
 			w = dfs[dfs_sz - 1];
 			if (pre[w] == 0) {
 				low[w] = next_preorder_num;
@@ -25157,6 +25244,7 @@ err_release_maps:
 err_unlock:
 	if (!is_priv)
 		mutex_unlock(&bpf_verifier_lock);
+	clear_insn_aux_data(env->insn_aux_data, 0, env->prog->len - 1);
 	vfree(env->insn_aux_data);
 err_free_env:
 	kvfree(env->cfg.insn_postorder);

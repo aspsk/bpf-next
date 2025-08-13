@@ -3711,8 +3711,6 @@ int bpf_insn_array_ready(struct bpf_map *map);
 void bpf_insn_array_release(struct bpf_map *map);
 void bpf_insn_array_adjust(struct bpf_map *map, u32 off, u32 len);
 void bpf_insn_array_adjust_after_remove(struct bpf_map *map, u32 off, u32 len);
-int bpf_insn_array_iter_xlated_offset(struct bpf_map *map, u32 iter_no);
-int bpf_insn_array_unique_offsets(struct bpf_map *map, u32 **off);
 
 /*
  * The struct bpf_insn_ptr structure describes a pointer to a
