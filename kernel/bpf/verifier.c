@@ -2958,14 +2958,13 @@ static int cmp_subprogs(const void *a, const void *b)
 	       ((struct bpf_subprog_info *)b)->start;
 }
 
-/* Find subprogram that contains instruction at 'off' */
-static struct bpf_subprog_info *find_containing_subprog(struct bpf_verifier_env *env, int off)
+static int find_containing_subprog_idx(struct bpf_verifier_env *env, int off)
 {
 	struct bpf_subprog_info *vals = env->subprog_info;
 	int l, r, m;
 
 	if (off >= env->prog->len || off < 0 || env->subprog_cnt == 0)
-		return NULL;
+		return -1;
 
 	l = 0;
 	r = env->subprog_cnt - 1;
@@ -2976,7 +2975,19 @@ static struct bpf_subprog_info *find_containing_subprog(struct bpf_verifier_env 
 		else
 			r = m - 1;
 	}
-	return &vals[l];
+	return l;
+}
+
+/* Find subprogram that contains instruction at 'off' */
+static struct bpf_subprog_info *find_containing_subprog(struct bpf_verifier_env *env, int off)
+{
+	int subprog_idx;
+
+	subprog_idx = find_containing_subprog_idx(env, off);
+	if (subprog_idx < 0)
+		return NULL;
+
+	return &env->subprog_info[subprog_idx];
 }
 
 /* Find subprogram that starts exactly at 'off' */
@@ -17750,19 +17761,11 @@ static int mark_fastcall_patterns(struct bpf_verifier_env *env)
 #define SET_HIGH(STATE, LAST)	STATE = (STATE & 0xffffU) | ((LAST) << 16)
 #define GET_HIGH(STATE)		((u16)((STATE) >> 16))
 
-static int gotox_sanity_check(struct bpf_verifier_env *env, int from, int to)
-{
-	/* TBD: check that to belongs to the same BPF function && whatever else */
-
-	return 0;
-}
-
 static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct jt *jt)
 {
 	int *insn_stack = env->cfg.insn_stack;
 	int *insn_state = env->cfg.insn_state;
 	u16 prev;
-	int err;
 	int w;
 
 	for (prev = GET_HIGH(insn_state[t]); prev < jt->off_cnt; prev++) {
@@ -17778,10 +17781,6 @@ static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct jt *jt)
 	if (prev == jt->off_cnt)
 		return DONE_EXPLORING;
 
-	err = gotox_sanity_check(env, t, w);
-	if (err)
-		return err;
-
 	mark_prune_point(env, t);
 
 	if (env->cfg.cur_stack >= env->prog->len)
@@ -17794,115 +17793,188 @@ static int push_goto_x_edge(int t, struct bpf_verifier_env *env, struct jt *jt)
 	return KEEP_EXPLORING;
 }
 
+static int copy_insn_array(struct bpf_map *map, u32 start, u32 end, u32 *off)
+{
+	struct bpf_insn_array_value *value;
+	u32 i;
+
+	for (i = start; i <= end; i++) {
+		value = map->ops->map_lookup_elem(map, &i);
+		if (!value)
+			return -EINVAL;
+		off[i - start] = value->xlated_off;
+	}
+	return 0;
+}
+
 static int cmp_ptr_to_u32(const void *a, const void *b)
 {
 	return *(u32 *)a - *(u32 *)b;
 }
 
-/*
- * sort_unique({map[start], ..., map[end]}) into [newly allocated] *xoff_ret
- */
-static int insn_array_unique_offsets(struct bpf_verifier_env *env, struct bpf_map *map, u32 start, u32 end, u32 **xoff_ret)
+static int sort_insn_array_uniq(u32 *off, int off_cnt)
 {
-	struct bpf_insn_array_value *value;
-	u32 n_total = end - start + 1;
-	u32 n_unique = 1;
-	u32 *off;
+	int unique = 1;
+	int i;
+
+	sort(off, off_cnt, sizeof(off[0]), cmp_ptr_to_u32, NULL);
+
+	for (i = 1; i < off_cnt; i++)
+		if (off[i] != off[unique - 1])
+			off[unique++] = off[i];
+
+	return unique;
+}
+
+/*
+ * sort_unique({map[start], ..., map[end]}) into off
+ */
+static int copy_insn_array_uniq(struct bpf_map *map, u32 start, u32 end, u32 *off)
+{
+	u32 n = end - start + 1;
 	int err;
-	u32 i;
 
-	off = kvcalloc(n_total, sizeof(u32), GFP_KERNEL_ACCOUNT);
-	if (!off)
-		return -ENOMEM;
+	err = copy_insn_array(map, start, end, off);
+	if (err)
+		return err;
 
-	for (i = start; i <= end; i++) {
-		value = map->ops->map_lookup_elem(map, &i);
-		if (!value) {
-			verbose(env, "incorrect key %d in the map id=%d", i, map->id);
-			err = -EINVAL;
-			goto err_free;
-		}
-		if (value->xlated_off == ((u32)-1)) {
-			verbose(env, "pointer to a deleted key %d in the map id=%d", i, map->id);
-			err = -EINVAL;
-			goto err_free;
-		}
-		off[i - start] = value->xlated_off;
-	}
-
-	/* sort uniquely in-place */
-	sort(off, n_total, sizeof(off[0]), cmp_ptr_to_u32, NULL);
-	for (i = 1; i < n_total; i++)
-		if (off[i] != off[n_unique-1])
-			off[n_unique++] = off[i];
-
-	*xoff_ret = off;
-	return n_unique;
-
-err_free:
-	kvfree(off);
-	return err;
+	return sort_insn_array_uniq(off, n);
 }
 
 /*
  * Copy all unique offsets from the map
  */
-static int jt_from_map(struct bpf_verifier_env *env, struct bpf_map *map, struct jt *jt)
- {
-	int ret;
+static int jt_from_map(struct bpf_map *map, struct jt *jt)
+{
+	u32 *off;
+	int n;
 
-	ret = insn_array_unique_offsets(env, map, 0, map->max_entries - 1, &jt->off);
-	if (ret < 0)
-		return ret;
-	jt->off_cnt = ret;
+	off = kvcalloc(map->max_entries, sizeof(u32), GFP_KERNEL_ACCOUNT);
+	if (!off)
+		return -ENOMEM;
+
+	n = copy_insn_array_uniq(map, 0, map->max_entries - 1, off);
+	if (n < 0) {
+		kvfree(off);
+		return n;
+	}
+
+	jt->off = off;
+	jt->off_cnt = n;
 	return 0;
 }
 
 /*
- * Find and collect all maps which fit in the sub-function containing insn[t]
+ * Find and collect all maps which fit in the subprog. Return the result as one
+ * combined jump table in jt->off (allocated with kvcalloc
  */
-static int jt_from_air(struct bpf_verifier_env *env, int t, struct jt *jt)
+static int jt_from_subprog(struct bpf_verifier_env *env,
+			   int subprog_start,
+			   int subprog_end,
+			   struct jt *jt)
 {
-	return -EFAULT;
+	struct bpf_map *map;
+	struct jt jt_cur;
+	u32 *off;
+	int err;
+	int i;
+
+	jt->off = NULL;
+	jt->off_cnt = 0;
+
+	for (i = 0; i < env->insn_array_map_cnt; i++) {
+		map = env->insn_array_maps[i]; // XXX: this must not be static key or map for indirect calls
+
+		err = jt_from_map(map, &jt_cur);
+		if (err) {
+			kvfree(jt->off);
+			return err;
+		}
+
+		/*
+		 * XXX: this should have been checked before, when the map is
+		 * initialized... We will add this check. So now this is enough
+		 * to check that only the first instruction fits
+		 */
+		if (jt_cur.off[0] >= subprog_start && jt_cur.off[0] < subprog_end) {
+			off = kvrealloc(jt->off, (jt->off_cnt + jt_cur.off_cnt) << 2, GFP_KERNEL_ACCOUNT);
+			if (!off) {
+				kvfree(jt_cur.off);
+				kvfree(jt->off);
+				return -ENOMEM;
+			}
+			memcpy(off + jt->off_cnt, jt_cur.off, jt_cur.off_cnt << 2);
+			jt->off = off;
+			jt->off_cnt += jt_cur.off_cnt;
+		}
+
+		kvfree(jt_cur.off);
+	}
+
+	if (jt->off == NULL) {
+		verbose(env, "no jump tables found for subprog starting at %u\n", subprog_start);
+		return -EINVAL;
+	}
+
+	jt->off_cnt = sort_insn_array_uniq(jt->off, jt->off_cnt);
+	return 0;
 }
 
 /* "conditional jump with N edges" */
 static int visit_goto_x_insn(int t, struct bpf_verifier_env *env, int fd)
 {
 	struct jt *jt = &env->insn_aux_data[t].jt;
+	static struct bpf_subprog_info *subprog;
+	int subprog_idx, subprog_start, subprog_end;
 	int map_idx;
 	int ret;
+	int i;
 
-	map_idx = add_used_map(env, fd);
-	if (map_idx >= 0) {
-		struct bpf_map *map = env->used_maps[map_idx];
-
-		if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY) {
-			verbose(env, "map type %d in the gotox insn %d is incorrect\n",
-				     map->map_type, t);
-			return -EINVAL;
+	if (jt->off == NULL) {
+		if (env->subprog_cnt == 0)
+			return -EFAULT;
+		else {
+			subprog_idx = find_containing_subprog_idx(env, t);
+			if (subprog_idx < 0) {
+				verbose(env, "can't find subprog containing instruction %d\n", t);
+				return -EFAULT;
+			}
+			subprog = &env->subprog_info[subprog_idx];
+			subprog_start = subprog->start;
+			subprog_end = (subprog + 1)->start;
 		}
 
-		env->insn_aux_data[t].map_index = map_idx;
+		map_idx = add_used_map(env, fd);
+		if (map_idx >= 0) {
+			struct bpf_map *map = env->used_maps[map_idx];
 
-		ret = jt_from_map(env, map, jt);
-		if (ret)
-			return ret;
-	} else {
-		/*
-			XXX: the very next thingy here: support this case, cache info, etc.
-			in the check_indirect_jump do the thingy to either use this cached info (if map is valid),
-			or copy info from map. We also need to iterate in push_goto_x_edge through the allocated array,
-			no need to copy stuff
+			if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY) {
+				verbose(env, "map type %d in the gotox insn %d is incorrect\n",
+					     map->map_type, t);
+				return -EINVAL;
+			}
 
-			так победим!
-		*/
-		ret = jt_from_air(env, t, jt);
-		if (ret)
-			return ret;
+			env->insn_aux_data[t].map_index = map_idx;
+
+			ret = jt_from_map(map, jt);
+			if (ret)
+				return ret;
+
+			for (i = 0; i < jt->off_cnt; i++) {
+				if (jt->off[i] < subprog_start || jt->off[i] >= subprog_end) {
+					verbose(env, "jump table id=%d points to outside of the subfunction [%u,%u]",
+						map->id, subprog_start, subprog_end);
+					return -EINVAL;
+				}
+			}
+		} else {
+			ret = jt_from_subprog(env, subprog_start, subprog_end, jt);
+			if (ret)
+				return ret;
+		}
 	}
 	return push_goto_x_edge(t, env, jt);
- }
+}
 
 /* Visits the instruction at index t and returns one of the following:
  *  < 0 - an error occurred
@@ -20057,7 +20129,6 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 	struct bpf_verifier_state *other_branch;
 	struct bpf_reg_state *dst_reg;
 	struct bpf_map *map;
-	int map_idx;
 	int err = 0;
 	u32 *xoff;
 	int n;
@@ -20071,23 +20142,11 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 	}
 
 	map = dst_reg->map_ptr;
-	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
+	if (!map)
 		return -EINVAL;
 
-	// XXX this check currently fails for the dev test, because libbpf inserts map fd
-	if (0) {
-	/*
-	 * The gotox instruction may, optionally, contain a reference to the
-	 * INSN_ARRAY map. If it is present, then it must be the same map as
-	 * in the DST. If not, then just use DST
-	 */
-	map_idx = env->insn_aux_data[env->insn_idx].map_index;
-	if (map_idx >= 0 && map_idx < env->used_map_cnt && map != env->used_maps[map_idx]) {
-		verbose(env, "BPF_JA|BPF_X R%d was loaded from map id=%u, expected id=%u\n",
-				insn->dst_reg, dst_reg->map_ptr->id, map->id);
+	if (map->map_type != BPF_MAP_TYPE_INSN_ARRAY)
 		return -EINVAL;
-	}
-	}
 
 	if (dst_reg->max_index >= map->max_entries) {
 		verbose(env, "BPF_JA|BPF_X R%d is out of map boundaries: index=%u, max_index=%u\n",
@@ -20095,9 +20154,15 @@ static int check_indirect_jump(struct bpf_verifier_env *env, struct bpf_insn *in
 		return -EINVAL;
 	}
 
-	n = insn_array_unique_offsets(env, map, dst_reg->min_index, dst_reg->max_index, &xoff);
-	if (n < 0)
-		return n;
+	xoff = kvcalloc(dst_reg->max_index - dst_reg->min_index + 1, sizeof(u32), GFP_KERNEL_ACCOUNT);
+	if (!xoff)
+		return -ENOMEM;
+
+	n = copy_insn_array_uniq(map, dst_reg->min_index, dst_reg->max_index, xoff);
+	if (n < 0) {
+		err = n;
+		goto free_off;
+	}
 	if (n == 0) {
 		verbose(env, "register R%d doesn't point to any offset in map id=%d\n",
 			     insn->dst_reg, map->id);
