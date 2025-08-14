@@ -5714,19 +5714,6 @@ static int check_map_access_type(struct bpf_verifier_env *env, u32 regno,
 	return 0;
 }
 
-static int check_insn_array_mem_access(struct bpf_verifier_env *env,
-				     const struct bpf_map *map,
-				     int off, int size, u32 mem_size)
-{
-	if ((off < 0) || (off % sizeof(long)) || (off/sizeof(long) >= map->max_entries))
-		return -EACCES;
-
-	if (mem_size != 8 || size != 8)
-		return -EACCES;
-
-	return 0;
-}
-
 /* check read/write into memory region (e.g., map value, ringbuf sample, etc) */
 static int __check_mem_access(struct bpf_verifier_env *env, int regno,
 			      int off, int size, u32 mem_size,
@@ -5745,10 +5732,6 @@ static int __check_mem_access(struct bpf_verifier_env *env, int regno,
 			mem_size, off, size);
 		break;
 	case PTR_TO_MAP_VALUE:
-		if (reg->map_ptr->map_type == BPF_MAP_TYPE_INSN_ARRAY &&
-		    check_insn_array_mem_access(env, reg->map_ptr, off, size, mem_size) == 0)
-			return 0;
-
 		verbose(env, "invalid access to map value, value_size=%d off=%d size=%d\n",
 			mem_size, off, size);
 		break;
@@ -6101,6 +6084,14 @@ static int check_map_kptr_access(struct bpf_verifier_env *env, u32 regno,
 	return 0;
 }
 
+static u32 map_mem_size(const struct bpf_map *map)
+{
+	if (map->map_type == BPF_MAP_TYPE_INSN_ARRAY)
+		return map->max_entries * sizeof(long);
+
+	return map->value_size;
+}
+
 /* check read/write into a map element with possible variable offset */
 static int check_map_access(struct bpf_verifier_env *env, u32 regno,
 			    int off, int size, bool zero_size_allowed,
@@ -6110,11 +6101,11 @@ static int check_map_access(struct bpf_verifier_env *env, u32 regno,
 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
 	struct bpf_reg_state *reg = &state->regs[regno];
 	struct bpf_map *map = reg->map_ptr;
+	u32 mem_size = map_mem_size(map);
 	struct btf_record *rec;
 	int err, i;
 
-	err = check_mem_region_access(env, regno, off, size, map->value_size,
-				      zero_size_allowed);
+	err = check_mem_region_access(env, regno, off, size, mem_size, zero_size_allowed);
 	if (err)
 		return err;
 
