@@ -18957,6 +18957,10 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 		return regs_exact(rold, rcur, idmap) && rold->frameno == rcur->frameno;
 	case PTR_TO_ARENA:
 		return true;
+	case PTR_TO_INSN:
+		/* cur ⊆ old */
+		return (rcur->min_index >= rold->min_index &&
+			rcur->max_index <= rold->max_index);
 	default:
 		return regs_exact(rold, rcur, idmap);
 	}
@@ -19208,21 +19212,10 @@ static bool func_states_equal(struct bpf_verifier_env *env, struct bpf_func_stat
 			      struct bpf_func_state *cur, u32 insn_idx, enum exact_level exact)
 {
 	u16 live_regs = env->insn_aux_data[insn_idx].live_regs_before;
-	struct bpf_insn *insn;
 	u16 i;
 
 	if (old->callback_depth > cur->callback_depth)
 		return false;
-
-	insn = &env->prog->insnsi[insn_idx];
-	if (insn_is_gotox(insn)) {
-		struct bpf_reg_state *old_dst = &old->regs[insn->dst_reg];
-		struct bpf_reg_state *cur_dst = &cur->regs[insn->dst_reg];
-
-		if (old_dst->min_index != cur_dst->min_index ||
-		    old_dst->max_index != cur_dst->max_index)
-			return false;
-	}
 
 	for (i = 0; i < MAX_BPF_REG; i++)
 		if (((1 << i) & live_regs) &&
