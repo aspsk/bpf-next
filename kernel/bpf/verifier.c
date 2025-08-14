@@ -14493,6 +14493,8 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
 	struct bpf_reg_state *regs = state->regs, *dst_reg;
 	bool known = tnum_is_const(off_reg->var_off);
+	bool ptr_to_insn_array = base_type(ptr_reg->type) == PTR_TO_MAP_VALUE &&
+				 map_is_insn_array(ptr_reg->map_ptr);
 	s64 smin_val = off_reg->smin_value, smax_val = off_reg->smax_value,
 	    smin_ptr = ptr_reg->smin_value, smax_ptr = ptr_reg->smax_value;
 	u64 umin_val = off_reg->umin_value, umax_val = off_reg->umax_value,
@@ -14590,6 +14592,36 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 
 	switch (opcode) {
 	case BPF_ADD:
+		if (ptr_to_insn_array) {
+			u32 min_index = dst_reg->min_index;
+			u32 max_index = dst_reg->max_index;
+
+			if (umin_val > (u64) U32_MAX * sizeof(long)) {
+				verbose(env, "umin_value %llu is too big to convert to index\n",
+					     umin_val);
+				return -EACCES;
+			}
+			if (umax_val > (u64) U32_MAX * sizeof(long)) {
+				verbose(env, "umax_value %llu is too big to convert to index\n",
+					     umax_val);
+				return -EACCES;
+			}
+
+			min_index += umin_val / sizeof(long);
+			max_index += umax_val / sizeof(long);
+
+			if (min_index >= ptr_reg->map_ptr->max_entries) {
+				verbose(env, "min_index %u points to outside of map\n", min_index);
+				return -EACCES;
+			}
+			if (max_index >= ptr_reg->map_ptr->max_entries) {
+				verbose(env, "max_index %u points to outside of map\n", max_index);
+				return -EACCES;
+			}
+
+			dst_reg->min_index = min_index;
+			dst_reg->max_index = max_index;
+		}
 		/* We can take a fixed offset as long as it doesn't overflow
 		 * the s32 'off' field
 		 */
@@ -14634,6 +14666,11 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 		}
 		break;
 	case BPF_SUB:
+		if (ptr_to_insn_array) {
+			verbose(env, "Operation %s on ptr to instruction set map is prohibited\n",
+				bpf_alu_string[opcode >> 4]);
+			return -EACCES;
+		}
 		if (dst_reg == off_reg) {
 			/* scalar -= pointer.  Creates an unknown scalar */
 			verbose(env, "R%d tried to subtract pointer from scalar\n",
@@ -15465,22 +15502,6 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
 
 		/* Any arithmetic operations are allowed on arena pointers */
 		return 0;
-	}
-
-	if (dst_reg->type == PTR_TO_MAP_VALUE && map_is_insn_array(dst_reg->map_ptr)) {
-		if (opcode != BPF_ADD) {
-			verbose(env, "Operation %s on ptr to instruction set map is prohibited\n",
-				bpf_alu_string[opcode >> 4]);
-			return -EACCES;
-		}
-		src_reg = &regs[insn->src_reg];
-		if (src_reg->type != SCALAR_VALUE) {
-			verbose(env, "Adding non-scalar R%d to an instruction ptr is prohibited\n",
-				insn->src_reg);
-			return -EACCES;
-		}
-		dst_reg->min_index = src_reg->umin_value / sizeof(long);
-		dst_reg->max_index = src_reg->umax_value / sizeof(long);
 	}
 
 	if (dst_reg->type != SCALAR_VALUE)
@@ -17935,7 +17956,7 @@ static int visit_goto_x_insn(int t, struct bpf_verifier_env *env, int fd)
 			subprog_end = (subprog + 1)->start;
 		}
 
-		map_idx = add_used_map(env, fd);
+		map_idx = add_used_map(env, fd); // XXX: as we're ignoring error here, add_used_map needs to not report in verbose, otherwise it is misleading in the log
 		if (map_idx >= 0) {
 			struct bpf_map *map = env->used_maps[map_idx];
 
