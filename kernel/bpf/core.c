@@ -1484,6 +1484,7 @@ void bpf_jit_prog_release_other(struct bpf_prog *fp, struct bpf_prog *fp_other)
 
 static void adjust_insn_arrays(struct bpf_prog *prog, u32 off, u32 len)
 {
+#ifdef CONFIG_BPF_SYSCALL
 	struct bpf_map *map;
 	int i;
 
@@ -1495,6 +1496,7 @@ static void adjust_insn_arrays(struct bpf_prog *prog, u32 off, u32 len)
 		if (map->map_type == BPF_MAP_TYPE_INSN_ARRAY)
 			bpf_insn_array_adjust(map, off, len);
 	}
+#endif
 }
 
 struct bpf_prog *bpf_jit_blind_constants(struct bpf_prog *prog)
