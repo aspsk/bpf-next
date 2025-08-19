@@ -20,16 +20,23 @@ struct simple_ctx {
 	__u64 x;
 };
 
+typedef __u64 (*foo_t)(__u64);
+
+__u64 __noinline woo(foo_t foo, __u64 arg)
+{
+	return foo(arg);
+}
+
 SEC("syscall") int simple_test(struct simple_ctx *ctx)
 {
-	__u64 (*foo)(__u64);
+	foo_t foo;
 
 	if (ctx->x % 2)
 		foo = &foo_1;
 	else
 		foo = &foo_2;
 
-	ret_user = foo(ctx->x);
+	ret_user = woo(foo, ctx->x);
 
 	return 0;
 }

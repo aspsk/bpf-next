@@ -70,5 +70,8 @@ void test_bpf_indirect_calls(void)
 		check_calculon(skel, "34+6522*321+*+*+*222**16+39-41+4321+*+*+*+-3+", 11);
 	}
 
+	for ( ;; )
+		pause();
+
 	bpf_indirect_calls__destroy(skel);
 }
