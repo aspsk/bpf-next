@@ -1623,6 +1623,7 @@ EXPORT_SYMBOL_GPL(__bpf_call_base);
 	INSN_3(ALU64, MOD,  K),			\
 	/* Call instruction. */			\
 	INSN_2(JMP, CALL),			\
+	INSN_3(JMP, CALL, X),			\
 	/* Exit instruction. */			\
 	INSN_2(JMP, EXIT),			\
 	/* 32-bit Jump instructions. */		\

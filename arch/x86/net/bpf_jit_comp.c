@@ -2327,6 +2327,11 @@ populate_extable:
 				pop_r9(&prog);
 			break;
 		}
+		case BPF_JMP | BPF_CALL | BPF_X: {
+			// XXX: this only covers low registers, need to add mod to cover all registers
+			EMIT2(0xff, add_1reg(0xD0, dst_reg));
+			break;
+		}
 
 		case BPF_JMP | BPF_TAIL_CALL:
 			if (imm32)
