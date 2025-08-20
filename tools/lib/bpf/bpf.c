@@ -1395,3 +1395,20 @@ int bpf_prog_stream_read(int prog_fd, __u32 stream_id, void *buf, __u32 buf_len,
 	err = sys_bpf(BPF_PROG_STREAM_READ_BY_FD, &attr, attr_sz);
 	return libbpf_err_errno(err);
 }
+
+int bpf_static_key_update(int map_fd, struct bpf_static_key_update_opts *opts)
+{
+	const size_t attr_sz = offsetofend(union bpf_attr, static_key);
+	union bpf_attr attr;
+	int ret;
+
+	if (!OPTS_VALID(opts, bpf_static_key_update_opts))
+		return libbpf_err(-EINVAL);
+
+	memset(&attr, 0, attr_sz);
+	attr.static_key.map_fd = map_fd;
+	attr.static_key.on = OPTS_GET(opts, on, 0);
+
+	ret = sys_bpf(BPF_STATIC_KEY_UPDATE, &attr, attr_sz);
+	return libbpf_err_errno(ret);
+}
