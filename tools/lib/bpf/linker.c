@@ -31,6 +31,7 @@
 #define RODATA_REL_SEC ".rel.rodata"
 #define JUMPTABLES_SEC ".jumptables"
 #define JUMPTABLES_REL_SEC ".rel.jumptables"
+#define STATIC_KEYS_REL_SEC ".rel.static_keys"
 
 struct src_sec {
 	const char *sec_name;
@@ -1040,7 +1041,8 @@ static int linker_sanity_check_elf_relos(struct src_obj *obj, struct src_sec *se
 		size_t sym_type = ELF64_R_TYPE(relo->r_info);
 
 		if (sym_type != R_BPF_64_64 && sym_type != R_BPF_64_32 &&
-		    sym_type != R_BPF_64_ABS64 && sym_type != R_BPF_64_ABS32) {
+		    sym_type != R_BPF_64_ABS64 && sym_type != R_BPF_64_ABS32 &&
+		    sym_type != R_BPF_64_NODYLD32 && strcmp(sec->sec_name, STATIC_KEYS_REL_SEC)) {
 			pr_warn("ELF relo #%d in section #%zu has unexpected type %zu in %s\n",
 				i, sec->sec_idx, sym_type, obj->filename);
 			return -EINVAL;
@@ -2279,7 +2281,8 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 					else
 						insn->imm += sec->dst_off;
 				} else if (strcmp(src_sec->sec_name, JUMPTABLES_REL_SEC) &&
-					   strcmp(src_sec->sec_name, RODATA_REL_SEC)) {
+					   strcmp(src_sec->sec_name, RODATA_REL_SEC) &&
+					   strcmp(src_sec->sec_name, STATIC_KEYS_REL_SEC)) {
 					pr_warn("relocation against STT_SECTION in section %s is not supported!\n",
 						src_sec->sec_name);
 					return -EINVAL;
