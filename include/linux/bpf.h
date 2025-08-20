@@ -3956,6 +3956,26 @@ void bpf_insn_array_release(struct bpf_map *map);
 void bpf_insn_array_adjust(struct bpf_map *map, u32 off, u32 len);
 void bpf_insn_array_adjust_after_remove(struct bpf_map *map, u32 off, u32 len);
 
+/*
+ * Is this instruction goto_or_nop or nop_or_goto
+ */
+static inline bool is_static_branch(const struct bpf_insn *insn)
+{
+	return (insn->code == (BPF_JMP | BPF_JA) ||
+		insn->code == (BPF_JMP32 | BPF_JA)) &&
+		(insn->src_reg & BPF_STATIC_BRANCH_JA);
+}
+
+static inline bool is_goto_or_nop(const struct bpf_insn *insn)
+{
+	return is_static_branch(insn) && !(insn->src_reg & BPF_STATIC_BRANCH_NOP);
+}
+
+static inline bool is_nop_or_goto(const struct bpf_insn *insn)
+{
+	return is_static_branch(insn) && (insn->src_reg & BPF_STATIC_BRANCH_NOP);
+}
+
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image);
 #else

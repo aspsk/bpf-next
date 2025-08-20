@@ -495,8 +495,9 @@ bpf_insn_successors(struct bpf_verifier_env *env, u32 idx)
 	succ->cnt = 0;
 
 	opcode_info = &opcode_info_tbl[BPF_CLASS(insn->code) | BPF_OP(insn->code)];
+
 	insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
-	if (opcode_info->can_fallthrough)
+	if (opcode_info->can_fallthrough || is_static_branch(insn))
 		succ->items[succ->cnt++] = idx + insn_sz;
 
 	if (opcode_info->can_jump)

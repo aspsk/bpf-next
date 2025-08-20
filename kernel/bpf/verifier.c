@@ -18790,14 +18790,24 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 		else
 			off = insn->imm;
 
-		/* unconditional jump with single edge */
-		ret = push_insn(t, t + off + 1, FALLTHROUGH, env);
-		if (ret)
-			return ret;
+		if (insn->src_reg & BPF_STATIC_BRANCH_JA) {
+			/* static branch - jump with two edges */
+			mark_prune_point(env, t);
 
-		mark_prune_point(env, t + off + 1);
-		mark_jmp_point(env, t + off + 1);
+			ret = push_insn(t, t + 1, FALLTHROUGH, env);
+			if (ret)
+				return ret;
 
+			ret = push_insn(t, t + off + 1, BRANCH, env);
+		} else {
+			/* unconditional jump with single edge */
+			ret = push_insn(t, t + off + 1, FALLTHROUGH, env);
+			if (ret)
+				return ret;
+
+			mark_prune_point(env, t + off + 1);
+			mark_jmp_point(env, t + off + 1);
+		}
 		return ret;
 
 	default:
@@ -21025,6 +21035,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 
 			mark_reg_scratched(env, BPF_REG_0);
 		} else if (opcode == BPF_JA) {
+			int jmp_offset;
+
 			if (BPF_SRC(insn->code) == BPF_X) {
 				if (insn->src_reg != BPF_REG_0 ||
 				    insn->imm != 0 || insn->off != 0) {
@@ -21035,7 +21047,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			}
 
 			if (BPF_SRC(insn->code) != BPF_K ||
-			    insn->src_reg != BPF_REG_0 ||
+			    (insn->src_reg & ~BPF_STATIC_BRANCH_MASK) ||
 			    insn->dst_reg != BPF_REG_0 ||
 			    (class == BPF_JMP && insn->imm != 0) ||
 			    (class == BPF_JMP32 && insn->off != 0)) {
@@ -21044,9 +21056,24 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			}
 
 			if (class == BPF_JMP)
-				env->insn_idx += insn->off + 1;
+				jmp_offset = insn->off + 1;
 			else
-				env->insn_idx += insn->imm + 1;
+				jmp_offset = insn->imm + 1;
+
+			/* Staic branch can either jump to +off or +0 */
+			if (insn->src_reg & BPF_STATIC_BRANCH_JA) {
+				struct bpf_verifier_state *other_branch;
+
+				other_branch = push_stack(env, env->insn_idx + jmp_offset,
+							  env->insn_idx, false);
+				if (!other_branch)
+					return -EFAULT;
+
+				jmp_offset = 1;
+			}
+
+			env->insn_idx += jmp_offset;
+
 			return 0;
 		} else if (opcode == BPF_EXIT) {
 			if (BPF_SRC(insn->code) != BPF_K ||
