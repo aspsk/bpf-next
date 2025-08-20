@@ -1417,3 +1417,20 @@ int bpf_prog_assoc_struct_ops(int prog_fd, int map_fd,
 	err = sys_bpf(BPF_PROG_ASSOC_STRUCT_OPS, &attr, attr_sz);
 	return libbpf_err_errno(err);
 }
+
+int bpf_static_key_update(int map_fd, struct bpf_static_key_update_opts *opts)
+{
+	const size_t attr_sz = offsetofend(union bpf_attr, static_key);
+	union bpf_attr attr;
+	int ret;
+
+	if (!OPTS_VALID(opts, bpf_static_key_update_opts))
+		return libbpf_err(-EINVAL);
+
+	memset(&attr, 0, attr_sz);
+	attr.static_key.map_fd = map_fd;
+	attr.static_key.on = OPTS_GET(opts, on, 0);
+
+	ret = sys_bpf(BPF_STATIC_KEY_UPDATE, &attr, attr_sz);
+	return libbpf_err_errno(ret);
+}
