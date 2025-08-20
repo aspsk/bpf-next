@@ -3987,7 +3987,7 @@ struct bpf_insn_ptr {
 void bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image);
 
 int __bpf_static_key_update(struct bpf_map *map, bool on);
-int bpf_arch_poke_static_branch(struct bpf_insn_ptr *ptr, bool on);
+int bpf_arch_poke_static_branch(struct bpf_insn_ptr *ptr, void *ip, bool on);
 #else
 static inline void
 bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image)

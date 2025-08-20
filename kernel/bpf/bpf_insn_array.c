@@ -361,7 +361,7 @@ void bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image)
 			jitted_len = offsets[xlated_off + 1] - offsets[xlated_off];
 			insn_array->values[j].jitted_len = jitted_len;
 
-			insn_array->values[j].jitted_jump_offset = 0; // XXX = jitted_jump_offset; // XXX
+			insn_array->values[j].jitted_jump_offset = 0; // XXX = jitted_jump_offset; // XXX instead copy the instruction itself
 		}
 	}
 }
@@ -370,6 +370,7 @@ int __bpf_static_key_update(struct bpf_map *map, bool on)
 {
 	struct bpf_insn_array *insn_array = cast_insn_array(map);
 	struct bpf_insn_ptr *ptr;
+	void *ip;
 	int err = 0;
 	int i;
 
@@ -380,11 +381,12 @@ int __bpf_static_key_update(struct bpf_map *map, bool on)
 
 	for (i = 0; i < map->max_entries; i++) {
 		ptr = &insn_array->values[i];
+		ip = (void *) insn_array->ips[i];
 
 		if (ptr->user.xlated_off == INSN_DELETED)
 			continue;
 
-		err = bpf_arch_poke_static_branch(ptr, on ^ ptr->inverse_ja_or_nop);
+		err = bpf_arch_poke_static_branch(ptr, ip, on ^ ptr->inverse_ja_or_nop);
 		if (err)
 			return err;
 	}

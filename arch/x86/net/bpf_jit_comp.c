@@ -4123,3 +4123,44 @@ bool bpf_jit_supports_fsession(void)
 {
 	return true;
 }
+
+// XXX: read about bpf_jit_supports_xxx etc., add corresponding functions instead
+
+bool bpf_jit_supports_static_branch(void)
+{
+	return true;
+}
+
+int bpf_arch_poke_static_branch(struct bpf_insn_ptr *ptr, void *ip, bool on)
+{
+	int jmp_offset = ptr->jitted_jump_offset; // XXX: надо выспаться и подумать, может я могу просто скопировать всю инструкцию и не париться из-за offset? Вроде это проще и не нужно ничего городить
+	u32 len = ptr->jitted_len;
+	u8 op[5];
+
+	if (WARN_ON_ONCE(!ip))
+		return -EINVAL;
+
+	if (WARN_ON_ONCE(is_imm8(jmp_offset) && len != 2))
+		return -EINVAL;
+
+	if (WARN_ON_ONCE(!is_imm8(jmp_offset) && len != 5))
+		return -EINVAL;
+
+	if (on) {
+		if (len == 2) {
+			op[0] = 0xEB;
+			op[1] = jmp_offset;
+		} else {
+			op[0] = 0xE9;
+			memcpy(&op[1], &jmp_offset, 4);
+		}
+	} else {
+		memcpy(op, x86_nops[len], len);
+	}
+
+	mutex_lock(&text_mutex);
+	smp_text_poke_single(ip, op, len, NULL);
+	mutex_unlock(&text_mutex);
+
+	return 0;
+}
