@@ -36,7 +36,8 @@ static int insn_array_alloc_check(union bpf_attr *attr)
 	if (attr->max_entries == 0 ||
 	    attr->key_size != 4 ||
 	    attr->value_size != 8 ||
-	    attr->map_flags != 0)
+	    attr->map_flags != 0 ||
+	    attr->map_extra & ~BPF_F_STATIC_KEY)
 		return -EINVAL;
 
 	if (attr->max_entries > MAX_INSN_ARRAY_ENTRIES)
@@ -207,13 +208,32 @@ static bool is_insn_array(const struct bpf_map *map)
 	return map->map_type == BPF_MAP_TYPE_INSN_ARRAY;
 }
 
+static bool is_static_key(const struct bpf_map *map)
+{
+	return is_insn_array(map) && (map->map_extra & BPF_F_STATIC_KEY);
+}
+
+static bool is_ja_or_nop(const struct bpf_insn *insn)
+{
+	u8 code = insn->code;
+
+	return (code == (BPF_JMP | BPF_JA) || code == (BPF_JMP32 | BPF_JA)) &&
+		(insn->src_reg & BPF_STATIC_BRANCH_JA);
+}
+
+static bool is_inverse_ja_or_nop(const struct bpf_insn *insn)
+{
+	return insn->src_reg & BPF_STATIC_BRANCH_NOP;
+}
+
 static inline bool valid_offsets(const struct bpf_insn_array *insn_array,
 				 const struct bpf_prog *prog)
 {
+	const struct bpf_map *map = &insn_array->map;
 	u32 off;
 	int i;
 
-	for (i = 0; i < insn_array->map.max_entries; i++) {
+	for (i = 0; i < map->max_entries; i++) {
 		off = insn_array->ptrs[i].orig_xlated_off;
 
 		if (off >= prog->len)
@@ -223,6 +243,9 @@ static inline bool valid_offsets(const struct bpf_insn_array *insn_array,
 			if (prog->insnsi[off-1].code == (BPF_LD | BPF_DW | BPF_IMM))
 				return false;
 		}
+
+		if (is_static_key(map) && !is_ja_or_nop(&prog->insnsi[off]))
+			return false;
 	}
 
 	return true;
@@ -231,6 +254,7 @@ static inline bool valid_offsets(const struct bpf_insn_array *insn_array,
 int bpf_insn_array_init(struct bpf_map *map, const struct bpf_prog *prog)
 {
 	struct bpf_insn_array *insn_array = cast_insn_array(map);
+	const struct bpf_insn *insn;
 	int i;
 
 	if (!valid_offsets(insn_array, prog))
@@ -247,13 +271,25 @@ int bpf_insn_array_init(struct bpf_map *map, const struct bpf_prog *prog)
 	insn_array->state = INSN_ARRAY_STATE_INIT;
 	mutex_unlock(&insn_array->state_mutex);
 
-	/*
-	 * Reset all the map indexes to the original values.  This is needed,
-	 * e.g., when a replay of verification with different log level should
-	 * be performed.
-	 */
-	for (i = 0; i < map->max_entries; i++)
-		insn_array->ptrs[i].user_value.xlated_off = insn_array->ptrs[i].orig_xlated_off;
+	for (i = 0; i < map->max_entries; i++) {
+		u32 off = insn_array->ptrs[i].orig_xlated_off;
+
+		/*
+		 * Reset all the map indexes to the original values.
+		 * This is needed, e.g., when a replay of verification
+		 * with different log level should be performed.
+		 */
+		insn_array->ptrs[i].user_value.xlated_off = off;
+
+		/*
+		 * Static key -> off/on results in jump off/on or on/off,
+		 * depending on the instruction
+		 */
+		if (is_static_key(map)) {
+			insn = &prog->insnsi[off];
+			insn_array->ptrs[i].inverse_ja_or_nop = is_inverse_ja_or_nop(insn);
+		}
+	}
 
 	return 0;
 }
@@ -327,6 +363,8 @@ void bpf_insn_array_adjust_after_remove(struct bpf_map *map, u32 off, u32 len)
 void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
 			      u32 xlated_off,
 			      u32 jitted_off,
+			      u32 jitted_jump_offset,
+			      u32 jitted_len,
 			      void *jitted_ip)
 {
 	struct bpf_insn_array *insn_array;
@@ -344,7 +382,56 @@ void bpf_prog_update_insn_ptr(struct bpf_prog *prog,
 				insn_array->ips[j] = (long)jitted_ip;
 				insn_array->ptrs[j].jitted_ip = jitted_ip;
 				insn_array->ptrs[j].user_value.jitted_off = jitted_off;
+				insn_array->ptrs[j].jitted_jump_offset = jitted_jump_offset;
+				insn_array->ptrs[j].jitted_len = jitted_len;
 			}
 		}
 	}
+}
+
+static int __bpf_static_key_set(struct bpf_insn_array *insn_array, bool on)
+{
+	struct bpf_insn_ptr *ptr;
+	int ret;
+	int i;
+
+	for (i = 0; i < insn_array->map.max_entries && ret == 0; i++) {
+		ptr = &insn_array->ptrs[i];
+		if (ptr->user_value.xlated_off == INSN_DELETED)
+			continue;
+
+		ret = bpf_arch_poke_static_branch(ptr, on ^ ptr->inverse_ja_or_nop);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+int bpf_static_key_set(struct bpf_map *map, bool on)
+{
+	struct bpf_insn_array *insn_array = cast_insn_array(map);
+	int ret = 0;
+
+	if (!is_static_key(map))
+		return -EINVAL;
+
+	if (!mutex_trylock(&insn_array->state_mutex))
+		return -EBUSY;
+
+	if (insn_array->state == INSN_ARRAY_STATE_FREE) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	if (insn_array->state == INSN_ARRAY_STATE_INIT) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	ret = __bpf_static_key_set(insn_array, on);
+
+unlock:
+	mutex_unlock(&insn_array->state_mutex);
+	return ret;
 }

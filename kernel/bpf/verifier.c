@@ -20338,9 +20338,9 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			}
 
 			if (class == BPF_JMP)
-				jmp_offset += insn->off + 1;
+				jmp_offset = insn->off + 1;
 			else
-				jmp_offset += insn->imm + 1;
+				jmp_offset = insn->imm + 1;
 
 			/* Staic branch can either jump to +off or +0 */
 			if (insn->src_reg & BPF_STATIC_BRANCH_JA) {

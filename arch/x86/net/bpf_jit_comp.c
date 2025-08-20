@@ -1641,7 +1641,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		u32 src_reg = insn->src_reg;
 		u8 b2 = 0, b3 = 0;
 		u8 *start_of_ldx;
-		s64 jmp_offset;
+		s64 jmp_offset = 0;
 		s16 insn_off;
 		u8 jmp_cond;
 		u8 *func;
@@ -2681,7 +2681,7 @@ emit_jmp:
 			 * maps to jitted code
 			 */
 			bpf_prog_update_insn_ptr(bpf_prog, abs_xlated_off, proglen,
-						 image + proglen);
+						 jmp_offset, ilen, image + proglen);
 		}
 		proglen += ilen;
 		addrs[i] = proglen;
