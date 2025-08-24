@@ -502,8 +502,8 @@ struct bpf_program {
 	__u32 line_info_cnt;
 	__u32 prog_flags;
 
-	__u32 subprog_offset[256];
-	__u32 subprog_sec_offst[256];
+	__u32 subprog_off[256];
+	__u32 subprog_sec_off[256];
 	__u32 subprog_cnt;
 };
 
@@ -6173,8 +6173,8 @@ static int subprog_insn_off(struct bpf_program *prog, int insn_idx)
 	int i;
 
 	for (i = prog->subprog_cnt - 1; i >= 0; i--)
-		if (insn_idx >= prog->subprog_offset[i])
-			return prog->subprog_offset[i] - prog->subprog_sec_offst[i];
+		if (insn_idx >= prog->subprog_off[i])
+			return prog->subprog_off[i] - prog->subprog_sec_off[i];
 
 	return -prog->sec_insn_off;
 }
@@ -6486,14 +6486,14 @@ static int append_subprog_relos(struct bpf_program *main_prog, struct bpf_progra
 static int
 bpf_prog__append_subprog_offsets(struct bpf_program *prog, __u32 sec_insn_off, __u32 sub_insn_off)
 {
-	if (prog->subprog_cnt == ARRAY_SIZE(prog->subprog_sec_offst)) {
+	if (prog->subprog_cnt == ARRAY_SIZE(prog->subprog_sec_off)) {
 		pr_warn("prog '%s': number of subprogs exceeds %zu\n",
-			prog->name, ARRAY_SIZE(prog->subprog_sec_offst));
+			prog->name, ARRAY_SIZE(prog->subprog_sec_off));
 		return -E2BIG;
 	}
 
-	prog->subprog_sec_offst[prog->subprog_cnt] = sec_insn_off;
-	prog->subprog_offset[prog->subprog_cnt] = sub_insn_off;
+	prog->subprog_sec_off[prog->subprog_cnt] = sec_insn_off;
+	prog->subprog_off[prog->subprog_cnt] = sub_insn_off;
 
 	prog->subprog_cnt += 1;
 	return 0;
