@@ -28,7 +28,6 @@
 #include "str_error.h"
 
 #define BTF_EXTERN_SEC ".extern"
-#define RODATA_REL_SEC ".rel.rodata"
 #define JUMPTABLES_SEC ".jumptables"
 #define JUMPTABLES_REL_SEC ".rel.jumptables"
 
@@ -2278,8 +2277,7 @@ static int linker_append_elf_relos(struct bpf_linker *linker, struct src_obj *ob
 						insn->imm += sec->dst_off / sizeof(struct bpf_insn);
 					else
 						insn->imm += sec->dst_off;
-				} else if (strcmp(src_sec->sec_name, JUMPTABLES_REL_SEC) &&
-					   strcmp(src_sec->sec_name, RODATA_REL_SEC)) {
+				} else if (strcmp(src_sec->sec_name, JUMPTABLES_REL_SEC)) {
 					pr_warn("relocation against STT_SECTION in section %s is not supported!\n",
 						src_sec->sec_name);
 					return -EINVAL;
