@@ -384,8 +384,10 @@ struct reloc_desc {
 		struct {
 			int map_idx;
 			int sym_off;
-			int ext_idx;
-			int sym_size;
+			union {
+				int ext_idx;
+				int sym_size;
+			};
 		};
 	};
 };
