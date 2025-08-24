@@ -189,7 +189,7 @@ int two_switches(struct simple_ctx *ctx)
 SEC("syscall")
 int big_jump_table(struct simple_ctx *ctx __attribute__((unused)))
 {
-#if 0
+#if 1
 	const void *const jt[256] = {
 		[0 ... 255] = &&default_label,
 		[0] = &&l0,
@@ -232,7 +232,7 @@ default_label:
 SEC("syscall")
 int one_jump_two_maps(struct simple_ctx *ctx __attribute__((unused)))
 {
-#if 0
+#if 1
 	__label__ l1, l2, l3, l4;
 	void *jt1[2] = { &&l1, &&l2 };
 	void *jt2[2] = { &&l3, &&l4 };
