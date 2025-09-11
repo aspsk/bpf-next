@@ -4057,6 +4057,9 @@ static const char *disasm_kfunc_name(void *data, const struct bpf_insn *insn)
 		return "<error>";
 
 	func = btf_type_by_id(desc_btf, insn->imm);
+	if (!func)
+		return "<error>";
+
 	return btf_name_by_offset(desc_btf, func->name_off);
 }
 
@@ -20026,6 +20029,7 @@ static int do_check(struct bpf_verifier_env *env)
 
 		insn = &insns[env->insn_idx];
 		insn_aux = &env->insn_aux_data[env->insn_idx];
+		insn_aux->seen_cnt++;
 
 		if (++env->insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
 			verbose(env,
@@ -23365,10 +23369,25 @@ static int do_check_main(struct bpf_verifier_env *env)
 	return ret;
 }
 
+static void print_seen_cnt(struct bpf_verifier_env *env)
+{
+	int i;
+	int insn_cnt = env->prog->len;
+	struct bpf_insn *insns = env->prog->insnsi;
+
+	for (i = 0; i < insn_cnt; ++i) {
+		verbose(env, "%10d: ", env->insn_aux_data[i].seen_cnt);
+		verbose_insn(env, &insns[i]);
+		if (bpf_is_ldimm64(&insns[i]))
+			i++;
+	}
+}
 
 static void print_verification_stats(struct bpf_verifier_env *env)
 {
 	int i;
+
+	print_seen_cnt(env);
 
 	if (env->log.level & BPF_LOG_STATS) {
 		verbose(env, "verification time %lld usec\n",
