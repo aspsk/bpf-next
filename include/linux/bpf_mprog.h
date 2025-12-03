@@ -340,4 +340,6 @@ static inline bool bpf_mprog_supported(enum bpf_prog_type type)
 		return false;
 	}
 }
+
+struct bpf_prog *bpf_mprog_generate(struct bpf_mprog_entry *entry, s32 next_rc);
 #endif /* __BPF_MPROG_H */

@@ -2454,6 +2454,17 @@ populate_extable:
 			break;
 		}
 
+		case BPF_DIRECT_CALL: {
+			u8 *ip = image + addrs[i - 1];
+
+			func = (u8 *)(long)((u64)insn[1].imm << 32 | (u32)insn[0].imm);
+			if (emit_call(&prog, func, ip))
+				return -EINVAL;
+			insn++;
+			i++;
+			break;
+		}
+
 		case BPF_JMP | BPF_TAIL_CALL:
 			if (imm32)
 				emit_bpf_tail_call_direct(bpf_prog,

@@ -2,6 +2,7 @@
 /* Copyright (c) 2023 Isovalent */
 
 #include <linux/bpf.h>
+#include <linux/filter.h>
 #include <linux/bpf_mprog.h>
 
 static int bpf_mprog_link(struct bpf_tuple *tuple,
@@ -449,4 +450,110 @@ int bpf_mprog_query(const union bpf_attr *attr, union bpf_attr __user *uattr,
 			break;
 	}
 	return ret;
+}
+
+static void __add_prog(struct bpf_prog *wrapper_prog, struct bpf_prog *prog, bool last, s32 next_rc)
+{
+	u64 func = (u64)(long)prog->bpf_func;
+	struct bpf_insn *insn = wrapper_prog->insnsi;
+	int i = wrapper_prog->len;
+	bool first = i == 0;
+
+	/* save ctx before the first program, restore for others */
+	if (first)
+		insn[i++] = BPF_MOV64_REG(BPF_REG_6, BPF_REG_1);
+	else
+		insn[i++] = BPF_MOV64_REG(BPF_REG_1, BPF_REG_6);
+
+	insn[i++] = BPF_RAW_INSN(BPF_DIRECT_CALL, 0, 0, 0, (u32)func);
+	insn[i++] = BPF_RAW_INSN(0, 0, 0, 0, (u32)(func >> 32));
+
+	if (!last)
+		insn[i++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, next_rc, 1);
+
+	insn[i++] = BPF_EXIT_INSN();
+
+	wrapper_prog->len = i;
+}
+
+/*
+ * We have N=`total` programs prog_1, ..., prog_N.
+ * We want to construct the following program instead:
+
+   ctx = R1
+
+   call prog1
+   if r0 != NEXT exit
+
+   R1 = ctx
+   call prog2
+   if r0 != NEXT exit
+
+   ...
+
+   R1 = ctx
+   call progN
+   exit
+
+ */
+static struct bpf_prog *__bpf_mprog_generate(struct bpf_mprog_entry *entry, int total, s32 next_rc)
+{
+	struct bpf_mprog_fp *fp;
+	struct bpf_prog *prog;
+	struct bpf_prog *wrapper_prog;
+	int err;
+	int i = 0;
+
+	wrapper_prog = bpf_prog_alloc(bpf_prog_size(total * 16), 0);
+	if (!wrapper_prog)
+		return ERR_PTR(-ENOMEM);
+
+	bpf_mprog_foreach_prog(entry, fp, prog) {
+		bpf_prog_inc(prog); /* XXX is this required, and how to properly put it later? */
+		__add_prog(wrapper_prog, prog, ++i == total, next_rc);
+	}
+
+	wrapper_prog->bpf_func = NULL;
+	wrapper_prog->jited = 0;
+
+	pr_warn("%s: xxx\n", __func__);
+	err = bpf_prog_alloc_jited_linfo(wrapper_prog);
+	if (err)
+		return ERR_PTR(err);
+
+	wrapper_prog = bpf_int_jit_compile(wrapper_prog);
+	bpf_prog_jit_attempt_done(wrapper_prog);
+	if (!wrapper_prog->jited) {
+		pr_warn("%s: xxx, jited=%d\n", __func__, wrapper_prog->jited);
+		return ERR_PTR(-ENOTSUPP);
+	}
+	pr_warn("%s: xxx, jited=%d\n", __func__, wrapper_prog->jited);
+
+	/* JIT compiler couldn't process this filter, so do the eBPF translation
+	 * for the optimized interpreter.
+	 */
+	if (!wrapper_prog->jited)
+		return ERR_PTR(-EFAULT);
+
+	return wrapper_prog;
+}
+
+struct bpf_prog *bpf_mprog_generate(struct bpf_mprog_entry *entry, s32 next_rc)
+{
+	struct bpf_prog *prog;
+	int total;
+
+	rcu_read_lock();
+
+	total = bpf_mprog_total(entry);
+	if (total == 0)
+		prog = NULL;
+	else if (total == 1)
+		prog = READ_ONCE(entry->fp_items[0].prog);
+	else
+		prog = __bpf_mprog_generate(entry, total, next_rc);
+
+	rcu_read_unlock();
+
+	return prog;
 }
