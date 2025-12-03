@@ -135,6 +135,8 @@ static const char * const attach_type_name[] = {
 	[BPF_NETKIT_PEER]		= "netkit_peer",
 	[BPF_TRACE_KPROBE_SESSION]	= "trace_kprobe_session",
 	[BPF_TRACE_UPROBE_SESSION]	= "trace_uprobe_session",
+	[BPF_XDP_INGRESS]		= "xdp_ingress",
+	[BPF_XDP_EGRESS]		= "xdp_egress",
 };
 
 static const char * const link_type_name[] = {
@@ -9866,6 +9868,10 @@ static const struct bpf_sec_def section_defs[] = {
 	SEC_DEF("xdp/cpumap",		XDP, BPF_XDP_CPUMAP, SEC_ATTACHABLE),
 	SEC_DEF("xdp.frags",		XDP, BPF_XDP, SEC_XDP_FRAGS),
 	SEC_DEF("xdp",			XDP, BPF_XDP, SEC_ATTACHABLE_OPT),
+	SEC_DEF("xdp/ingress",		XDP, BPF_XDP_INGRESS, SEC_NONE),
+	SEC_DEF("xdp/egress",		XDP, BPF_XDP_EGRESS, SEC_NONE),
+	SEC_DEF("xdp.frags/ingress",	XDP, BPF_XDP_INGRESS, SEC_XDP_FRAGS),
+	SEC_DEF("xdp.frags/egress",	XDP, BPF_XDP_EGRESS, SEC_XDP_FRAGS),
 	SEC_DEF("perf_event",		PERF_EVENT, 0, SEC_NONE),
 	SEC_DEF("lwt_in",		LWT_IN, 0, SEC_NONE),
 	SEC_DEF("lwt_out",		LWT_OUT, 0, SEC_NONE),
@@ -13236,6 +13242,41 @@ bpf_program__attach_tcx(const struct bpf_program *prog, int ifindex,
 
 	/* target_fd/target_ifindex use the same field in LINK_CREATE */
 	return bpf_program_attach_fd(prog, ifindex, "tcx", &link_create_opts);
+}
+
+struct bpf_link *
+bpf_program__attach_xdp_opts(const struct bpf_program *prog, int ifindex,
+			     const struct bpf_xdp_opts *opts)
+{
+	LIBBPF_OPTS(bpf_link_create_opts, link_create_opts);
+	__u32 relative_id;
+	int relative_fd;
+
+	if (!OPTS_VALID(opts, bpf_xdp_opts))
+		return libbpf_err_ptr(-EINVAL);
+
+	relative_id = OPTS_GET(opts, relative_id, 0);
+	relative_fd = OPTS_GET(opts, relative_fd, 0);
+
+	/* validate we don't have unexpected combinations of non-zero fields */
+	if (!ifindex) {
+		pr_warn("prog '%s': target netdevice ifindex cannot be zero\n",
+			prog->name);
+		return libbpf_err_ptr(-EINVAL);
+	}
+	if (relative_fd && relative_id) {
+		pr_warn("prog '%s': relative_fd and relative_id cannot be set at the same time\n",
+			prog->name);
+		return libbpf_err_ptr(-EINVAL);
+	}
+
+	link_create_opts.xdp.expected_revision = OPTS_GET(opts, expected_revision, 0);
+	link_create_opts.xdp.relative_fd = relative_fd;
+	link_create_opts.xdp.relative_id = relative_id;
+	link_create_opts.flags = OPTS_GET(opts, flags, 0);
+
+	/* target_fd/target_ifindex use the same field in LINK_CREATE */
+	return bpf_program_attach_fd(prog, ifindex, "xdp", &link_create_opts);
 }
 
 struct bpf_link *

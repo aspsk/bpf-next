@@ -823,6 +823,22 @@ int bpf_link_create(int prog_fd, int target_fd,
 		if (!OPTS_ZEROED(opts, tcx))
 			return libbpf_err(-EINVAL);
 		break;
+	case BPF_XDP_INGRESS:
+	case BPF_XDP_EGRESS:
+		relative_fd = OPTS_GET(opts, xdp.relative_fd, 0);
+		relative_id = OPTS_GET(opts, xdp.relative_id, 0);
+		if (relative_fd && relative_id)
+			return libbpf_err(-EINVAL);
+		if (relative_id) {
+			attr.link_create.xdp.relative_id = relative_id;
+			attr.link_create.flags |= BPF_F_ID;
+		} else {
+			attr.link_create.xdp.relative_fd = relative_fd;
+		}
+		attr.link_create.xdp.expected_revision = OPTS_GET(opts, xdp.expected_revision, 0);
+		if (!OPTS_ZEROED(opts, xdp))
+			return libbpf_err(-EINVAL);
+		break;
 	case BPF_NETKIT_PRIMARY:
 	case BPF_NETKIT_PEER:
 		relative_fd = OPTS_GET(opts, netkit.relative_fd, 0);

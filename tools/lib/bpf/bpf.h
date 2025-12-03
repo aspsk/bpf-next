@@ -440,6 +440,11 @@ struct bpf_link_create_opts {
 			__u32 relative_fd;
 			__u32 relative_id;
 			__u64 expected_revision;
+		} xdp;
+		struct {
+			__u32 relative_fd;
+			__u32 relative_id;
+			__u64 expected_revision;
 		} netkit;
 		struct {
 			__u32 relative_fd;
