@@ -1,10 +1,51 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2020 Facebook */
+/* Copyright (c) 2025 Isovalent */
 #include <uapi/linux/if_link.h>
 #include <test_progs.h>
 #include "test_xdp_link.skel.h"
+// doesn't work as it also includes tc skeleton #include "tc_helpers.h" // XXX xdp
 
 #define IFINDEX_LO 1
+#define PING_CMD "ping -q -c1 -w1 127.0.0.1 > /dev/null"
+
+static inline void reset_all_seen(struct test_xdp_link *skel)
+{
+	memset(skel->bss, 0, sizeof(*skel->bss));
+}
+
+static inline __u32 ifindex_from_link_fd(int fd)
+{
+	struct bpf_link_info link_info = {};
+	__u32 link_info_len = sizeof(link_info);
+	int err;
+
+	err = bpf_link_get_info_by_fd(fd, &link_info, &link_info_len);
+	if (!ASSERT_OK(err, "id_from_link_fd"))
+		return 0;
+
+	return link_info.xdp.ifindex;
+}
+
+static inline void __assert_mprog_count(int target, int expected, int ifindex)
+{
+	__u32 count = 0, attach_flags = 0;
+	int err;
+
+	err = bpf_prog_query(ifindex, target, 0, &attach_flags, NULL, &count);
+	ASSERT_EQ(count, expected, "count");
+	ASSERT_EQ(err, 0, "prog_query");
+}
+
+static inline void assert_mprog_count(int target, int expected)
+{
+	__assert_mprog_count(target, expected, IFINDEX_LO);
+}
+
+static inline void assert_mprog_count_ifindex(int ifindex, int target, int expected)
+{
+	__assert_mprog_count(target, expected, ifindex);
+}
 
 void serial_test_xdp_link(void)
 {
@@ -149,4 +190,103 @@ void serial_test_xdp_link(void)
 cleanup:
 	test_xdp_link__destroy(skel1);
 	test_xdp_link__destroy(skel2);
+}
+
+void serial_test_xdp_mprog_basic(void)
+{
+	LIBBPF_OPTS(bpf_prog_query_opts, optq);
+	LIBBPF_OPTS(bpf_xdp_opts, optl);
+	__u32 prog_ids[2], link_ids[2];
+	__u32 pid1, pid2, lid1, lid2;
+	struct test_xdp_link *skel;
+	struct bpf_link *link;
+	int err;
+
+	skel = test_xdp_link__open_and_load();
+	if (!ASSERT_OK_PTR(skel, "skel_load"))
+		goto cleanup;
+
+	pid1 = id_from_prog_fd(bpf_program__fd(skel->progs.xdp_ingress1));
+	pid2 = id_from_prog_fd(bpf_program__fd(skel->progs.xdp_ingress2));
+
+	ASSERT_NEQ(pid1, pid2, "prog_ids_1_2");
+
+	assert_mprog_count(BPF_XDP_INGRESS, 0);
+	assert_mprog_count(BPF_XDP_EGRESS, 0);
+
+	ASSERT_EQ(skel->bss->seen_xdp_ingress1, false, "seen_xdp_ingress1");
+	ASSERT_EQ(skel->bss->seen_xdp_ingress2, false, "seen_xdp_ingress2");
+
+	link = bpf_program__attach_xdp_opts(skel->progs.xdp_ingress1, IFINDEX_LO, &optl);
+	if (!ASSERT_OK_PTR(link, "link_attach"))
+		goto cleanup;
+
+	skel->links.xdp_ingress1 = link;
+
+	lid1 = id_from_link_fd(bpf_link__fd(skel->links.xdp_ingress1));
+
+	assert_mprog_count(BPF_XDP_INGRESS, 1);
+	assert_mprog_count(BPF_XDP_EGRESS, 0);
+
+	optq.prog_ids = prog_ids;
+	optq.link_ids = link_ids;
+
+	memset(prog_ids, 0, sizeof(prog_ids));
+	memset(link_ids, 0, sizeof(link_ids));
+	optq.count = ARRAY_SIZE(prog_ids);
+
+	err = bpf_prog_query_opts(IFINDEX_LO, BPF_XDP_INGRESS, &optq);
+	if (!ASSERT_OK(err, "prog_query"))
+		goto cleanup;
+
+	ASSERT_EQ(optq.count, 1, "count");
+	ASSERT_EQ(optq.revision, 2, "revision");
+	ASSERT_EQ(optq.prog_ids[0], pid1, "prog_ids[0]");
+	ASSERT_EQ(optq.link_ids[0], lid1, "link_ids[0]");
+	ASSERT_EQ(optq.prog_ids[1], 0, "prog_ids[1]");
+	ASSERT_EQ(optq.link_ids[1], 0, "link_ids[1]");
+
+	reset_all_seen(skel);
+	ASSERT_OK(system(PING_CMD), PING_CMD);
+	ASSERT_EQ(skel->bss->seen_xdp_ingress1, true, "seen_xdp_ingress1");
+	ASSERT_EQ(skel->bss->seen_xdp_ingress2, false, "seen_xdp_ingress2");
+
+	link = bpf_program__attach_xdp_opts(skel->progs.xdp_ingress2, IFINDEX_LO, &optl);
+	if (!ASSERT_OK_PTR(link, "link_attach"))
+		goto cleanup;
+
+	skel->links.xdp_ingress2 = link;
+
+	lid2 = id_from_link_fd(bpf_link__fd(skel->links.xdp_ingress2));
+	ASSERT_NEQ(lid1, lid2, "link_ids_1_2");
+
+	assert_mprog_count(BPF_XDP_INGRESS, 2);
+	assert_mprog_count(BPF_XDP_EGRESS, 0);
+
+	memset(prog_ids, 0, sizeof(prog_ids));
+	memset(link_ids, 0, sizeof(link_ids));
+	optq.count = ARRAY_SIZE(prog_ids);
+
+	err = bpf_prog_query_opts(IFINDEX_LO, BPF_XDP_INGRESS, &optq);
+	if (!ASSERT_OK(err, "prog_query"))
+		goto cleanup;
+
+	ASSERT_EQ(optq.count, 2, "count");
+	ASSERT_EQ(optq.revision, 3, "revision");
+	ASSERT_EQ(optq.prog_ids[0], pid1, "prog_ids[0]");
+	ASSERT_EQ(optq.link_ids[0], lid1, "link_ids[0]");
+	ASSERT_EQ(optq.prog_ids[1], pid2, "prog_ids[1]");
+	ASSERT_EQ(optq.link_ids[1], lid2, "link_ids[1]");
+
+	reset_all_seen(skel);
+	ASSERT_OK(system(PING_CMD), PING_CMD);
+
+	ASSERT_EQ(skel->bss->seen_xdp_ingress1, true, "seen_xdp_ingress1");
+	ASSERT_EQ(skel->bss->seen_xdp_ingress2, true, "seen_xdp_ingress2");
+
+cleanup:
+	test_xdp_link__destroy(skel);
+
+	assert_mprog_count(BPF_TCX_INGRESS, 0);
+	assert_mprog_count(BPF_TCX_EGRESS, 0);
 }
