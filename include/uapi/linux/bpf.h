@@ -1134,6 +1134,8 @@ enum bpf_attach_type {
 	BPF_NETKIT_PEER,
 	BPF_TRACE_KPROBE_SESSION,
 	BPF_TRACE_UPROBE_SESSION,
+	BPF_XDP_INGRESS,
+	BPF_XDP_EGRESS,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -1816,6 +1818,13 @@ union bpf_attr {
 				};
 				__u64		expected_revision;
 			} tcx;
+			struct {
+				union {
+					__u32	relative_fd;
+					__u32	relative_id;
+				};
+				__u64		expected_revision;
+			} xdp;
 			struct {
 				__aligned_u64	path;
 				__aligned_u64	offsets;
@@ -6519,6 +6528,7 @@ enum xdp_action {
 	XDP_ABORTED = 0,
 	XDP_DROP,
 	XDP_PASS,
+	XDP_NEXT = XDP_PASS,
 	XDP_TX,
 	XDP_REDIRECT,
 };
@@ -6752,6 +6762,7 @@ struct bpf_link_info {
 		} netns;
 		struct {
 			__u32 ifindex;
+			__u32 attach_type;
 		} xdp;
 		struct {
 			__u32 map_id;

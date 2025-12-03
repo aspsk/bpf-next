@@ -2559,8 +2559,16 @@ struct net_device {
 
 	struct hwtstamp_provider __rcu	*hwprov;
 
+	// XXX move them to fast access, also there's `xdp_state`
+#ifdef CONFIG_NET_XGRESS
+	struct bpf_mprog_entry __rcu *xdp_ingress;
+	struct bpf_mprog_entry __rcu *xdp_egress;
+#endif
+
+
 	u8			priv[] ____cacheline_aligned
 				       __counted_by(priv_len);
+
 } ____cacheline_aligned;
 #define to_net_dev(d) container_of(d, struct net_device, dev)
 
@@ -4262,6 +4270,7 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 				    struct netdev_queue *txq, int *ret);
 
 int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog);
+int xdp_prog_query(const union bpf_attr *attr, union bpf_attr __user *uattr);
 u8 dev_xdp_prog_count(struct net_device *dev);
 int netif_xdp_propagate(struct net_device *dev, struct netdev_bpf *bpf);
 int dev_xdp_propagate(struct net_device *dev, struct netdev_bpf *bpf);

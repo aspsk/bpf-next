@@ -4434,6 +4434,12 @@ static int bpf_prog_attach_check_attach_type(const struct bpf_prog *prog,
 		    attach_type != BPF_NETKIT_PEER)
 			return -EINVAL;
 		return 0;
+	case BPF_PROG_TYPE_XDP:
+		if (attach_type != BPF_XDP &&
+		    attach_type != BPF_XDP_INGRESS &&
+		    attach_type != BPF_XDP_EGRESS)
+			return -EINVAL;
+		return 0;
 	default:
 		ptype = attach_type_to_prog_type(attach_type);
 		if (ptype == BPF_PROG_TYPE_UNSPEC || ptype != prog->type)
@@ -4667,6 +4673,9 @@ static int bpf_prog_query(const union bpf_attr *attr,
 	case BPF_TCX_INGRESS:
 	case BPF_TCX_EGRESS:
 		return tcx_prog_query(attr, uattr);
+	case BPF_XDP_INGRESS:
+	case BPF_XDP_EGRESS:
+		return xdp_prog_query(attr, uattr);
 	case BPF_NETKIT_PRIMARY:
 	case BPF_NETKIT_PEER:
 		return netkit_prog_query(attr, uattr);

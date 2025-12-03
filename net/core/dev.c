@@ -10255,11 +10255,143 @@ static void dev_xdp_uninstall(struct net_device *dev)
 	}
 }
 
+struct xdp_entry {
+	struct bpf_mprog_bundle bundle;
+	struct rcu_head rcu;
+};
+
+static inline struct xdp_entry *xdp_entry(struct bpf_mprog_entry *entry)
+{
+	struct bpf_mprog_bundle *bundle = entry->parent;
+
+	return container_of(bundle, struct xdp_entry, bundle);
+}
+
+static inline struct bpf_mprog_entry *
+xdp_entry_fetch(struct net_device *dev, bool ingress)
+{
+	ASSERT_RTNL();
+
+	if (ingress)
+		return rcu_dereference_rtnl(dev->xdp_ingress);
+	else
+		return rcu_dereference_rtnl(dev->xdp_egress);
+}
+
+
+static inline void xdp_entry_sync(void)
+{
+	/* bpf_mprog_entry got a/b swapped, therefore ensure that
+	 * there are no inflight users on the old one anymore.
+	 */
+	synchronize_rcu();
+}
+
+static inline void
+xdp_entry_update(struct net_device *dev, struct bpf_mprog_entry *entry, bool ingress)
+{
+	ASSERT_RTNL();
+
+	if (ingress)
+		rcu_assign_pointer(dev->xdp_ingress, entry);
+	else
+		rcu_assign_pointer(dev->xdp_egress, entry);
+}
+
+static inline struct bpf_mprog_entry *xdp_entry_create_noprof(void)
+{
+	struct xdp_entry *xdp = kzalloc_noprof(sizeof(*xdp), GFP_KERNEL);
+
+	if (xdp) {
+		bpf_mprog_bundle_init(&xdp->bundle);
+		return &xdp->bundle.a;
+	}
+	return NULL;
+}
+#define xdp_entry_create(...)	alloc_hooks(xdp_entry_create_noprof(__VA_ARGS__))
+
+static inline void xdp_entry_free(struct bpf_mprog_entry *entry)
+{
+	kfree_rcu(xdp_entry(entry), rcu);
+}
+
+static inline struct bpf_mprog_entry *
+xdp_entry_fetch_or_create(struct net_device *dev, bool ingress, bool *created)
+{
+	struct bpf_mprog_entry *entry = xdp_entry_fetch(dev, ingress);
+
+	*created = false;
+	if (!entry) {
+		entry = xdp_entry_create();
+		if (!entry)
+			return NULL;
+		*created = true;
+	}
+	return entry;
+}
+
+static int dev_xdp_attach_mprog(struct net_device *dev,
+				struct netlink_ext_ack *extack,
+				struct bpf_xdp_link *link,
+				u32 flags,
+				u32 id_or_fd,
+				u64 revision)
+{
+	bool created;
+	bool ingress = link->link.attach_type == BPF_XDP_INGRESS;
+	struct bpf_mprog_entry *entry, *entry_new;
+	int ret;
+	enum bpf_xdp_mode mode;
+	struct bpf_prog *new_prog;
+	bpf_op_t bpf_op;
+
+	ASSERT_RTNL();
+	entry = xdp_entry_fetch_or_create(dev, ingress, &created);
+	if (!entry)
+		return -ENOMEM;
+
+	ret = bpf_mprog_attach(entry, &entry_new, link->link.prog, &link->link, NULL, flags, id_or_fd, revision);
+	if (!ret) {
+		if (entry != entry_new) {
+			xdp_entry_update(dev, entry_new, ingress);
+			xdp_entry_sync();
+			// xdp_skeys_inc(ingress); XXX
+		}
+		bpf_mprog_commit(entry);
+	} else if (created) {
+		xdp_entry_free(entry);
+	}
+
+	mode = XDP_MODE_SKB; // dev_xdp_mode(dev, flags); // XXX
+	bpf_op = dev_xdp_bpf_op(dev, mode);
+	if (!bpf_op) {
+		NL_SET_ERR_MSG(extack, "Underlying driver does not support XDP in native mode");
+		return -EOPNOTSUPP;
+	}
+
+	// XXX
+	if (entry != entry_new)
+		new_prog = bpf_mprog_generate(entry_new, XDP_NEXT);
+	else
+		new_prog = bpf_mprog_generate(entry, XDP_NEXT);
+
+	if (!new_prog) {
+		NL_SET_ERR_MSG(extack, "Couldn't generate a new prog");
+		return -EFAULT;
+	}
+
+	// XXX should I inc the prog?
+
+	return dev_xdp_install(dev, mode, bpf_op, extack, flags, new_prog);
+}
+
 static int dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack,
 			  struct bpf_xdp_link *link, struct bpf_prog *new_prog,
-			  struct bpf_prog *old_prog, u32 flags)
+			  struct bpf_prog *old_prog, u32 flags,
+			  u32 id_or_fd, u64 revision)
 {
 	unsigned int num_modes = hweight32(flags & XDP_FLAGS_MODES);
+	bool shiny_new_api = (link->link.attach_type == BPF_XDP_INGRESS);
 	struct bpf_prog *cur_prog;
 	struct net_device *upper;
 	struct list_head *iter;
@@ -10269,21 +10401,25 @@ static int dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack
 
 	ASSERT_RTNL();
 
+	/* XXX ignore spaghetti below for now */
+	if (shiny_new_api)
+		return dev_xdp_attach_mprog(dev, extack, link, flags, id_or_fd, revision);
+
 	/* either link or prog attachment, never both */
 	if (link && (new_prog || old_prog))
 		return -EINVAL;
 	/* link supports only XDP mode flags */
-	if (link && (flags & ~XDP_FLAGS_MODES)) {
+	if (!shiny_new_api && link && (flags & ~XDP_FLAGS_MODES)) { // XXX BPF_F_BEFORE, etc. conflicts with these values, need to move or hardcode DRV or add more (in my case I need to force SKB for testing and DRV for prod :(
 		NL_SET_ERR_MSG(extack, "Invalid XDP flags for BPF link attachment");
 		return -EINVAL;
 	}
 	/* just one XDP mode bit should be set, zero defaults to drv/skb mode */
-	if (num_modes > 1) {
+	if (!shiny_new_api && num_modes > 1) {
 		NL_SET_ERR_MSG(extack, "Only one XDP mode flag can be set");
 		return -EINVAL;
 	}
 	/* avoid ambiguity if offload + drv/skb mode progs are both loaded */
-	if (!num_modes && dev_xdp_prog_count(dev) > 1) {
+	if (!num_modes && dev_xdp_prog_count(dev) > 1) { // check
 		NL_SET_ERR_MSG(extack,
 			       "More than one program loaded, unset mode is ambiguous");
 		return -EINVAL;
@@ -10296,7 +10432,7 @@ static int dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack
 
 	mode = dev_xdp_mode(dev, flags);
 	/* can't replace attached link */
-	if (dev_xdp_link(dev, mode)) {
+	if (dev_xdp_link(dev, mode)) { // XXX new mode don't care about this
 		NL_SET_ERR_MSG(extack, "Can't replace active BPF XDP link");
 		return -EBUSY;
 	}
@@ -10384,9 +10520,11 @@ static int dev_xdp_attach(struct net_device *dev, struct netlink_ext_ack *extack
 
 static int dev_xdp_attach_link(struct net_device *dev,
 			       struct netlink_ext_ack *extack,
-			       struct bpf_xdp_link *link)
+			       struct bpf_xdp_link *link,
+			       u32 id_or_fd,
+			       u64 revision)
 {
-	return dev_xdp_attach(dev, extack, link, NULL, NULL, link->flags);
+	return dev_xdp_attach(dev, extack, link, NULL, NULL, link->flags, id_or_fd, revision);
 }
 
 static int dev_xdp_detach_link(struct net_device *dev,
@@ -10408,16 +10546,60 @@ static int dev_xdp_detach_link(struct net_device *dev,
 	return 0;
 }
 
+static inline bool xdp_entry_is_active(struct bpf_mprog_entry *entry)
+{
+	ASSERT_RTNL();
+
+	return bpf_mprog_total(entry); // XXX || tcx_entry(entry)->miniq_active;
+}
+
+static int bpf_xdp_link_release_mprog(struct bpf_link *link)
+{
+	struct bpf_xdp_link *xdp_link = container_of(link, struct bpf_xdp_link, link);
+	bool ingress = link->attach_type == BPF_XDP_INGRESS;
+	struct bpf_mprog_entry *entry, *entry_new;
+	struct net_device *dev;
+	int ret = 0;
+
+	dev = xdp_link->dev;
+	if (!dev)
+		return 0;
+
+	entry = xdp_entry_fetch(dev, ingress);
+	if (!entry)
+		return -ENOENT;
+
+	ret = bpf_mprog_detach(entry, &entry_new, link->prog, link, 0, 0, 0);
+	if (ret)
+		return ret;
+
+	if (!xdp_entry_is_active(entry_new))
+		entry_new = NULL;
+	xdp_entry_update(dev, entry_new, ingress);
+	xdp_entry_sync();
+	//xdp_skeys_dec(ingress); XXX
+	bpf_mprog_commit(entry);
+	if (!entry_new)
+		xdp_entry_free(entry);
+	xdp_link->dev = NULL;
+
+	return 0;
+}
+
 static void bpf_xdp_link_release(struct bpf_link *link)
 {
 	struct bpf_xdp_link *xdp_link = container_of(link, struct bpf_xdp_link, link);
 
 	rtnl_lock();
 
+	if (link->attach_type == BPF_XDP_INGRESS ||
+	    link->attach_type == BPF_XDP_EGRESS) {
+		WARN_ON_ONCE(bpf_xdp_link_release_mprog(link));
+	}
 	/* if racing with net_device's tear down, xdp_link->dev might be
 	 * already NULL, in which case link was already auto-detached
 	 */
-	if (xdp_link->dev) {
+	else if (xdp_link->dev) {
 		netdev_lock_ops(xdp_link->dev);
 		WARN_ON(dev_xdp_detach_link(xdp_link->dev, NULL, xdp_link));
 		netdev_unlock_ops(xdp_link->dev);
@@ -10452,6 +10634,11 @@ static void bpf_xdp_link_show_fdinfo(const struct bpf_link *link,
 	rtnl_unlock();
 
 	seq_printf(seq, "ifindex:\t%u\n", ifindex);
+
+	if (link->attach_type == BPF_XDP_INGRESS || link->attach_type == BPF_XDP_EGRESS)
+	seq_printf(seq, "attach_type:\t%u (%s)\n",
+		   link->attach_type,
+		   link->attach_type == BPF_XDP_INGRESS ? "ingress" : "egress");
 }
 
 static int bpf_xdp_link_fill_link_info(const struct bpf_link *link,
@@ -10466,6 +10653,7 @@ static int bpf_xdp_link_fill_link_info(const struct bpf_link *link,
 	rtnl_unlock();
 
 	info->xdp.ifindex = ifindex;
+	info->xdp.attach_type = link->attach_type;
 	return 0;
 }
 
@@ -10476,6 +10664,8 @@ static int bpf_xdp_link_update(struct bpf_link *link, struct bpf_prog *new_prog,
 	enum bpf_xdp_mode mode;
 	bpf_op_t bpf_op;
 	int err = 0;
+
+	// XXX implement me for mprog please
 
 	rtnl_lock();
 
@@ -10528,6 +10718,47 @@ static const struct bpf_link_ops bpf_xdp_link_lops = {
 	.update_prog = bpf_xdp_link_update,
 };
 
+/* XXX XDP mprog stuff */
+
+static const char *attype_str(u32 attach_type)
+{
+	static char __bu[16];
+
+	switch (attach_type) {
+	case BPF_XDP_INGRESS:
+		return "BPF_XDP_INGRESS";
+	case BPF_XDP_EGRESS:
+		return "BPF_XDP_EGRESS";
+	default:
+		snprintf(__bu, sizeof(__bu), "%u", attach_type);
+		return __bu;
+	}
+}
+
+// XXX config options oder?
+int xdp_prog_query(const union bpf_attr *attr, union bpf_attr __user *uattr)
+{
+	bool ingress = attr->query.attach_type == BPF_XDP_INGRESS;
+	struct net *net = current->nsproxy->net_ns;
+	struct net_device *dev;
+	int ret;
+
+	pr_warn("%s: attach_type=%s\n", __func__, attype_str(attr->query.attach_type));
+
+	rtnl_lock();
+	dev = __dev_get_by_index(net, attr->query.target_ifindex);
+	if (!dev) {
+		ret = -ENODEV;
+		goto out;
+	}
+	ret = bpf_mprog_query(attr, uattr, xdp_entry_fetch(dev, ingress));
+out:
+	rtnl_unlock();
+	return ret;
+}
+
+/* bpf mprog stuff */
+
 int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 {
 	struct net *net = current->nsproxy->net_ns;
@@ -10537,11 +10768,13 @@ int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 	struct net_device *dev;
 	int err, fd;
 
+	pr_warn("%s: attach_type=%s\n", __func__, attype_str(attr->link_create.attach_type));
+
 	rtnl_lock();
 	dev = dev_get_by_index(net, attr->link_create.target_ifindex);
 	if (!dev) {
 		rtnl_unlock();
-		return -EINVAL;
+		return -EINVAL; // XXX: enodev?
 	}
 
 	link = kzalloc(sizeof(*link), GFP_USER);
@@ -10562,7 +10795,8 @@ int bpf_xdp_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 	}
 
 	netdev_lock_ops(dev);
-	err = dev_xdp_attach_link(dev, &extack, link);
+	err = dev_xdp_attach_link(dev, &extack, link,
+			attr->link_create.xdp.relative_fd, attr->link_create.xdp.expected_revision); // needa pass more options for ingress/egress or put them inside link struct?
 	netdev_unlock_ops(dev);
 	rtnl_unlock();
 
@@ -10622,7 +10856,7 @@ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
 		}
 	}
 
-	err = dev_xdp_attach(dev, extack, NULL, new_prog, old_prog, flags);
+	err = dev_xdp_attach(dev, extack, NULL, new_prog, old_prog, flags, 0, 0);
 
 err_out:
 	if (err && new_prog)
