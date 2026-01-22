@@ -6186,6 +6186,34 @@ put_prog:
 	return ret;
 }
 
+#define BPF_STATIC_KEY_UPDATE_LAST_FIELD static_key.on
+
+static int bpf_static_key_update(const union bpf_attr *attr)
+{
+	bool on = attr->static_key.on & 1;
+	struct bpf_map *map;
+	int ret;
+
+	if (CHECK_ATTR(BPF_STATIC_KEY_UPDATE))
+		return -EINVAL;
+
+	if (attr->static_key.on & ~1)
+		return -EINVAL;
+
+	map = bpf_map_get(attr->static_key.map_fd);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	// XXX: is the easier way to get the program here? Still need to draw all the possible arrows
+
+	mutex_lock(&map->freeze_mutex); /* XXX rename this mutex */
+	ret = __bpf_static_key_update(map, on);
+	mutex_unlock(&map->freeze_mutex); /* XXX rename this mutex */
+
+	bpf_map_put(map);
+	return ret;
+}
+
 static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 {
 	union bpf_attr attr;
@@ -6327,6 +6355,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_PROG_ASSOC_STRUCT_OPS:
 		err = prog_assoc_struct_ops(&attr);
+		break;
+	case BPF_STATIC_KEY_UPDATE:
+		err = bpf_static_key_update(&attr);
 		break;
 	default:
 		err = -EINVAL;

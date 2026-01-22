@@ -3976,8 +3976,18 @@ static inline bool is_nop_or_goto(const struct bpf_insn *insn)
 	return is_static_branch(insn) && (insn->src_reg & BPF_STATIC_BRANCH_NOP);
 }
 
+struct bpf_insn_ptr {
+	struct bpf_insn_array_value user;
+	u32 jitted_jump_offset;
+	u32 jitted_len:3;
+	u32 inverse_ja_or_nop:1;
+};
+
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image);
+
+int __bpf_static_key_update(struct bpf_map *map, bool on);
+int bpf_arch_poke_static_branch(struct bpf_insn_ptr *ptr, bool on);
 #else
 static inline void
 bpf_prog_update_insn_ptrs(struct bpf_prog *prog, u32 *offsets, void *image)
