@@ -472,6 +472,54 @@ void gotox(void)
 
 #endif /* __TARGET_ARCH_x86 || __TARGET_ARCH_arm64 */
 
+#ifndef XXXYYY
+
+SEC("socket")
+__log_level(2)
+__msg("0: .......... (b7) r1 = 1")
+__msg("1: .1........ (b7) r2 = 2")
+__msg("2: .12....... (06) gotol_or_nop pc+2")
+__msg("3: .1........ (bf) r0 = r1")
+__msg("4: 0......... (06) gotol pc+1")
+__msg("5: ..2....... (bf) r0 = r2")
+__msg("6: 0......... (95) exit")
+__naked void gotol_or_nop(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"r2 = 2;"
+		"gotol_or_nop +2;"
+		"r0 = r1;"
+		"gotol +1;"
+		"r0 = r2;"
+		"exit;"
+		::: __clobber_all);
+}
+
+SEC("socket")
+__log_level(2)
+__msg("0: .......... (b7) r1 = 1")
+__msg("1: .1........ (b7) r2 = 2")
+__msg("2: .12....... (06) nop_or_gotol pc+2")
+__msg("3: .1........ (bf) r0 = r1")
+__msg("4: 0......... (06) gotol pc+1")
+__msg("5: ..2....... (bf) r0 = r2")
+__msg("6: 0......... (95) exit")
+__naked void nop_or_gotol(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"r2 = 2;"
+		"nop_or_gotol +2;"
+		"r0 = r1;"
+		"gotol +1;"
+		"r0 = r2;"
+		"exit;"
+		::: __clobber_all);
+}
+
+#endif
+
 /* to retain debug info for BTF generation */
 void kfunc_root(void)
 {
