@@ -443,6 +443,8 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
 )
 #endif /* bpf_repeat */
 
+#define BPF_F_STATIC_KEY 13
+
 #define DEFINE_STATIC_KEY(NAME)									\
 	struct {										\
 		__uint(type, BPF_MAP_TYPE_INSN_ARRAY);						\

@@ -5932,7 +5932,7 @@ retry:
 					zfree(&obj->arena_data);
 				}
 			} else if (map->def.type == BPF_MAP_TYPE_INSN_ARRAY) {
-				if (map->map_extra & BPF_F_STATIC_KEY) {
+				if (map->map_extra & 13) {
 					err = bpf_object__init_static_key_map(obj, map);
 					if (err < 0)
 						goto err_out;

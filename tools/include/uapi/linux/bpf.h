@@ -7727,4 +7727,7 @@ struct bpf_insn_array_value {
 	__u32 :32;
 };
 
+// XXX
+#define BPF_F_STATIC_KEY 13
+
 #endif /* _UAPI__LINUX_BPF_H__ */
