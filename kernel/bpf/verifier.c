@@ -7757,6 +7757,7 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 					return -EACCES;
 				}
 				copy_register_state(&regs[value_regno], reg);
+				regs[value_regno].off = off;
 				regs[value_regno].type = PTR_TO_INSN;
 			} else {
 				mark_reg_unknown(env, regs, value_regno);
