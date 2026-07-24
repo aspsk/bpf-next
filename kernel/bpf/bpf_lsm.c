@@ -9,6 +9,7 @@
 #include <linux/btf.h>
 #include <linux/binfmts.h>
 #include <linux/lsm_hooks.h>
+#include <linux/seq_file.h>
 #include <linux/bpf_lsm.h>
 #include <linux/kallsyms.h>
 #include <net/bpf_sk_storage.h>
@@ -547,3 +548,121 @@ int bpf_lsm_get_retval_range(const struct bpf_prog *prog,
 	}
 	return 0;
 }
+
+enum bpf_lsm_info_flags {
+	BPF_LSM_INFO_F_DISABLED  = BIT(0),
+	BPF_LSM_INFO_F_BPF_ONLY  = BIT(1),
+	BPF_LSM_INFO_F_SLEEPABLE = BIT(2),
+};
+
+struct bpf_lsm_info {
+	u32 btf_id;
+	u32 flags;
+};
+
+static void bpf_lsm_fill_info(struct bpf_lsm_info *info, u32 btf_id)
+{
+	bool bpf_only = !!bpf_lsm_btf_id_to_key(btf_id); /* list, not set */
+	bool disabled = btf_id_set_contains(&bpf_lsm_disabled_hooks, btf_id);
+	bool sleepable = btf_id_set_contains(&sleepable_lsm_hooks, btf_id);
+
+	info->btf_id = btf_id;
+	info->flags = 0;
+
+	if (disabled)
+		info->flags |= BPF_LSM_INFO_F_DISABLED;
+	if (bpf_only)
+		info->flags |= BPF_LSM_INFO_F_BPF_ONLY;
+	if (sleepable)
+		info->flags |= BPF_LSM_INFO_F_SLEEPABLE;
+}
+
+static void *bpf_lsm_get_info(struct seq_file *seq, loff_t pos)
+{
+	struct bpf_lsm_info *info = seq->private;
+
+	if (pos < 0 || (u64)pos >= bpf_lsm_hooks.cnt)
+		return NULL;
+
+	bpf_lsm_fill_info(info, bpf_lsm_hooks.ids[pos]);
+
+	return info;
+}
+
+static void *bpf_lsm_seq_start(struct seq_file *seq, loff_t *pos)
+{
+	return bpf_lsm_get_info(seq, *pos);
+}
+
+static void *bpf_lsm_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	return bpf_lsm_get_info(seq, ++*pos);
+}
+
+struct bpf_iter__bpf_lsm {
+	__bpf_md_ptr(struct bpf_iter_meta *, meta);
+	__bpf_md_ptr(struct bpf_lsm_info *, lsm_info);
+};
+
+DEFINE_BPF_ITER_FUNC(bpf_lsm, struct bpf_iter_meta *meta, struct bpf_lsm_info *lsm_info)
+
+static int __bpf_lsm_seq_show(struct seq_file *seq, void *v, bool in_stop)
+{
+	struct bpf_iter__bpf_lsm ctx;
+	struct bpf_iter_meta meta;
+	struct bpf_prog *prog;
+	int ret = 0;
+
+	ctx.meta = &meta;
+	ctx.lsm_info = v;
+	meta.seq = seq;
+	prog = bpf_iter_get_info(&meta, in_stop);
+	if (prog)
+		ret = bpf_iter_run_prog(prog, &ctx);
+
+	return ret;
+}
+
+static int bpf_lsm_seq_show(struct seq_file *seq, void *v)
+{
+	return __bpf_lsm_seq_show(seq, v, false);
+}
+
+static void bpf_lsm_seq_stop(struct seq_file *seq, void *v)
+{
+	if (!v)
+		(void) __bpf_lsm_seq_show(seq, NULL, true);
+}
+
+static const struct seq_operations bpf_lsm_seq_ops = {
+	.start	= bpf_lsm_seq_start,
+	.next	= bpf_lsm_seq_next,
+	.stop	= bpf_lsm_seq_stop,
+	.show	= bpf_lsm_seq_show,
+};
+
+BTF_ID_LIST_SINGLE(btf_bpf_lsm_info_id, struct, bpf_lsm_info)
+
+static const struct bpf_iter_seq_info bpf_lsm_seq_info = {
+	.seq_ops		= &bpf_lsm_seq_ops,
+	.init_seq_private	= NULL,
+	.fini_seq_private	= NULL,
+	.seq_priv_size		= sizeof(struct bpf_lsm_info),
+};
+
+static struct bpf_iter_reg bpf_lsm_reg_info = {
+	.target			= "bpf_lsm",
+	.ctx_arg_info_size	= 1,
+	.ctx_arg_info		= {
+		{ offsetof(struct bpf_iter__bpf_lsm, lsm_info), PTR_TO_BTF_ID_OR_NULL },
+	},
+	.seq_info		= &bpf_lsm_seq_info,
+};
+
+static int __init bpf_lsm_iter_init(void)
+{
+	bpf_lsm_reg_info.ctx_arg_info[0].btf_id = *btf_bpf_lsm_info_id;
+	return bpf_iter_reg_target(&bpf_lsm_reg_info);
+}
+
+late_initcall(bpf_lsm_iter_init);
