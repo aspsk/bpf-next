@@ -981,9 +981,12 @@ static int __bpf_trampoline_link_prog(struct bpf_tramp_node *node,
 	err = bpf_trampoline_add_prog(tr, node, cnt);
 	if (err)
 		return err;
+	bpf_lsm_hook_inc(node->link->prog);
 	err = bpf_trampoline_update(tr, true /* lock_direct_mutex */, ops, data);
-	if (err)
+	if (err) {
+		bpf_lsm_hook_dec(node->link->prog);
 		bpf_trampoline_remove_prog(tr, node);
+	}
 	return err;
 }
 
@@ -1020,7 +1023,10 @@ static int __bpf_trampoline_unlink_prog(struct bpf_tramp_node *node,
 		return err;
 	}
 	bpf_trampoline_remove_prog(tr, node);
-	return bpf_trampoline_update(tr, true /* lock_direct_mutex */, ops, data);
+	err = bpf_trampoline_update(tr, true /* lock_direct_mutex */, ops, data);
+	if (!err)
+		bpf_lsm_hook_dec(node->link->prog);
+	return err;
 }
 
 /* bpf_trampoline_unlink_prog() should never fail. */

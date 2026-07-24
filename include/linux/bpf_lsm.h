@@ -16,9 +16,20 @@
 
 extern bool bpf_lsm_initialized __ro_after_init;
 
+#define BPF_HOOK_KEY_NAME(NAME) __bpf_lsm_##NAME##_key
+
+#define LSM_HOOK(RET, DEFAULT, NAME, ...) \
+	DECLARE_STATIC_KEY_FALSE(BPF_HOOK_KEY_NAME(NAME));
+#include <linux/bpf_lsm_hook_defs.h>
+#undef LSM_HOOK
+
+#define bpf_lsm_hook(NAME, ...)	\
+	(static_branch_unlikely(&BPF_HOOK_KEY_NAME(NAME)) ? bpf_lsm_##NAME(__VA_ARGS__) : 0)
+
 #define LSM_HOOK(RET, DEFAULT, NAME, ...) \
 	RET bpf_lsm_##NAME(__VA_ARGS__);
 #include <linux/lsm_hook_defs.h>
+#include <linux/bpf_lsm_hook_defs.h>
 #undef LSM_HOOK
 
 struct bpf_storage_blob {
@@ -29,6 +40,8 @@ extern struct lsm_blob_sizes bpf_lsm_blob_sizes;
 
 int bpf_lsm_verify_prog(struct bpf_verifier_log *vlog,
 			const struct bpf_prog *prog);
+void bpf_lsm_hook_inc(const struct bpf_prog *prog);
+void bpf_lsm_hook_dec(const struct bpf_prog *prog);
 
 bool bpf_lsm_is_sleepable_hook(u32 btf_id);
 bool bpf_lsm_is_trusted(const struct bpf_prog *prog);
@@ -76,6 +89,14 @@ static inline int bpf_lsm_verify_prog(struct bpf_verifier_log *vlog,
 	return -EOPNOTSUPP;
 }
 
+static inline void bpf_lsm_hook_inc(const struct bpf_prog *prog)
+{
+}
+
+static inline void bpf_lsm_hook_dec(const struct bpf_prog *prog)
+{
+}
+
 static inline struct bpf_storage_blob *bpf_inode(
 	const struct inode *inode)
 {
@@ -114,6 +135,9 @@ static inline bool bpf_lsm_hook_returns_errno(u32 btf_id)
 {
 	return true;
 }
+
+#define bpf_lsm_hook(NAME, ...) 0
+
 #endif /* CONFIG_BPF_LSM */
 
 #endif /* _LINUX_BPF_LSM_H */

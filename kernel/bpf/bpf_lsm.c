@@ -16,6 +16,7 @@
 #include <linux/btf_ids.h>
 #include <linux/ima.h>
 #include <linux/bpf-cgroup.h>
+#include <linux/sort.h>
 
 /* For every LSM hook that allows attachment of BPF programs, declare a nop
  * function where a BPF program can be attached. Notably, we qualify each with
@@ -28,13 +29,89 @@ __weak noinline RET bpf_lsm_##NAME(__VA_ARGS__)	\
 }
 
 #include <linux/lsm_hook_defs.h>
+#include <linux/bpf_lsm_hook_defs.h>
 #undef LSM_HOOK
 
 #define LSM_HOOK(RET, DEFAULT, NAME, ...) BTF_ID(func, bpf_lsm_##NAME)
 BTF_SET_START(bpf_lsm_hooks)
 #include <linux/lsm_hook_defs.h>
+#include <linux/bpf_lsm_hook_defs.h>
 #undef LSM_HOOK
 BTF_SET_END(bpf_lsm_hooks)
+
+BTF_ID_LIST(bpf_lsm_bpf_only_hooks)
+#define LSM_HOOK(RET, DEFAULT, NAME, ...) BTF_ID(func, bpf_lsm_##NAME)
+#include <linux/bpf_lsm_hook_defs.h>
+#undef LSM_HOOK
+
+#define LSM_HOOK(RET, DEFAULT, NAME, ...) \
+	DEFINE_STATIC_KEY_FALSE(BPF_HOOK_KEY_NAME(NAME));
+#include <linux/bpf_lsm_hook_defs.h>
+#undef LSM_HOOK
+
+struct bpf_lsm_hook_key {
+	u32 btf_id;
+	struct static_key_false *key;
+};
+
+static struct bpf_lsm_hook_key hook_keys[] __ro_after_init = {
+#define LSM_HOOK(RET, DEFAULT, NAME, ...) { .key = &BPF_HOOK_KEY_NAME(NAME) },
+#include <linux/bpf_lsm_hook_defs.h>
+#undef LSM_HOOK
+};
+
+static int __init bpf_lsm_hook_keys_init(void)
+{
+	int i, n = ARRAY_SIZE(hook_keys);
+
+	for (i = 0; i < n; i++)
+		hook_keys[i].btf_id = bpf_lsm_bpf_only_hooks[i];
+
+	sort(hook_keys, n, sizeof(hook_keys[0]), btf_id_cmp_func, NULL);
+
+	return 0;
+}
+core_initcall(bpf_lsm_hook_keys_init);
+
+static struct static_key_false *bpf_lsm_btf_id_to_key(u32 btf_id)
+{
+	const struct bpf_lsm_hook_key *hook;
+
+	if (!btf_id)
+		return NULL;
+
+	hook = bsearch(&btf_id, hook_keys, ARRAY_SIZE(hook_keys),
+		       sizeof(hook_keys[0]), btf_id_cmp_func);
+	if (hook)
+		return hook->key;
+
+	return NULL;
+}
+
+static struct static_key_false *bpf_lsm_prog_to_key(const struct bpf_prog *prog)
+{
+	if (prog->type != BPF_PROG_TYPE_LSM ||
+	    prog->expected_attach_type != BPF_LSM_MAC)
+		return NULL;
+
+	return bpf_lsm_btf_id_to_key(prog->aux->attach_btf_id);
+}
+
+void bpf_lsm_hook_inc(const struct bpf_prog *prog)
+{
+	struct static_key_false *key = bpf_lsm_prog_to_key(prog);
+
+	if (key)
+		static_branch_inc(key);
+}
+
+void bpf_lsm_hook_dec(const struct bpf_prog *prog)
+{
+	struct static_key_false *key = bpf_lsm_prog_to_key(prog);
+
+	if (key)
+		static_branch_dec(key);
+}
 
 BTF_SET_START(bpf_lsm_disabled_hooks)
 BTF_ID(func, bpf_lsm_vm_enough_memory)
