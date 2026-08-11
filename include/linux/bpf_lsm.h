@@ -12,7 +12,16 @@
 #include <linux/bpf_verifier.h>
 #include <linux/lsm_hooks.h>
 
+
 struct genl_family; /* for the bpf_lsm_genl_family_rcv_msg hook */
+
+struct bpf_ethtool_ctx {
+	const struct net_device *dev;
+	u32 cmd;
+	u32 sub_cmd;      /* set for ioctl */
+	u32 header_flags; /* set for netlink */
+	u32 phy_index;    /* set for netlink */
+};
 
 #ifdef CONFIG_BPF_LSM
 

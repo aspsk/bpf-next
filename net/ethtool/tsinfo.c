@@ -437,7 +437,12 @@ static int ethnl_tsinfo_dump_one_net_topo(struct sk_buff *skb,
 {
 	struct ethnl_tsinfo_dump_ctx *ctx = (void *)cb->ctx;
 	struct phy_device_node *pdn;
-	int ret = 0;
+	int ret;
+
+	ret = ethnl_bpf_lsm_dump(dev, &ctx->req_info->base,
+				 ETHTOOL_MSG_TSINFO_GET);
+	if (ret)
+		return ret;
 
 	if (!ctx->netdev_dump_done) {
 		ret = ethnl_tsinfo_dump_one_netdev(skb, dev, cb);

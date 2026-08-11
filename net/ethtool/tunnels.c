@@ -179,6 +179,9 @@ int ethnl_tunnel_info_doit(struct sk_buff *skb, struct genl_info *info)
 		return ret;
 
 	rtnl_lock();
+	ret = ethnl_bpf_lsm_doit(&req_info, info->genlhdr->cmd);
+	if (ret)
+		goto err_unlock_rtnl;
 	ret = ethnl_tunnel_info_reply_size(&req_info, info->extack);
 	if (ret < 0)
 		goto err_unlock_rtnl;
@@ -248,6 +251,10 @@ int ethnl_tunnel_info_dumpit(struct sk_buff *skb, struct netlink_callback *cb)
 
 	rtnl_lock();
 	for_each_netdev_dump(net, dev, ctx->ifindex) {
+		ret = ethnl_bpf_lsm_dump(dev, &ctx->req_info, ETHTOOL_MSG_TUNNEL_INFO_GET);
+		if (ret)
+			break;
+
 		ehdr = ethnl_dump_put(skb, cb,
 				      ETHTOOL_MSG_TUNNEL_INFO_GET_REPLY);
 		if (!ehdr) {

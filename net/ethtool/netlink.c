@@ -543,7 +543,9 @@ static int ethnl_default_doit(struct sk_buff *skb, struct genl_info *info)
 			rtnl_lock();
 		netdev_lock_ops(req_info->dev);
 	}
-	ret = ops->prepare_data(req_info, reply_data, info);
+	ret = ethnl_bpf_lsm_doit(req_info, cmd);
+	if (!ret)
+		ret = ops->prepare_data(req_info, reply_data, info);
 	if (req_info->dev) {
 		netdev_unlock_ops(req_info->dev);
 		if (need_rtnl)
@@ -595,9 +597,14 @@ static int ethnl_default_dump_one(struct sk_buff *skb, struct net_device *dev,
 				  const struct ethnl_dump_ctx *ctx,
 				  const struct genl_info *info)
 {
+	int cmd = ctx->ops->request_cmd;
 	bool need_rtnl;
 	void *ehdr;
 	int ret;
+
+	ret = ethnl_bpf_lsm_dump(dev, ctx->req_info, cmd);
+	if (ret)
+		return ret;
 
 	ehdr = genlmsg_put(skb, info->snd_portid, info->snd_seq,
 			   &ethtool_genl_family, NLM_F_MULTI,
@@ -607,7 +614,7 @@ static int ethnl_default_dump_one(struct sk_buff *skb, struct net_device *dev,
 
 	ethnl_init_reply_data(ctx->reply_data, ctx->ops, dev);
 	need_rtnl = !netdev_need_ops_lock(dev) ||
-		    ethtool_nl_msg_needs_rtnl(dev, ctx->ops->request_cmd);
+		    ethtool_nl_msg_needs_rtnl(dev, cmd);
 	if (need_rtnl)
 		rtnl_lock();
 	netdev_lock_ops(dev);
@@ -934,6 +941,9 @@ static int ethnl_default_set_doit(struct sk_buff *skb, struct genl_info *info)
 	if (need_rtnl)
 		rtnl_lock();
 	netdev_lock_ops(dev);
+	ret = ethnl_bpf_lsm_doit(req_info, cmd);
+	if (ret)
+		goto out_unlock;
 	dev->cfg_pending = kmemdup(dev->cfg, sizeof(*dev->cfg),
 				   GFP_KERNEL_ACCOUNT);
 	if (!dev->cfg_pending) {
@@ -961,6 +971,7 @@ out_free_cfg:
 	kfree(dev->cfg_pending);
 out_tie_cfg:
 	dev->cfg_pending = dev->cfg;
+out_unlock:
 	netdev_unlock_ops(dev);
 	if (need_rtnl)
 		rtnl_unlock();

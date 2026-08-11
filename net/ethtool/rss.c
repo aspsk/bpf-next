@@ -357,6 +357,8 @@ struct rss_nl_dump_ctx {
 	/* User wants to only dump contexts from given ifindex */
 	unsigned int		match_ifindex;
 	unsigned int		start_ctx;
+
+	u32			flags;
 };
 
 static struct rss_nl_dump_ctx *rss_dump_ctx(struct netlink_callback *cb)
@@ -394,6 +396,8 @@ int ethnl_rss_dump_start(struct netlink_callback *cb)
 		ethnl_parse_header_dev_put(&req_info);
 		req_info.dev = NULL;
 	}
+
+	ctx->flags = req_info.flags;
 
 	return ret;
 }
@@ -442,10 +446,17 @@ rss_dump_one_dev(struct sk_buff *skb, struct netlink_callback *cb,
 		 struct net_device *dev)
 {
 	struct rss_nl_dump_ctx *ctx = rss_dump_ctx(cb);
+	struct ethnl_req_info req_info = {
+		.flags = ctx->flags,
+	};
 	int ret;
 
 	if (!dev->ethtool_ops->get_rxfh)
 		return 0;
+
+	ret = ethnl_bpf_lsm_dump(dev, &req_info, ETHTOOL_MSG_RSS_GET);
+	if (ret)
+		return ret;
 
 	if (!ctx->ctx_idx) {
 		ret = rss_dump_one_ctx(skb, cb, dev, 0);
@@ -1035,6 +1046,9 @@ int ethnl_rss_create_doit(struct sk_buff *skb, struct genl_info *info)
 		goto exit_free_dev;
 
 	netdev_lock_ops_compat(dev);
+	ret = ethnl_bpf_lsm_doit(&req.base, info->genlhdr->cmd);
+	if (ret)
+		goto exit_dev_unlock;
 
 	ret = ethnl_ops_begin(dev);
 	if (ret < 0)
@@ -1176,6 +1190,9 @@ int ethnl_rss_delete_doit(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	netdev_lock_ops_compat(dev);
+	ret = ethnl_bpf_lsm_doit(&req, info->genlhdr->cmd);
+	if (ret)
+		goto exit_dev_unlock;
 
 	ret = ethnl_ops_begin(dev);
 	if (ret < 0)

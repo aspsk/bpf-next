@@ -8,6 +8,7 @@
  */
 
 #include <linux/compat.h>
+#include <linux/bpf_lsm.h>
 #include <linux/etherdevice.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -3266,6 +3267,17 @@ static int ethtool_set_fecparam(struct net_device *dev, void __user *useraddr)
 	return dev->ethtool_ops->set_fecparam(dev, &fecparam);
 }
 
+static int ethtool_bpf_ioctl_hook(struct net_device *dev, u32 ethcmd, u32 sub_cmd)
+{
+	struct bpf_ethtool_ctx ctx = {
+		.dev = dev,
+		.cmd = ethcmd,
+		.sub_cmd = sub_cmd,
+	};
+
+	return bpf_lsm_hook(ethtool_ioctl, &ctx);
+}
+
 /* The main entry point in this file.  Called from net/core/dev_ioctl.c */
 
 static int
@@ -3329,6 +3341,10 @@ dev_ethtool_locked(struct net *net, struct net_device *dev,
 	}
 
 	netdev_assert_locked_ops_compat(dev);
+
+	rc = ethtool_bpf_ioctl_hook(dev, ethcmd, sub_cmd);
+	if (rc)
+		return rc;
 
 	if (dev->dev.parent)
 		pm_runtime_get_sync(dev->dev.parent);

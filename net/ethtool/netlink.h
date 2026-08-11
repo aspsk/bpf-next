@@ -5,6 +5,7 @@
 
 #include <linux/ethtool_netlink.h>
 #include <linux/netdevice.h>
+#include <linux/bpf_lsm.h>
 #include <net/genetlink.h>
 #include <net/sock.h>
 
@@ -353,6 +354,32 @@ struct ethnl_sock_priv {
 
 int ethnl_sock_priv_set(struct sk_buff *skb, struct net *net, u32 portid,
 			enum ethnl_sock_type type);
+
+static inline int ethnl_bpf_lsm_doit(const struct ethnl_req_info *req_info, u32 cmd)
+{
+	struct bpf_ethtool_ctx ctx = {
+		.dev = req_info->dev,
+		.cmd = cmd,
+		.header_flags = req_info->flags,
+		.phy_index = req_info->phy_index,
+	};
+
+	return bpf_lsm_hook(ethtool_netlink_doit, &ctx);
+}
+
+static inline int ethnl_bpf_lsm_dump(const struct net_device *dev,
+				     const struct ethnl_req_info *req_info,
+				     u32 cmd)
+{
+	struct bpf_ethtool_ctx ctx = {
+		.dev = dev,
+		.cmd = cmd,
+		.header_flags = req_info->flags,
+		.phy_index = req_info->phy_index,
+	};
+
+	return bpf_lsm_hook(ethtool_netlink_dump, &ctx);
+}
 
 /**
  * struct ethnl_request_ops - unified handling of GET and SET requests
