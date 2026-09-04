@@ -17,6 +17,8 @@
 #include <linux/skbuff.h>
 #include <linux/mutex.h>
 #include <linux/bitmap.h>
+#include <linux/btf.h>
+#include <linux/btf_ids.h>
 #include <linux/rwsem.h>
 #include <linux/idr.h>
 #include <net/sock.h>
@@ -1152,6 +1154,41 @@ static int genl_header_check(const struct genl_family *family,
 	return 0;
 }
 
+#ifdef CONFIG_BPF_SYSCALL
+__bpf_hook_start();
+
+__weak noinline int
+bpf_genl_family_rcv_msg(const struct genl_family *family,
+			const struct net *net, u32 cmd, u16 nlmsg_flags)
+{
+	return 0;
+}
+
+__bpf_hook_end();
+
+BTF_SET8_START(bpf_genl_fmodret_ids)
+BTF_ID_FLAGS(func, bpf_genl_family_rcv_msg)
+BTF_SET8_END(bpf_genl_fmodret_ids)
+
+static const struct btf_kfunc_id_set bpf_genl_fmodret_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_genl_fmodret_ids,
+};
+
+static int __init bpf_genl_fmodret_init(void)
+{
+	return register_btf_fmodret_id_set(&bpf_genl_fmodret_set);
+}
+late_initcall(bpf_genl_fmodret_init);
+#else
+static inline int
+bpf_genl_family_rcv_msg(const struct genl_family *family,
+			const struct net *net, u32 cmd, u16 nlmsg_flags)
+{
+	return 0;
+}
+#endif /* CONFIG_BPF_SYSCALL */
+
 static int genl_family_rcv_msg(const struct genl_family *family,
 			       struct sk_buff *skb,
 			       struct nlmsghdr *nlh,
@@ -1162,6 +1199,7 @@ static int genl_family_rcv_msg(const struct genl_family *family,
 	struct genl_split_ops op;
 	int hdrlen;
 	u8 flags;
+	int err;
 
 	/* this family doesn't exist in this netns */
 	if (!family->netnsok && !net_eq(net, &init_net))
@@ -1186,6 +1224,10 @@ static int genl_family_rcv_msg(const struct genl_family *family,
 	if ((op.flags & GENL_UNS_ADMIN_PERM) &&
 	    !netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN))
 		return -EPERM;
+
+	err = bpf_genl_family_rcv_msg(family, net, hdr->cmd, nlh->nlmsg_flags);
+	if (err)
+		return err;
 
 	if (flags & GENL_CMD_CAP_DUMP)
 		return genl_family_rcv_msg_dumpit(family, skb, nlh, extack,
