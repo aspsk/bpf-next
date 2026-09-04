@@ -3266,6 +3266,34 @@ static int ethtool_set_fecparam(struct net_device *dev, void __user *useraddr)
 	return dev->ethtool_ops->set_fecparam(dev, &fecparam);
 }
 
+#ifdef CONFIG_BPF_SYSCALL
+__bpf_hook_start();
+
+__weak noinline int bpf_ethtool_ioctl(const struct net_device *dev, u32 cmd, u32 sub_cmd)
+{
+	return 0;
+}
+
+__bpf_hook_end();
+
+BTF_SET8_START(bpf_ethtool_ioctl_fmodret_ids)
+BTF_ID_FLAGS(func, bpf_ethtool_ioctl)
+BTF_SET8_END(bpf_ethtool_ioctl_fmodret_ids)
+
+static const struct btf_kfunc_id_set bpf_ethtool_ioctl_fmodret_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_ethtool_ioctl_fmodret_ids,
+};
+
+static int __init bpf_ethtool_fmodret_init(void)
+{
+	return register_btf_fmodret_id_set(&bpf_ethtool_ioctl_fmodret_set);
+}
+late_initcall(bpf_ethtool_fmodret_init);
+#else
+#define bpf_ethtool_ioctl(...) 0
+#endif
+
 /* The main entry point in this file.  Called from net/core/dev_ioctl.c */
 
 static int
@@ -3329,6 +3357,10 @@ dev_ethtool_locked(struct net *net, struct net_device *dev,
 	}
 
 	netdev_assert_locked_ops_compat(dev);
+
+	rc = bpf_ethtool_ioctl(dev, ethcmd, sub_cmd);
+	if (rc)
+		return rc;
 
 	if (dev->dev.parent)
 		pm_runtime_get_sync(dev->dev.parent);

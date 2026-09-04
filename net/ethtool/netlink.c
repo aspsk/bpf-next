@@ -503,6 +503,36 @@ static void ethnl_init_reply_data(struct ethnl_reply_data *reply_data,
 	reply_data->dev = dev;
 }
 
+#ifdef CONFIG_BPF_SYSCALL
+__weak noinline int
+bpf_ethtool_netlink_doit(const struct net_device *dev__nullable, u32 cmd, u32 phy_index)
+{
+	return 0;
+}
+
+__weak noinline int
+bpf_ethtool_netlink_dump(const struct net_device *dev, u32 cmd, u32 phy_index)
+{
+	return 0;
+}
+
+BTF_SET8_START(bpf_ethtool_netlink_fmodret_ids)
+BTF_ID_FLAGS(func, bpf_ethtool_netlink_doit)
+BTF_ID_FLAGS(func, bpf_ethtool_netlink_dump)
+BTF_SET8_END(bpf_ethtool_netlink_fmodret_ids)
+
+static const struct btf_kfunc_id_set bpf_ethtool_netlink_fmodret_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_ethtool_netlink_fmodret_ids,
+};
+
+static int __init bpf_ethtool_fmodret_init(void)
+{
+	return register_btf_fmodret_id_set(&bpf_ethtool_netlink_fmodret_set);
+}
+late_initcall(bpf_ethtool_fmodret_init);
+#endif
+
 /* default ->doit() handler for GET type requests */
 static int ethnl_default_doit(struct sk_buff *skb, struct genl_info *info)
 {
@@ -543,7 +573,9 @@ static int ethnl_default_doit(struct sk_buff *skb, struct genl_info *info)
 			rtnl_lock();
 		netdev_lock_ops(req_info->dev);
 	}
-	ret = ops->prepare_data(req_info, reply_data, info);
+	ret = ethnl_bpf_hook_doit(req_info, cmd);
+	if (!ret)
+		ret = ops->prepare_data(req_info, reply_data, info);
 	if (req_info->dev) {
 		netdev_unlock_ops(req_info->dev);
 		if (need_rtnl)
@@ -595,6 +627,7 @@ static int ethnl_default_dump_one(struct sk_buff *skb, struct net_device *dev,
 				  const struct ethnl_dump_ctx *ctx,
 				  const struct genl_info *info)
 {
+	int cmd = ctx->ops->request_cmd;
 	bool need_rtnl;
 	void *ehdr;
 	int ret;
@@ -607,11 +640,15 @@ static int ethnl_default_dump_one(struct sk_buff *skb, struct net_device *dev,
 
 	ethnl_init_reply_data(ctx->reply_data, ctx->ops, dev);
 	need_rtnl = !netdev_need_ops_lock(dev) ||
-		    ethtool_nl_msg_needs_rtnl(dev, ctx->ops->request_cmd);
+		    ethtool_nl_msg_needs_rtnl(dev, cmd);
 	if (need_rtnl)
 		rtnl_lock();
 	netdev_lock_ops(dev);
-	ret = ctx->ops->prepare_data(ctx->req_info, ctx->reply_data, info);
+
+	ret = ethnl_bpf_hook_dump(dev, ctx->req_info->phy_index, cmd);
+	if (!ret)
+		ret = ctx->ops->prepare_data(ctx->req_info, ctx->reply_data, info);
+
 	netdev_unlock_ops(dev);
 	if (need_rtnl)
 		rtnl_unlock();
@@ -934,6 +971,9 @@ static int ethnl_default_set_doit(struct sk_buff *skb, struct genl_info *info)
 	if (need_rtnl)
 		rtnl_lock();
 	netdev_lock_ops(dev);
+	ret = ethnl_bpf_hook_doit(req_info, cmd);
+	if (ret)
+		goto out_unlock;
 	dev->cfg_pending = kmemdup(dev->cfg, sizeof(*dev->cfg),
 				   GFP_KERNEL_ACCOUNT);
 	if (!dev->cfg_pending) {
@@ -961,6 +1001,7 @@ out_free_cfg:
 	kfree(dev->cfg_pending);
 out_tie_cfg:
 	dev->cfg_pending = dev->cfg;
+out_unlock:
 	netdev_unlock_ops(dev);
 	if (need_rtnl)
 		rtnl_unlock();
