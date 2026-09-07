@@ -8585,6 +8585,45 @@ enum {
 	BTF_MODULE_F_LIVE = (1 << 0),
 };
 
+#ifdef CONFIG_DEBUG_INFO_BTF
+static int btf_register_fmodret_ids(struct module *owner, const void *data, u32 size)
+{
+	const struct btf_id_set8 *set = data;
+	struct btf_kfunc_id_set kset = {
+		.owner = owner,
+		.set = set,
+	};
+	size_t header_size = offsetof(struct btf_id_set8, pairs);
+	size_t item_size = sizeof(set->pairs[0]);
+
+	if (!size)
+		return 0;
+
+	if (!set || size < header_size || (size - header_size) % item_size ||
+	    set->cnt != (size - header_size) / item_size)
+		return -EINVAL;
+
+	if (!set->cnt)
+		return 0;
+
+	return register_btf_fmodret_id_set(&kset);
+}
+
+static int __init btf_fmodret_ids_init(void)
+{
+	extern char __start_fmodret_ids[];
+	extern char __stop_fmodret_ids[];
+	size_t size;
+
+	size = __stop_fmodret_ids - __start_fmodret_ids;
+	if (size > U32_MAX)
+		return -EINVAL;
+
+	return btf_register_fmodret_ids(NULL, __start_fmodret_ids, size);
+}
+fs_initcall(btf_fmodret_ids_init);
+#endif
+
 #ifdef CONFIG_DEBUG_INFO_BTF_MODULES
 struct btf_module {
 	struct list_head list;
@@ -8645,6 +8684,11 @@ static int btf_module_notify(struct notifier_block *nb, unsigned long op,
 		btf_mod->btf = btf;
 		list_add(&btf_mod->list, &btf_modules);
 		mutex_unlock(&btf_module_mutex);
+
+		err = btf_register_fmodret_ids(mod, mod->fmodret_ids,
+					       mod->fmodret_ids_size);
+		if (err)
+			goto out;
 
 		if (IS_ENABLED(CONFIG_SYSFS)) {
 			struct bin_attribute *attr;
@@ -9003,7 +9047,7 @@ static int btf_populate_kfunc_set(struct btf *btf, enum btf_kfunc_hook hook,
 				  const struct btf_kfunc_id_set *kset)
 {
 	struct btf_kfunc_hook_filter *hook_filter;
-	struct btf_id_set8 *add_set = kset->set;
+	const struct btf_id_set8 *add_set = kset->set;
 	bool vmlinux_set = !btf_is_module(btf);
 	bool add_filter = !!kset->filter;
 	struct btf_kfunc_set_tab *tab;
