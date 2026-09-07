@@ -36,4 +36,14 @@ config GCC_PLUGIN_LATENT_ENTROPY
 	   * https://grsecurity.net/
 	   * https://pax.grsecurity.net/
 
+config GCC_PLUGIN_FMODRET_CANDIDATES
+	bool "Generate fmod_ret candidate metadata"
+	depends on DEBUG_INFO_BTF
+	default y
+	help
+	  Emit compiler-derived references to functions returning int or long
+	  which may return a Linux errno, including compiler-proven errno ranges
+	  and the common IS_ERR()/PTR_ERR() pattern. The BTF generation tools use
+	  this metadata to construct the fmod_ret allow-list.
+
 endif

@@ -553,6 +553,7 @@ CLIPPY_DRIVER	= clippy-driver
 BINDGEN		= bindgen
 PAHOLE		= pahole
 RESOLVE_BTFIDS	= $(objtree)/tools/bpf/resolve_btfids/resolve_btfids
+GEN_FMODRET_IDS	= $(objtree)/tools/bpf/gen_fmodret_ids/gen_fmodret_ids
 LEX		= flex
 YACC		= bison
 AWK		= awk
@@ -646,7 +647,7 @@ export CLIPPY_CONF_DIR := $(srctree)
 export ARCH SRCARCH CONFIG_SHELL BASH HOSTCC KBUILD_HOSTCFLAGS CROSS_COMPILE LD CC HOSTPKG_CONFIG
 export RUSTC RUSTDOC RUSTFMT RUSTC_OR_CLIPPY_QUIET RUSTC_OR_CLIPPY BINDGEN LLVM_LINK
 export HOSTRUSTC KBUILD_HOSTRUSTFLAGS
-export CPP AR NM STRIP OBJCOPY OBJDUMP READELF PAHOLE RESOLVE_BTFIDS LEX YACC AWK INSTALLKERNEL
+export CPP AR NM STRIP OBJCOPY OBJDUMP READELF PAHOLE RESOLVE_BTFIDS GEN_FMODRET_IDS LEX YACC AWK INSTALLKERNEL
 export PERL PYTHON3 CHECK CHECKFLAGS MAKE UTS_MACHINE HOSTCXX
 export KGZIP KBZIP2 KLZOP LZMA LZ4 XZ ZSTD TAR
 export KBUILD_HOSTCXXFLAGS KBUILD_HOSTLDFLAGS KBUILD_HOSTLDLIBS KBUILD_PROCMACROLDFLAGS LDFLAGS_MODULE
@@ -1569,6 +1570,8 @@ endif
 ifdef CONFIG_BPF
 ifdef CONFIG_DEBUG_INFO_BTF
 prepare: tools/bpf/resolve_btfids
+prepare: tools/bpf/gen_fmodret_ids
+tools/bpf/gen_fmodret_ids: tools/bpf/resolve_btfids
 endif
 endif
 
@@ -1595,14 +1598,21 @@ tools/bootconfig: FORCE
 # here. See Documentation/kbuild/makefiles.rst for details.
 
 PHONY += resolve_btfids_clean
+PHONY += gen_fmodret_ids_clean
 
 resolve_btfids_O = $(abspath $(objtree))/tools/bpf/resolve_btfids
+gen_fmodret_ids_O = $(abspath $(objtree))/tools/bpf/gen_fmodret_ids
 
 # tools/bpf/resolve_btfids directory might not exist
 # in output directory, skip its clean in that case
 resolve_btfids_clean:
 ifneq ($(wildcard $(resolve_btfids_O)),)
 	$(Q)$(MAKE) -sC $(srctree)/tools/bpf/resolve_btfids O=$(resolve_btfids_O) clean
+endif
+
+gen_fmodret_ids_clean:
+ifneq ($(wildcard $(gen_fmodret_ids_O)),)
+	$(Q)$(MAKE) -sC $(srctree)/tools/bpf/gen_fmodret_ids O=$(gen_fmodret_ids_O) clean
 endif
 
 PHONY += objtool_clean objtool_mrproper
@@ -1798,7 +1808,7 @@ vmlinuxclean:
 	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/link-vmlinux.sh clean
 	$(Q)$(if $(ARCH_POSTLINK), $(MAKE) -f $(ARCH_POSTLINK) clean)
 
-clean: archclean vmlinuxclean resolve_btfids_clean objtool_clean bootconfig_clean
+clean: archclean vmlinuxclean resolve_btfids_clean gen_fmodret_ids_clean objtool_clean bootconfig_clean
 
 # mrproper - Delete all generated files, including .config
 #

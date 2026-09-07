@@ -46,11 +46,20 @@ quiet_cmd_btf_ko = BTF [M] $@
 		$(CONFIG_SHELL) $(srctree)/scripts/gen-btf.sh --btf_base $(objtree)/vmlinux $@; \
 	fi;
 
-# Re-generate module BTFs if either module's .ko or vmlinux changed
-%.ko: %.o %.mod.o .module-common.o $(objtree)/scripts/module.lds $(and $(CONFIG_DEBUG_INFO_BTF_MODULES),$(KBUILD_BUILTIN),$(objtree)/vmlinux) FORCE
+quiet_cmd_fmodret_ko = FMODRET [M] $@
+      cmd_fmodret_ko = 							\
+	if [ ! -f $(objtree)/vmlinux ]; then				\
+		printf "Skipping fmod-ret ID generation for %s due to unavailability of vmlinux\n" $@ 1>&2; \
+	else	\
+		$(CONFIG_SHELL) $(srctree)/scripts/gen-fmodret.sh --btf_base $(objtree)/vmlinux $@ $@; \
+	fi;
+
+# Re-generate module BTF and fmod-ret data if their inputs changed
+%.ko: %.o %.mod.o .module-common.o $(objtree)/scripts/module.lds $(srctree)/scripts/gen-fmodret.sh $(and $(CONFIG_DEBUG_INFO_BTF_MODULES),$(KBUILD_BUILTIN),$(objtree)/vmlinux $(GEN_FMODRET_IDS)) FORCE
 	+$(call if_changed,ld_ko_o)
 ifdef CONFIG_DEBUG_INFO_BTF_MODULES
 	+$(if $(newer-prereqs),$(call cmd,btf_ko))
+	+$(if $(newer-prereqs),$(call cmd,fmodret_ko))
 endif
 	+$(call cmd,check_tracepoint)
 

@@ -103,7 +103,8 @@ vmlinux_link()
 	${ld} ${ldflags} -o ${output}					\
 		${wl}--whole-archive ${objs} ${wl}--no-whole-archive	\
 		${wl}--start-group ${libs} ${wl}--end-group		\
-		${kallsymso} ${btf_vmlinux_bin_o} ${arch_vmlinux_o} ${ldlibs}
+		${kallsymso} ${btf_vmlinux_bin_o} ${fmodret_vmlinux_bin_o} \
+		${arch_vmlinux_o} ${ldlibs}
 }
 
 # Check if kallsymso_prev and kallsymso differ
@@ -194,6 +195,7 @@ if is_enabled CONFIG_ARCH_WANTS_PRE_LINK_VMLINUX; then
 fi
 
 btf_vmlinux_bin_o=
+fmodret_vmlinux_bin_o=
 btfids_vmlinux=
 kallsymso=
 strip_debug=
@@ -230,6 +232,13 @@ if is_enabled CONFIG_DEBUG_INFO_BTF; then
 	fi
 	btf_vmlinux_bin_o=.tmp_vmlinux1.btf.o
 	btfids_vmlinux=.tmp_vmlinux1.BTF_ids
+	info FMODRET .tmp_vmlinux1
+	if ! ${CONFIG_SHELL} ${srctree}/scripts/gen-fmodret.sh \
+		.tmp_vmlinux1 .tmp_vmlinux1.btf.o .tmp_vmlinux1.fmodret.o; then
+		echo >&2 "Failed to generate fmod-ret IDs for vmlinux"
+		exit 1
+	fi
+	fmodret_vmlinux_bin_o=.tmp_vmlinux1.fmodret.o
 fi
 
 if is_enabled CONFIG_KALLSYMS; then

@@ -1,0 +1,3 @@
+hostprogs := gen_fmodret_ids
+
+gen_fmodret_ids-y += gen_fmodret_ids.o

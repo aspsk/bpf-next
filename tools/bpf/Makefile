@@ -33,7 +33,7 @@ FEATURE_TESTS = libbfd disassembler-four-args disassembler-init-styled
 FEATURE_DISPLAY = libbfd
 
 check_feat := 1
-NON_CHECK_FEAT_TARGETS := clean bpftool_clean resolve_btfids_clean
+NON_CHECK_FEAT_TARGETS := clean bpftool_clean resolve_btfids_clean gen_fmodret_ids_clean
 ifdef MAKECMDGOALS
 ifeq ($(filter-out $(NON_CHECK_FEAT_TARGETS),$(MAKECMDGOALS)),)
   check_feat := 0
@@ -87,7 +87,7 @@ $(OUTPUT)bpf_exp.lex.c: $(OUTPUT)bpf_exp.yacc.c
 $(OUTPUT)bpf_exp.yacc.o: $(OUTPUT)bpf_exp.yacc.c
 $(OUTPUT)bpf_exp.lex.o: $(OUTPUT)bpf_exp.lex.c
 
-clean: bpftool_clean resolve_btfids_clean
+clean: bpftool_clean resolve_btfids_clean gen_fmodret_ids_clean
 	$(call QUIET_CLEAN, bpf-progs)
 	$(Q)$(RM) -r -- $(OUTPUT)*.o $(OUTPUT)bpf_jit_disasm $(OUTPUT)bpf_dbg \
 	       $(OUTPUT)bpf_asm $(OUTPUT)bpf_exp.yacc.* $(OUTPUT)bpf_exp.lex.*
@@ -119,5 +119,11 @@ resolve_btfids:
 resolve_btfids_clean:
 	$(call descend,resolve_btfids,clean)
 
+gen_fmodret_ids:
+	$(call descend,gen_fmodret_ids)
+
+gen_fmodret_ids_clean:
+	$(call descend,gen_fmodret_ids,clean)
+
 .PHONY: all install clean bpftool bpftool_install bpftool_clean \
-	resolve_btfids resolve_btfids_clean
+	resolve_btfids resolve_btfids_clean gen_fmodret_ids gen_fmodret_ids_clean

@@ -22,6 +22,7 @@ SECTIONS {
 	.init_array		0 : ALIGN(8) { *(SORT(.init_array.*)) *(.init_array) }
 
 	.fmodret_ids		0 : ALIGN(8) { KEEP(*(.fmodret_ids)) }
+	.fmodret_candidates	0 : { KEEP(*(.fmodret_candidates)) }
 
 	.altinstructions	0 : ALIGN(8) { KEEP(*(.altinstructions)) }
 	__bug_table		0 : ALIGN(8) { KEEP(*(__bug_table)) }
