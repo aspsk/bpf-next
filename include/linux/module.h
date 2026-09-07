@@ -502,6 +502,8 @@ struct module {
 	unsigned int btf_base_data_size;
 	void *btf_data;
 	void *btf_base_data;
+	unsigned int btf_fmodret_ids_size;
+	void *btf_fmodret_ids;
 #endif
 #ifdef CONFIG_JUMP_LABEL
 	struct jump_entry *jump_entries;
