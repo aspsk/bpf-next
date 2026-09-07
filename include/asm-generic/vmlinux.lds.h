@@ -684,6 +684,10 @@
 	. = ALIGN(PAGE_SIZE);						\
 	.BTF_ids : AT(ADDR(.BTF_ids) - LOAD_OFFSET) {			\
 		*(.BTF_ids)						\
+	}								\
+	. = ALIGN(PAGE_SIZE);						\
+	.BTF_fmodret_ids : AT(ADDR(.BTF_fmodret_ids) - LOAD_OFFSET) {	\
+		BOUNDED_SECTION_BY(.BTF_fmodret_ids, _btf_fmodret_ids)	\
 	}
 #else
 #define BTF

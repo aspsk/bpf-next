@@ -2722,6 +2722,8 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 	mod->btf_data = any_section_objs(info, ".BTF", 1, &mod->btf_data_size);
 	mod->btf_base_data = any_section_objs(info, ".BTF.base", 1,
 					      &mod->btf_base_data_size);
+	mod->btf_fmodret_ids = section_objs(info, ".BTF_fmodret_ids", 1,
+					    &mod->btf_fmodret_ids_size);
 #endif
 #ifdef CONFIG_JUMP_LABEL
 	mod->jump_entries = section_objs(info, "__jump_table",
