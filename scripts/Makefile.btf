@@ -26,6 +26,7 @@ export PAHOLE_FLAGS := $(pahole-flags-y)
 
 resolve-btfids-flags-y :=
 resolve-btfids-flags-$(CONFIG_WERROR) += --fatal_warnings
+resolve-btfids-flags-$(CONFIG_FUNCTION_ERROR_INJECTION) += --fmodret_error_injection
 resolve-btfids-flags-$(if $(KBUILD_EXTMOD),y) += --distill_base
 resolve-btfids-flags-$(if $(KBUILD_VERBOSE),y) += --verbose
 
