@@ -92,6 +92,8 @@
 #include "btf_colors.h"
 #include <subcmd/parse-options.h>
 
+#include "fmodret.h"
+
 #define BTF_IDS_SECTION	".BTF_ids"
 #define BTF_LINK_MODULE_NAME_MAX	64
 #define BTF_ID_PREFIX	"__BTF_ID__"
@@ -2097,6 +2099,7 @@ int main(int argc, const char **argv)
 	const char *btfids_path = NULL;
 	struct btf_links btf_links = {};
 	bool fatal_warnings = false;
+	bool fmodret_error_injection = false;
 	bool resolve_btfids = true;
 	char out_path[PATH_MAX];
 
@@ -2109,6 +2112,8 @@ int main(int argc, const char **argv)
 			   "path of file providing base BTF"),
 		OPT_BOOLEAN(0, "fatal_warnings", &fatal_warnings,
 			    "turn warnings into errors"),
+		OPT_BOOLEAN(0, "fmodret_error_injection", &fmodret_error_injection,
+			    "target kernel enables CONFIG_FUNCTION_ERROR_INJECTION"),
 		OPT_BOOLEAN(0, "distill_base", &obj.distill_base,
 			    "distill --btf_base and emit .BTF.base section data"),
 		OPT_BOOLEAN(0, "inline", &obj.extract_inline,
@@ -2175,6 +2180,15 @@ int main(int argc, const char **argv)
 		goto out;
 
 	if (finalize_btf(&obj))
+		goto out;
+
+	err = make_out_path(out_path, sizeof(out_path), obj.path,
+			    ".BTF_fmodret_ids");
+	if (err)
+		goto out;
+	err = fmodret_ids_generate(obj.path, obj.btf, obj.efile.encoding,
+				   out_path, fmodret_error_injection, verbose);
+	if (err)
 		goto out;
 
 	if (!resolve_btfids)
