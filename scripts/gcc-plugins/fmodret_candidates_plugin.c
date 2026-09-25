@@ -28,22 +28,25 @@ static struct plugin_info fmodret_candidates_plugin_info = {
 	.help = "disable\tdo not emit fmod_ret candidates\n",
 };
 
-static bool is_signed_int_or_long(tree type)
+static bool is_32_or_64_bit_integer(tree type)
 {
-	type = TYPE_MAIN_VARIANT(type);
-
-	return type == integer_type_node || type == long_integer_type_node;
+	return INTEGRAL_TYPE_P(type) &&
+	       (TYPE_PRECISION(type) == 32 || TYPE_PRECISION(type) == 64);
 }
 
 static bool is_errno_constant(tree value)
 {
-	HOST_WIDE_INT error;
+	wide_int error;
+	unsigned int precision;
 
-	if (TREE_CODE(value) != INTEGER_CST || !tree_fits_shwi_p(value))
+	if (TREE_CODE(value) != INTEGER_CST ||
+	    !is_32_or_64_bit_integer(TREE_TYPE(value)))
 		return false;
 
-	error = tree_to_shwi(value);
-	return error >= -MAX_ERRNO && error < 0;
+	precision = TYPE_PRECISION(TREE_TYPE(value));
+	error = wi::to_wide(value);
+	return !wi::lts_p(error, wi::shwi(-MAX_ERRNO, precision)) &&
+	       wi::lts_p(error, wi::zero(precision));
 }
 
 static tree converted_pointer(tree value)
@@ -211,8 +214,7 @@ static bool range_is_errno(tree value, gimple stmt, edge on_edge,
 	if (TREE_CODE(value) != SSA_NAME)
 		return false;
 	type = TREE_TYPE(value);
-	if (!INTEGRAL_TYPE_P(type) || TYPE_UNSIGNED(type) ||
-	    !irange::supports_p(type))
+	if (!is_32_or_64_bit_integer(type) || !irange::supports_p(type))
 		return false;
 
 	if (on_edge)
@@ -225,7 +227,8 @@ static bool range_is_errno(tree value, gimple stmt, edge on_edge,
 	min_errno = wi::shwi(-MAX_ERRNO, TYPE_PRECISION(type));
 	max_errno = wi::minus_one(TYPE_PRECISION(type));
 	for (i = 0; i < range.num_pairs(); i++)
-		if (wi::lts_p(range.lower_bound(i), min_errno) ||
+		if (wi::gts_p(range.lower_bound(i), range.upper_bound(i)) ||
+		    wi::lts_p(range.lower_bound(i), min_errno) ||
 		    wi::gts_p(range.upper_bound(i), max_errno))
 			return false;
 	return range.num_pairs() != 0;
@@ -280,13 +283,24 @@ static bool value_may_be_errno(tree value, tree *seen, unsigned int depth,
 	}
 
 	if (is_gimple_assign(def) &&
-	    (gimple_assign_copy_p(def) || gimple_assign_cast_p(def)))
-		return value_may_be_errno(gimple_assign_rhs1(def), seen,
+	    (gimple_assign_copy_p(def) || gimple_assign_cast_p(def))) {
+		tree rhs = gimple_assign_rhs1(def);
+
+		/* Widening an unsigned value clears its negative sign bit. */
+		if (gimple_assign_cast_p(def) &&
+		    INTEGRAL_TYPE_P(TREE_TYPE(value)) &&
+		    INTEGRAL_TYPE_P(TREE_TYPE(rhs)) &&
+		    TYPE_PRECISION(TREE_TYPE(value)) >
+			TYPE_PRECISION(TREE_TYPE(rhs)) &&
+		    TYPE_UNSIGNED(TREE_TYPE(rhs)))
+			return false;
+		return value_may_be_errno(rhs, seen,
 					  depth + 1, def, on_edge
 #if BUILDING_GCC_VERSION >= 11000
 					  , query
 #endif
 					  );
+	}
 
 	return false;
 }
@@ -350,7 +364,7 @@ static unsigned int fmodret_candidates_execute(void)
 		return 0;
 
 	return_type = TREE_TYPE(TREE_TYPE(fndecl));
-	if (!is_signed_int_or_long(return_type))
+	if (!is_32_or_64_bit_integer(return_type))
 		return 0;
 
 	had_dominators = dom_info_available_p(CDI_DOMINATORS);
