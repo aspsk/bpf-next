@@ -21,7 +21,8 @@ SECTIONS {
 	.ctors			0 : ALIGN(8) { *(SORT(.ctors.*)) *(.ctors) }
 	.init_array		0 : ALIGN(8) { *(SORT(.init_array.*)) *(.init_array) }
 
-	.btf_fmodret_ids	0 : ALIGN(8) { KEEP(*(.BTF_fmodret_ids)) }
+	.BTF_fmodret_ids	0 : ALIGN(8) { KEEP(*(.BTF_fmodret_ids)) }
+	.BTF_fmodret_candidates 0 : { KEEP(*(.BTF_fmodret_candidates)) }
 
 	.altinstructions	0 : ALIGN(8) { KEEP(*(.altinstructions)) }
 	__bug_table		0 : ALIGN(8) { KEEP(*(__bug_table)) }
