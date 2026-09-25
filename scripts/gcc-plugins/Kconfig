@@ -41,8 +41,8 @@ config GCC_PLUGIN_FMODRET_CANDIDATES
 	depends on DEBUG_INFO_BTF
 	default y
 	help
-	  Emit compiler-derived references to functions returning int or long
-	  which may return a Linux errno, including compiler-proven errno ranges
+	  Emit compiler-derived references to functions returning 32-bit or 64-bit
+	  integers which may return a Linux errno, including proven errno ranges
 	  and the common IS_ERR()/PTR_ERR() pattern. The BTF generation tools use
 	  this metadata to construct the fmod_ret allow-list.
 

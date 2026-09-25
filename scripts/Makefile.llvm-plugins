@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+CLANG_FMODRET_CFLAGS := -fpass-plugin=$(objtree)/scripts/llvm-plugins/fmodret_candidates.so -DCLANG_FMODRET_PLUGIN
+export CLANG_FMODRET_CFLAGS
+KBUILD_CFLAGS += $(CLANG_FMODRET_CFLAGS)

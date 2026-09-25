@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config CLANG_PLUGIN_FMODRET_CANDIDATES
+	bool "Generate fmod_ret candidate metadata with LLVM"
+	depends on CC_IS_CLANG && DEBUG_INFO_BTF
+	depends on $(success,$(LLVM_CONFIG) --version)
+	default y
+	help
+	  Emit compiler-derived references to 32-bit and 64-bit integer-returning
+	  functions which may return a Linux errno. The BTF generation tools use
+	  these references to construct the fmod_ret allow-list.
