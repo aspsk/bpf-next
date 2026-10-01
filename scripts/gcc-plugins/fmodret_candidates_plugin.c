@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Emit references to functions which may return a Linux errno. In addition to
- * constants and simple SSA values, use Ranger-proven ranges and recognize the
- * common IS_ERR()/PTR_ERR() control-flow pattern.
+ * Emit references to functions with a clean path to a Linux errno return.
+ * Recognize constants, Ranger-proven ranges, and IS_ERR()/PTR_ERR() paths.
  */
 
 #include "gcc-common.h"
@@ -236,7 +235,7 @@ static bool range_is_errno(tree value, gimple stmt, edge on_edge,
 #endif
 
 static bool value_may_be_errno(tree value, tree *seen, unsigned int depth,
-			       gimple stmt, edge on_edge
+			       gimple stmt, edge on_edge, bitmap clean_exits
 #if BUILDING_GCC_VERSION >= 11000
 			       , range_query *query
 #endif
@@ -270,15 +269,20 @@ static bool value_may_be_errno(tree value, tree *seen, unsigned int depth,
 	if (gimple_code(def) == GIMPLE_PHI) {
 		gphi *phi = as_a_gphi(def);
 
-		for (i = 0; i < gimple_phi_num_args(phi); i++)
+		for (i = 0; i < gimple_phi_num_args(phi); i++) {
+			edge incoming = gimple_phi_arg_edge(phi, i);
+
+			if (!bitmap_bit_p(clean_exits, incoming->src->index))
+				continue;
 			if (value_may_be_errno(gimple_phi_arg_def(phi, i), seen,
-					       depth + 1, def,
-					       gimple_phi_arg_edge(phi, i)
+					       depth + 1, def, incoming,
+					       clean_exits
 #if BUILDING_GCC_VERSION >= 11000
 					       , query
 #endif
 					       ))
 				return true;
+		}
 		return false;
 	}
 
@@ -295,7 +299,8 @@ static bool value_may_be_errno(tree value, tree *seen, unsigned int depth,
 		    TYPE_UNSIGNED(TREE_TYPE(rhs)))
 			return false;
 		return value_may_be_errno(rhs, seen,
-					  depth + 1, def, on_edge
+					  depth + 1, def, on_edge,
+					  clean_exits
 #if BUILDING_GCC_VERSION >= 11000
 					  , query
 #endif
@@ -305,16 +310,68 @@ static bool value_may_be_errno(tree value, tree *seen, unsigned int depth,
 	return false;
 }
 
-static bool function_may_return_errno(
+static bool is_clean_stmt(gimple stmt)
+{
+	switch (gimple_code(stmt)) {
+	case GIMPLE_COND:
+	case GIMPLE_SWITCH:
+	case GIMPLE_RETURN:
+	case GIMPLE_DEBUG:
+		return true;
+	default:
+		return !gimple_has_side_effects(stmt);
+	}
+}
+
+static bool function_has_clean_errno_path(
 #if BUILDING_GCC_VERSION >= 11000
 				      range_query *query
 #endif
 				      )
 {
+	auto_bitmap clean_entries;
+	auto_bitmap clean_exits;
+	auto_vec<basic_block, 32> worklist;
+	basic_block entry = ENTRY_BLOCK_PTR_FOR_FN(cfun);
 	basic_block bb;
+	edge e;
+	edge_iterator ei;
+
+	/* Only blocks reachable without earlier side effects can prove a path. */
+	bitmap_set_bit(clean_exits, entry->index);
+	FOR_EACH_EDGE(e, ei, entry->succs) {
+		if (e->dest == EXIT_BLOCK_PTR_FOR_FN(cfun) ||
+		    !bitmap_set_bit(clean_entries, e->dest->index))
+			continue;
+		worklist.safe_push(e->dest);
+	}
+	while (worklist.length()) {
+		gimple_stmt_iterator gsi;
+		bool clean = true;
+
+		bb = worklist.pop();
+		for (gsi = gsi_start_bb(bb); !gsi_end_p(gsi); gsi_next(&gsi)) {
+			if (!is_clean_stmt(gsi_stmt(gsi))) {
+				clean = false;
+				break;
+			}
+		}
+		if (!clean)
+			continue;
+		bitmap_set_bit(clean_exits, bb->index);
+		FOR_EACH_EDGE(e, ei, bb->succs) {
+			if (e->dest == EXIT_BLOCK_PTR_FOR_FN(cfun) ||
+			    !bitmap_set_bit(clean_entries, e->dest->index))
+				continue;
+			worklist.safe_push(e->dest);
+		}
+	}
 
 	FOR_EACH_BB_FN(bb, cfun) {
 		gimple_stmt_iterator gsi;
+
+		if (!bitmap_bit_p(clean_exits, bb->index))
+			continue;
 
 		for (gsi = gsi_start_bb(bb); !gsi_end_p(gsi); gsi_next(&gsi)) {
 			gimple stmt = gsi_stmt(gsi);
@@ -324,7 +381,8 @@ static bool function_may_return_errno(
 			if (gimple_code(stmt) != GIMPLE_RETURN)
 				continue;
 			value = gimple_return_retval(as_a_greturn(stmt));
-			if (value_may_be_errno(value, seen, 0, stmt, NULL
+			if (value_may_be_errno(value, seen, 0, stmt, NULL,
+					       clean_exits
 #if BUILDING_GCC_VERSION >= 11000
 					       , query
 #endif
@@ -372,10 +430,10 @@ static unsigned int fmodret_candidates_execute(void)
 		calculate_dominance_info(CDI_DOMINATORS);
 #if BUILDING_GCC_VERSION >= 11000
 	ranger = enable_ranger(cfun);
-	candidate = function_may_return_errno(ranger);
+	candidate = function_has_clean_errno_path(ranger);
 	disable_ranger(cfun);
 #else
-	candidate = function_may_return_errno();
+	candidate = function_has_clean_errno_path();
 #endif
 	if (!had_dominators)
 		free_dominance_info(CDI_DOMINATORS);
