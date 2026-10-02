@@ -835,7 +835,7 @@
 		.debug_names	0 : { *(.debug_names) }			\
 		.debug_rnglists	0 : { *(.debug_rnglists) }		\
 		.debug_str_offsets	0 : { *(.debug_str_offsets) }	\
-		.BTF_fmodret_candidates 0 : { KEEP(*(.BTF_fmodret_candidates)) }
+		.BTF_fmodret_candidates 0 (INFO) : { KEEP(*(.BTF_fmodret_candidates)) }
 
 /* Stabs debugging sections. */
 #define STABS_DEBUG							\

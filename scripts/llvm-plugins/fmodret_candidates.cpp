@@ -1,52 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Emit references to functions with a clean path to a Linux errno return. */
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LazyValueInfo.h"
+#include "llvm/IR/Analysis.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-
-#include <string>
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
 
-namespace {
-
-constexpr unsigned MaxErrno = 4095;
-constexpr unsigned MaxValueDepth = 64;
-
-static bool isErrnoRange(const ConstantRange &Range)
-{
-	unsigned Width = Range.getBitWidth();
-
-	if (Width != 32 && Width != 64)
-		return false;
-	ConstantRange Errnos(APInt(Width, 0) - APInt(Width, MaxErrno),
-			     APInt(Width, 0));
-
-	return !Range.isEmptySet() && Errnos.contains(Range);
-}
-
-static bool isErrnoConstant(const Value *V)
-{
-	auto *C = dyn_cast<ConstantInt>(V);
-	int64_t N;
-
-	if (!C || (C->getBitWidth() != 32 && C->getBitWidth() != 64))
-		return false;
-	N = C->getSExtValue();
-	return N >= -MaxErrno && N < 0;
-}
+static constexpr unsigned MaxErrno = 4095;
+static constexpr unsigned MaxValueDepth = 64;
 
 static const Value *convertedPointer(const Value *V)
 {
@@ -112,18 +85,17 @@ static bool conditionImpliesIsErr(Value *Condition, bool Truth,
 	return Threshold->getValue().uge(Limit);
 }
 
-static bool dominatedByIsErr(const Value *V, BasicBlock *BB,
-			     DominatorTree &DT)
+static bool dominatedByIsErr(const Value *V, BasicBlock *BB, DominatorTree &DT)
 {
 	const Value *Pointer = convertedPointer(V);
 
 	if (!Pointer)
 		return false;
+
 	while (BB) {
 		BasicBlock *Dom = DT.getNode(BB)->getIDom() ?
 			DT.getNode(BB)->getIDom()->getBlock() : nullptr;
-		auto *Branch = Dom ? dyn_cast<BranchInst>(Dom->getTerminator()) :
-				     nullptr;
+		auto *Branch = Dom ? dyn_cast<BranchInst>(Dom->getTerminator()) : nullptr;
 		bool TruePath, FalsePath;
 
 		if (!Dom)
@@ -135,12 +107,25 @@ static bool dominatedByIsErr(const Value *V, BasicBlock *BB,
 		TruePath = DT.dominates(Branch->getSuccessor(0), BB);
 		FalsePath = DT.dominates(Branch->getSuccessor(1), BB);
 		if (TruePath != FalsePath &&
-		    conditionImpliesIsErr(Branch->getCondition(), TruePath,
-					  Pointer))
+		    conditionImpliesIsErr(Branch->getCondition(), TruePath, Pointer))
 			return true;
 		BB = Dom;
 	}
 	return false;
+}
+
+static bool isErrnoRange(const ConstantRange &Range)
+{
+	unsigned Width = Range.getBitWidth();
+
+	if (Width != 32 && Width != 64)
+		return false;
+
+	// Range in [-4095, 0)
+	auto L = APInt(Width, 0) - APInt(Width, MaxErrno);
+	auto R = APInt(Width, 0);
+	return !Range.isEmptySet() &&
+		ConstantRange(L, R).contains(Range);
 }
 
 static bool rangeAtUseIsErrno(const Use &U, LazyValueInfo &LVI)
@@ -151,53 +136,63 @@ static bool rangeAtUseIsErrno(const Use &U, LazyValueInfo &LVI)
 	       isErrnoRange(LVI.getConstantRangeAtUse(U, false));
 }
 
+static bool isErrnoConstant(const Value *V)
+{
+	auto *C = dyn_cast<ConstantInt>(V);
+	int64_t N;
+
+	if (!C || (C->getBitWidth() != 32 && C->getBitWidth() != 64))
+		return false;
+
+	N = C->getSExtValue();
+	return N >= -MaxErrno && N < 0;
+}
+
+// XXX this is next
 static bool valueMayBeErrno(Value *V, BasicBlock *BB, LazyValueInfo &LVI,
 			    DominatorTree &DT,
-			    const SmallPtrSetImpl<BasicBlock *> &CleanExits,
+			    const SmallPtrSetImpl<BasicBlock *> &CleanBBs,
 			    SmallPtrSetImpl<const Value *> &Seen,
 			    unsigned Depth)
 {
 	if (!V || Depth == MaxValueDepth)
 		return false;
+
 	if (isErrnoConstant(V) || dominatedByIsErr(V, BB, DT))
 		return true;
+
 	if (!Seen.insert(V).second)
 		return false;
 
 	if (auto *Phi = dyn_cast<PHINode>(V)) {
-		for (unsigned I = 0; I < Phi->getNumIncomingValues(); I++) {
-			Value *Incoming = Phi->getIncomingValue(I);
-			BasicBlock *Pred = Phi->getIncomingBlock(I);
+		for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
+			Value *Incoming = Phi->getIncomingValue(i);
+			BasicBlock *Pred = Phi->getIncomingBlock(i);
 
-			if (!CleanExits.contains(Pred))
+			if (!CleanBBs.contains(Pred))
 				continue;
 			if (Incoming->getType()->isIntegerTy() &&
-			    isErrnoRange(LVI.getConstantRangeOnEdge(
-				Incoming, Pred, Phi->getParent())))
+			    isErrnoRange(LVI.getConstantRangeOnEdge(Incoming, Pred, Phi->getParent())))
 				return true;
-			if (valueMayBeErrno(Incoming, Pred, LVI, DT, CleanExits,
-					    Seen, Depth + 1))
+
+			if (valueMayBeErrno(Incoming, Pred, LVI, DT, CleanBBs, Seen, Depth + 1))
 				return true;
 		}
 	} else if (auto *Cast = dyn_cast<CastInst>(V)) {
 		/* Zero extension does not preserve a negative bit pattern. */
 		if (!isa<ZExtInst>(Cast) &&
 		    (rangeAtUseIsErrno(Cast->getOperandUse(0), LVI) ||
-		     valueMayBeErrno(Cast->getOperand(0), BB, LVI, DT,
-				     CleanExits, Seen, Depth + 1)))
+		     valueMayBeErrno(Cast->getOperand(0), BB, LVI, DT, CleanBBs, Seen, Depth + 1)))
 			return true;
 	}
 	Seen.erase(V);
 	return false;
 }
 
+// review above this XXX
+
 static bool isCleanInstruction(const Instruction &I)
 {
-	/* Control flow and return do not change the caller-visible state. */
-	if (isa<BranchInst, SwitchInst, ReturnInst>(I))
-		return true;
-	if (isa<DbgInfoIntrinsic>(I))
-		return true;
 	if (auto *Intrinsic = dyn_cast<IntrinsicInst>(&I)) {
 		switch (Intrinsic->getIntrinsicID()) {
 		case Intrinsic::assume:
@@ -213,107 +208,125 @@ static bool isCleanInstruction(const Instruction &I)
 	return !I.mayHaveSideEffects();
 }
 
-static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI,
-				      DominatorTree &DT)
+static bool cleanBB(BasicBlock *BB)
 {
-	SmallPtrSet<BasicBlock *, 32> CleanEntries;
-	SmallPtrSet<BasicBlock *, 32> CleanExits;
+	for (Instruction &I : *BB) {
+		if (!isCleanInstruction(I))
+			return false;
+	}
+	return true;
+}
+
+static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, DominatorTree &DT)
+{
+	SmallPtrSet<BasicBlock *, 32> CleanEntries; // XXX: don't like 32
+	SmallPtrSet<BasicBlock *, 32> CleanBBs;
 	SmallVector<BasicBlock *, 32> Worklist;
 
+	// build the list of "clean" BBs
 	CleanEntries.insert(&F.getEntryBlock());
 	Worklist.push_back(&F.getEntryBlock());
 	while (!Worklist.empty()) {
 		BasicBlock *BB = Worklist.pop_back_val();
-		bool Clean = true;
-
-		for (Instruction &I : *BB) {
-			if (!isCleanInstruction(I)) {
-				Clean = false;
-				break;
-			}
-		}
-		if (!Clean)
+		if (!cleanBB(BB))
 			continue;
-		CleanExits.insert(BB);
-		for (BasicBlock *Successor : successors(BB))
-			if (CleanEntries.insert(Successor).second)
+
+		CleanBBs.insert(BB);
+
+		for (BasicBlock *Successor : successors(BB)) {
+			auto havent_seen = CleanEntries.insert(Successor).second;
+			if (havent_seen)
 				Worklist.push_back(Successor);
+		}
 	}
 
-	for (BasicBlock &BB : F) {
-		auto *Return = dyn_cast<ReturnInst>(BB.getTerminator());
-		SmallPtrSet<const Value *, 32> Seen;
-
-		if (!CleanExits.contains(&BB) || !Return ||
-		    !Return->getReturnValue())
+	// consider the return values of "clean" exits, i.e.,
+	// exits, where all predcessors were "clean"
+	for (BasicBlock *BB : CleanBBs) {
+		auto *Return = dyn_cast<ReturnInst>(BB->getTerminator());
+		if (!Return || !Return->getReturnValue())
 			continue;
+
+		SmallPtrSet<const Value *, 32> Seen;
 		if (rangeAtUseIsErrno(Return->getOperandUse(0), LVI) ||
-		    valueMayBeErrno(Return->getReturnValue(), &BB, LVI, DT,
-				    CleanExits, Seen, 0))
+		    valueMayBeErrno(Return->getReturnValue(), BB, LVI, DT, CleanBBs, Seen, 0))
 			return true;
 	}
 	return false;
 }
 
-static void emitCandidate(Function &F)
+static void emitCandidates(Module &M, ArrayRef<Constant *> Fns)
 {
-	unsigned Bytes = F.getParent()->getDataLayout().getPointerSize();
-	std::string Asm = ".pushsection .BTF_fmodret_candidates,\"\"\n"
-			  ".balign " + std::to_string(Bytes) + "\n" +
-			  (Bytes == 8 ? ".quad " : ".long ") +
-			  "${0:c}\n.popsection";
-	auto *Ty = FunctionType::get(Type::getVoidTy(F.getContext()),
-				     {F.getType()}, false);
-	auto *IA = InlineAsm::get(Ty, Asm, "s", true);
-	IRBuilder<> Builder(&*F.getEntryBlock().getFirstInsertionPt());
-
-	Builder.CreateCall(IA, {&F});
+	auto *PtrTy = PointerType::getUnqual(M.getContext());
+	auto *ArrTy = ArrayType::get(PtrTy, Fns.size());
+	auto isConstant = true;
+	auto *GV = new GlobalVariable(M, ArrTy, isConstant,
+				      GlobalValue::PrivateLinkage,
+				      ConstantArray::get(ArrTy, Fns),
+				      "fmodret_candidates.table");
+	GV->setSection(".BTF_fmodret_candidates");
+	GV->setAlignment(M.getDataLayout().getPointerABIAlignment(0));
+	appendToUsed(M, {GV});
 }
 
-class FmodretCandidatesPass : public PassInfoMixin<FmodretCandidatesPass> {
+class FmodretCandidatesPass : public PassInfoMixin<FmodretCandidatesPass>
+{
 public:
 	PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM)
 	{
-		SmallVector<Function *, 32> Candidates;
-		auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M)
-				    .getManager();
+		// LTO can run this twice, do a smarter processing later,
+		// for now do not duplicate the section
+		if (M.getNamedMetadata("fmodret_candidates.done"))
+			return PreservedAnalyses::all();
+
+		SmallVector<Constant *> Fns;
+		auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
 		for (Function &F : M) {
-			unsigned Width;
-
 			if (F.isDeclaration() ||
-			    F.hasFnAttribute("fmodret-candidate-emitted") ||
+			    F.hasWeakAnyLinkage() || // to be removed later when we can track __weak properly
+			    F.hasAvailableExternallyLinkage() ||
 			    !F.getReturnType()->isIntegerTy())
 				continue;
-			Width = F.getReturnType()->getIntegerBitWidth();
+
+			unsigned Width = F.getReturnType()->getIntegerBitWidth();
 			if (Width != 32 && Width != 64)
 				continue;
+
 			auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
 			auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-
 			if (functionHasCleanErrnoPath(F, LVI, DT))
-				Candidates.push_back(&F);
+				Fns.push_back(&F);
 		}
-		if (Candidates.empty())
-			return PreservedAnalyses::all();
-		for (Function *F : Candidates) {
-			emitCandidate(*F);
-			F->addFnAttr("fmodret-candidate-emitted");
-		}
-		return PreservedAnalyses::none();
-	}
-};
 
-} // namespace
+		if (Fns.empty())
+			return PreservedAnalyses::all();
+
+		emitCandidates(M, Fns);
+		M.getOrInsertNamedMetadata("fmodret_candidates.done");
+
+		PreservedAnalyses PA;
+		PA.preserve<FunctionAnalysisManagerModuleProxy>();
+		PA.preserveSet<CFGAnalyses>();
+		PA.preserve<LazyValueAnalysis>();
+		return PA;
+	}
+
+	static bool isRequired() { return true; }
+};
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo()
 {
-	return {LLVM_PLUGIN_API_VERSION, "fmodret-candidates", "1.0",
+	return {
+		LLVM_PLUGIN_API_VERSION,
+		"fmodret-candidates",
+		"1.0",
 		[](PassBuilder &PB) {
 			PB.registerOptimizerLastEPCallback(
-				[](ModulePassManager &MPM, OptimizationLevel,
-				   ThinOrFullLTOPhase) {
+				[](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
 					MPM.addPass(FmodretCandidatesPass());
-				});
-		}};
+				   }
+			);
+		}
+	};
 }
