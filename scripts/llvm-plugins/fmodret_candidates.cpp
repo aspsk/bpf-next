@@ -21,6 +21,7 @@ using namespace llvm;
 static constexpr unsigned MaxErrno = 4095;
 static constexpr unsigned MaxValueDepth = 64;
 
+// XXX, here, I believe, we follow the chain to see if this was casted from a pointer
 static const Value *convertedPointer(const Value *V)
 {
 	for (unsigned Depth = 0; V && Depth < MaxValueDepth; Depth++) {
@@ -50,8 +51,7 @@ static const ConstantInt *comparisonThreshold(const Value *V)
 	return nullptr;
 }
 
-static bool conditionImpliesIsErr(Value *Condition, bool Truth,
-				  const Value *Pointer)
+static bool conditionImpliesIsErr(Value *Condition, bool Truth, const Value *Pointer)
 {
 	auto *Cmp = dyn_cast<ICmpInst>(Condition);
 	CmpInst::Predicate Pred;
@@ -85,6 +85,7 @@ static bool conditionImpliesIsErr(Value *Condition, bool Truth,
 	return Threshold->getValue().uge(Limit);
 }
 
+// XXX this is we are checking if (IS_ERR(ptr)) --> return PTR_ERR(ptr), but how?
 static bool dominatedByIsErr(const Value *V, BasicBlock *BB, DominatorTree &DT)
 {
 	const Value *Pointer = convertedPointer(V);
@@ -114,6 +115,7 @@ static bool dominatedByIsErr(const Value *V, BasicBlock *BB, DominatorTree &DT)
 	return false;
 }
 
+// is Range in [-4095, 0) ?
 static bool isErrnoRange(const ConstantRange &Range)
 {
 	unsigned Width = Range.getBitWidth();
@@ -121,11 +123,9 @@ static bool isErrnoRange(const ConstantRange &Range)
 	if (Width != 32 && Width != 64)
 		return false;
 
-	// Range in [-4095, 0)
 	auto L = APInt(Width, 0) - APInt(Width, MaxErrno);
 	auto R = APInt(Width, 0);
-	return !Range.isEmptySet() &&
-		ConstantRange(L, R).contains(Range);
+	return !Range.isEmptySet() && ConstantRange(L, R).contains(Range);
 }
 
 static bool rangeAtUseIsErrno(const Use &U, LazyValueInfo &LVI)
@@ -149,8 +149,11 @@ static bool isErrnoConstant(const Value *V)
 }
 
 // XXX this is next
-static bool valueMayBeErrno(Value *V, BasicBlock *BB, LazyValueInfo &LVI,
-			    DominatorTree &DT,
+// XXX draw the picture with CleanBBs and Seen
+static bool valueMayBeErrno(Value *V,
+			    BasicBlock *BB,
+			    LazyValueInfo &LVI,
+			    DominatorTree &DT, // XXX theory: what is DominatorTree exactly
 			    const SmallPtrSetImpl<BasicBlock *> &CleanBBs,
 			    SmallPtrSetImpl<const Value *> &Seen,
 			    unsigned Depth)
@@ -161,7 +164,7 @@ static bool valueMayBeErrno(Value *V, BasicBlock *BB, LazyValueInfo &LVI,
 	if (isErrnoConstant(V) || dominatedByIsErr(V, BB, DT))
 		return true;
 
-	if (!Seen.insert(V).second)
+	if (!Seen.insert(V).second) // XXX: is there a "exists" alternative? I don't like "insert"; XXX also should it go here or before returning true above?
 		return false;
 
 	if (auto *Phi = dyn_cast<PHINode>(V)) {
@@ -171,26 +174,28 @@ static bool valueMayBeErrno(Value *V, BasicBlock *BB, LazyValueInfo &LVI,
 
 			if (!CleanBBs.contains(Pred))
 				continue;
+
 			if (Incoming->getType()->isIntegerTy() &&
-			    isErrnoRange(LVI.getConstantRangeOnEdge(Incoming, Pred, Phi->getParent())))
+			    isErrnoRange(LVI.getConstantRangeOnEdge(Incoming, Pred, Phi->getParent()))) // why do we know the range here? Because of isIntegerTy()?
 				return true;
 
 			if (valueMayBeErrno(Incoming, Pred, LVI, DT, CleanBBs, Seen, Depth + 1))
 				return true;
 		}
-	} else if (auto *Cast = dyn_cast<CastInst>(V)) {
-		/* Zero extension does not preserve a negative bit pattern. */
+	} else if (auto *Cast = dyn_cast<CastInst>(V)) { // XXX what does this mean exactly?
+		// Zero extension does not preserve a negative bit pattern
 		if (!isa<ZExtInst>(Cast) &&
 		    (rangeAtUseIsErrno(Cast->getOperandUse(0), LVI) ||
 		     valueMayBeErrno(Cast->getOperand(0), BB, LVI, DT, CleanBBs, Seen, Depth + 1)))
 			return true;
 	}
-	Seen.erase(V);
+	Seen.erase(V); // XXX why erase?
 	return false;
 }
 
 // review above this XXX
 
+// XXX: I still do not understand precisely what it does
 static bool isCleanInstruction(const Instruction &I)
 {
 	if (auto *Intrinsic = dyn_cast<IntrinsicInst>(&I)) {
@@ -260,7 +265,7 @@ static void emitCandidates(Module &M, ArrayRef<Constant *> Fns)
 	auto *PtrTy = PointerType::getUnqual(M.getContext());
 	auto *ArrTy = ArrayType::get(PtrTy, Fns.size());
 	auto isConstant = true;
-	auto *GV = new GlobalVariable(M, ArrTy, isConstant,
+	auto *GV = new GlobalVariable(M, ArrTy, isConstant, // XXX: does this approach allow us to pass more information and also more complex structures to allow to check how error propagations work?
 				      GlobalValue::PrivateLinkage,
 				      ConstantArray::get(ArrTy, Fns),
 				      "fmodret_candidates.table");
@@ -279,7 +284,7 @@ public:
 		if (M.getNamedMetadata("fmodret_candidates.done"))
 			return PreservedAnalyses::all();
 
-		SmallVector<Constant *> Fns;
+		SmallVector<Constant *> Fns; // XXX: why small vector? Is 10K small?
 		auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
 		for (Function &F : M) {
