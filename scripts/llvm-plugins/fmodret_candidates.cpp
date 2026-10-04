@@ -260,6 +260,151 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 	return false;
 }
 
+static bool returnsCallError(Value *V, CallInst &Call, BasicBlock *ReturnBB,
+			     BasicBlock *FromBB,
+			     SmallPtrSetImpl<const Instruction *> &ErrorUses,
+			     unsigned Depth = 0)
+{
+	if (Depth == MaxValueDepth)
+		return false;
+	if (V == &Call || isErrnoConstant(V))
+		return true;
+	if (auto *Phi = dyn_cast<PHINode>(V)) {
+		if (Phi->getParent() != ReturnBB || !Phi->hasOneUse())
+			return false;
+		int Index = Phi->getBasicBlockIndex(FromBB);
+
+		if (Index < 0 ||
+		    !returnsCallError(Phi->getIncomingValue(Index), Call,
+					  ReturnBB, FromBB, ErrorUses, Depth + 1))
+			return false;
+		ErrorUses.insert(Phi);
+		return true;
+	}
+	if (auto *Cast = dyn_cast<CastInst>(V)) {
+		if ((!isa<SExtInst>(Cast) && !isa<TruncInst>(Cast)) ||
+		    !Cast->hasOneUse() ||
+		    !Cast->getSrcTy()->isIntegerTy() ||
+		    !Cast->getDestTy()->isIntegerTy() ||
+		    Cast->getSrcTy()->getIntegerBitWidth() < 32 ||
+		    Cast->getDestTy()->getIntegerBitWidth() < 32 ||
+		    !returnsCallError(Cast->getOperand(0), Call, ReturnBB,
+					  FromBB, ErrorUses, Depth + 1))
+			return false;
+		ErrorUses.insert(Cast);
+		return true;
+	}
+	return false;
+}
+
+static bool noSideEffectsAfterCall(CallInst &Call, Instruction &End)
+{
+	if (Call.getParent() != End.getParent())
+		return false;
+	for (Instruction *I = Call.getNextNode(); I; I = I->getNextNode()) {
+		if (I == &End)
+			return true;
+		if (I->mayHaveSideEffects())
+			return false;
+	}
+	return false;
+}
+
+static bool branchHandlesError(CallInst &Call, ICmpInst &Cmp,
+			       BranchInst &Branch, DominatorTree &DT)
+{
+	if (!Branch.isConditional() || Branch.getCondition() != &Cmp ||
+	    !noSideEffectsAfterCall(Call, Branch) ||
+	    Branch.getSuccessor(0) == Branch.getSuccessor(1))
+		return false;
+
+	BasicBlock *ErrorBB = Branch.getSuccessor(0);
+	BasicBlock *SuccessBB = Branch.getSuccessor(1);
+	auto *Return = dyn_cast<ReturnInst>(ErrorBB->getTerminator());
+	SmallPtrSet<const Instruction *, 8> ErrorUses;
+
+	if (!Return || !Return->getReturnValue() ||
+	    !returnsCallError(Return->getReturnValue(), Call, ErrorBB,
+			      Branch.getParent(), ErrorUses))
+		return false;
+	ErrorUses.insert(Return);
+
+	for (User *U : Call.users()) {
+		if (U == &Cmp)
+			continue;
+		auto *I = dyn_cast<Instruction>(U);
+
+		if (!I)
+			return false;
+		if (ErrorUses.contains(I) ||
+		    DT.dominates(SuccessBB, I->getParent()))
+			continue;
+		return false;
+	}
+	return true;
+}
+
+static bool selectHandlesError(CallInst &Call, ICmpInst &Cmp,
+			       SelectInst &Select)
+{
+	if (Select.getCondition() != &Cmp || !Select.hasOneUse())
+		return false;
+	auto *Return = dyn_cast<ReturnInst>(*Select.user_begin());
+	SmallPtrSet<const Instruction *, 8> ErrorUses;
+
+	if (!Return || Return->getReturnValue() != &Select ||
+	    !noSideEffectsAfterCall(Call, *Return) ||
+	    !returnsCallError(Select.getTrueValue(), Call,
+			      Return->getParent(), Call.getParent(), ErrorUses))
+		return false;
+	for (User *U : Call.users()) {
+		if (U == &Cmp || U == &Select)
+			continue;
+		auto *I = dyn_cast<Instruction>(U);
+
+		if (!I || !ErrorUses.contains(I))
+			return false;
+	}
+	return true;
+}
+
+static bool callHandlesError(CallInst &Call, DominatorTree &DT)
+{
+	for (User *U : Call.users()) {
+		auto *Cmp = dyn_cast<ICmpInst>(U);
+
+		if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_SLT ||
+		    Cmp->getOperand(0) != &Call ||
+		    !isa<ConstantInt>(Cmp->getOperand(1)) ||
+		    !cast<ConstantInt>(Cmp->getOperand(1))->isZero() ||
+		    !Cmp->hasOneUse())
+			continue;
+
+		User *Guard = *Cmp->user_begin();
+		if (auto *Branch = dyn_cast<BranchInst>(Guard)) {
+			if (branchHandlesError(Call, *Cmp, *Branch, DT))
+				return true;
+		} else if (auto *Select = dyn_cast<SelectInst>(Guard)) {
+			if (selectHandlesError(Call, *Cmp, *Select))
+				return true;
+		}
+	}
+	return false;
+}
+
+static bool localCallersHandleError(Function &F, FunctionAnalysisManager &FAM)
+{
+	for (User *U : F.users()) {
+		auto *Call = dyn_cast<CallInst>(U);
+
+		if (!Call || Call->getCalledOperand() != &F ||
+		    !callHandlesError(*Call, FAM.getResult<DominatorTreeAnalysis>(
+								*Call->getFunction())))
+			return false;
+	}
+	return true;
+}
+
 static void emitCandidates(Module &M, ArrayRef<Constant *> Fns)
 {
 	auto *PtrTy = PointerType::getUnqual(M.getContext());
@@ -301,7 +446,9 @@ public:
 
 			auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
 			auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-			if (functionHasCleanErrnoPath(F, LVI, DT))
+			if (functionHasCleanErrnoPath(F, LVI, DT) &&
+			    (!F.hasLocalLinkage() ||
+			     localCallersHandleError(F, FAM)))
 				Fns.push_back(&F);
 		}
 
