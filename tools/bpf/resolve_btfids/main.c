@@ -1762,6 +1762,7 @@ int main(int argc, const char **argv)
 	const char *btfids_path = NULL;
 	bool fatal_warnings = false;
 	bool fmodret_error_injection = false;
+	bool fmodret_candidates = false;
 	bool resolve_btfids = true;
 	char out_path[PATH_MAX];
 
@@ -1776,6 +1777,8 @@ int main(int argc, const char **argv)
 			    "turn warnings into errors"),
 		OPT_BOOLEAN(0, "fmodret_error_injection", &fmodret_error_injection,
 			    "target kernel enables CONFIG_FUNCTION_ERROR_INJECTION"),
+		OPT_BOOLEAN(0, "fmodret_candidates", &fmodret_candidates,
+			    "generate IDs for fmod_ret candidates"),
 		OPT_BOOLEAN(0, "distill_base", &obj.distill_base,
 			    "distill --btf_base and emit .BTF.base section data"),
 		OPT_STRING(0, "patch_btfids", &btfids_path, "file",
@@ -1824,8 +1827,12 @@ int main(int argc, const char **argv)
 			    ".BTF_fmodret_ids");
 	if (err)
 		goto out;
-	err = fmodret_ids_generate(obj.path, obj.btf, obj.efile.encoding,
-				   out_path, fmodret_error_injection, verbose);
+	if (fmodret_candidates)
+		err = fmodret_ids_generate(obj.path, obj.btf,
+					   obj.efile.encoding, out_path,
+					   fmodret_error_injection, verbose);
+	else if (unlink(out_path) && errno != ENOENT)
+		err = -errno;
 	if (err)
 		goto out;
 
