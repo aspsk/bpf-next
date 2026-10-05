@@ -263,12 +263,11 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 static bool returnsCallError(Value *V, CallInst &Call, BasicBlock *ReturnBB,
 			     BasicBlock *FromBB,
 			     SmallPtrSetImpl<const Instruction *> &ErrorUses,
-			     bool AllowConstant,
 			     unsigned Depth = 0)
 {
 	if (Depth == MaxValueDepth)
 		return false;
-	if (V == &Call || (AllowConstant && isErrnoConstant(V)))
+	if (V == &Call || isErrnoConstant(V))
 		return true;
 	if (auto *Phi = dyn_cast<PHINode>(V)) {
 		if (Phi->getParent() != ReturnBB || !Phi->hasOneUse())
@@ -277,8 +276,7 @@ static bool returnsCallError(Value *V, CallInst &Call, BasicBlock *ReturnBB,
 
 		if (Index < 0 ||
 		    !returnsCallError(Phi->getIncomingValue(Index), Call,
-					  ReturnBB, FromBB, ErrorUses,
-					  AllowConstant, Depth + 1))
+					  ReturnBB, FromBB, ErrorUses, Depth + 1))
 			return false;
 		ErrorUses.insert(Phi);
 		return true;
@@ -291,8 +289,7 @@ static bool returnsCallError(Value *V, CallInst &Call, BasicBlock *ReturnBB,
 		    Cast->getSrcTy()->getIntegerBitWidth() < 32 ||
 		    Cast->getDestTy()->getIntegerBitWidth() < 32 ||
 		    !returnsCallError(Cast->getOperand(0), Call, ReturnBB,
-					      FromBB, ErrorUses,
-					      AllowConstant, Depth + 1))
+					      FromBB, ErrorUses, Depth + 1))
 			return false;
 		ErrorUses.insert(Cast);
 		return true;
@@ -315,7 +312,7 @@ static bool noSideEffectsAfterCall(CallInst &Call, Instruction &End)
 
 static bool branchHandlesError(CallInst &Call, ICmpInst &Cmp,
 			       BranchInst &Branch, DominatorTree &DT,
-			       bool ErrorOnTrue, bool AllowConstant)
+			       bool ErrorOnTrue)
 {
 	if (!Branch.isConditional() || Branch.getCondition() != &Cmp ||
 	    !noSideEffectsAfterCall(Call, Branch) ||
@@ -329,7 +326,7 @@ static bool branchHandlesError(CallInst &Call, ICmpInst &Cmp,
 
 	if (!Return || !Return->getReturnValue() ||
 	    !returnsCallError(Return->getReturnValue(), Call, ErrorBB,
-			      Branch.getParent(), ErrorUses, AllowConstant))
+			      Branch.getParent(), ErrorUses))
 		return false;
 	ErrorUses.insert(Return);
 
@@ -349,8 +346,7 @@ static bool branchHandlesError(CallInst &Call, ICmpInst &Cmp,
 }
 
 static bool selectHandlesError(CallInst &Call, ICmpInst &Cmp,
-			       SelectInst &Select, bool ErrorOnTrue,
-			       bool AllowConstant)
+			       SelectInst &Select, bool ErrorOnTrue)
 {
 	if (Select.getCondition() != &Cmp || !Select.hasOneUse())
 		return false;
@@ -361,8 +357,7 @@ static bool selectHandlesError(CallInst &Call, ICmpInst &Cmp,
 	    !noSideEffectsAfterCall(Call, *Return) ||
 	    !returnsCallError(ErrorOnTrue ? Select.getTrueValue() :
 					    Select.getFalseValue(), Call,
-			      Return->getParent(), Call.getParent(), ErrorUses,
-			      AllowConstant))
+			      Return->getParent(), Call.getParent(), ErrorUses))
 		return false;
 	for (User *U : Call.users()) {
 		if (U == &Cmp || U == &Select)
@@ -403,11 +398,11 @@ static bool callHandlesError(CallInst &Call, DominatorTree &DT)
 		User *Guard = *Cmp->user_begin();
 		if (auto *Branch = dyn_cast<BranchInst>(Guard)) {
 			if (branchHandlesError(Call, *Cmp, *Branch, DT,
-					       ErrorOnTrue, Negative))
+					       ErrorOnTrue))
 				return true;
 		} else if (auto *Select = dyn_cast<SelectInst>(Guard)) {
 			if (selectHandlesError(Call, *Cmp, *Select,
-					       ErrorOnTrue, Negative))
+					       ErrorOnTrue))
 				return true;
 		}
 	}
