@@ -1430,7 +1430,7 @@ static int find_fmodret_ids(const char *elf_file, const struct btf *btf,
 
 	if (nr_result)
 		qsort(result, nr_result, sizeof(*result), cmp_fmodret_ids);
-	if (verbose)
+	if (1 || verbose) // XXX make it verbose later
 		fprintf(stderr,
 			"fmodret: %zu candidates, %zu added, %zu not added "
 			"(%zu unattachable or ambiguous, %zu outside runtime "
