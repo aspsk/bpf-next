@@ -7,6 +7,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
@@ -14,12 +15,68 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+
+#include <cstdlib>
+#include <cstring>
+#include <string>
 
 using namespace llvm;
 
 static constexpr unsigned MaxErrno = 4095;
 static constexpr unsigned MaxValueDepth = 64;
+
+static bool debugEnabled()
+{
+	const char *Value = std::getenv("FMODRET_CANDIDATES_DEBUG");
+
+	return Value && *Value && std::strcmp(Value, "0");
+}
+
+static const char *environmentName(const char *Variable)
+{
+	const char *Name = std::getenv(Variable);
+
+	return Name && *Name ? Name : nullptr;
+}
+
+static void writeJsonString(raw_ostream &Out, StringRef Value)
+{
+	static const char Hex[] = "0123456789abcdef";
+
+	Out << '"';
+	for (char Byte : Value) {
+		unsigned char C = static_cast<unsigned char>(Byte);
+
+		switch (C) {
+		case '"': Out << "\\\""; break;
+		case '\\': Out << "\\\\"; break;
+		case '\n': Out << "\\n"; break;
+		case '\r': Out << "\\r"; break;
+		case '\t': Out << "\\t"; break;
+		default:
+			if (C < 0x20)
+				Out << "\\u00" << Hex[C >> 4] << Hex[C & 15];
+			else
+				Out << Byte;
+		}
+	}
+	Out << '"';
+}
+
+static void writeJsonEnvironment(raw_ostream &Out, const char *Variable)
+{
+	if (const char *Name = environmentName(Variable))
+		writeJsonString(Out, Name);
+	else
+		Out << "null";
+}
+
+struct CleanPathInfo {
+	unsigned CleanReturns = 0;
+	unsigned BlockedBlocks = 0;
+};
 
 // XXX, here, I believe, we follow the chain to see if this was casted from a pointer
 static const Value *convertedPointer(const Value *V)
@@ -222,7 +279,8 @@ static bool cleanBB(BasicBlock *BB)
 	return true;
 }
 
-static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, DominatorTree &DT)
+static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI,
+				      DominatorTree &DT, CleanPathInfo &Info)
 {
 	SmallPtrSet<BasicBlock *, 32> CleanEntries; // XXX: don't like 32
 	SmallPtrSet<BasicBlock *, 32> CleanBBs;
@@ -233,8 +291,10 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 	Worklist.push_back(&F.getEntryBlock());
 	while (!Worklist.empty()) {
 		BasicBlock *BB = Worklist.pop_back_val();
-		if (!cleanBB(BB))
+		if (!cleanBB(BB)) {
+			Info.BlockedBlocks++;
 			continue;
+		}
 
 		CleanBBs.insert(BB);
 
@@ -252,6 +312,7 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 		if (!Return || !Return->getReturnValue())
 			continue;
 
+		Info.CleanReturns++;
 		SmallPtrSet<const Value *, 32> Seen;
 		if (rangeAtUseIsErrno(Return->getOperandUse(0), LVI) ||
 		    valueMayBeErrno(Return->getReturnValue(), BB, LVI, DT, CleanBBs, Seen, 0))
@@ -438,17 +499,86 @@ static bool callHandlesError(CallInst &Call, DominatorTree &DT)
 	return false;
 }
 
-static bool localCallersHandleError(Function &F, FunctionAnalysisManager &FAM)
+static bool localCallersHandleError(Function &F, FunctionAnalysisManager &FAM,
+				    User *&BadUse)
 {
 	for (User *U : F.users()) {
 		auto *Call = dyn_cast<CallInst>(U);
 
 		if (!Call || Call->getCalledOperand() != &F ||
 		    !callHandlesError(*Call, FAM.getResult<DominatorTreeAnalysis>(
-								*Call->getFunction())))
+								*Call->getFunction()))) {
+			BadUse = U;
 			return false;
+		}
 	}
 	return true;
+}
+
+static void reportDecision(Function &F, bool CleanChecked, bool Clean,
+			   const CleanPathInfo &Info, const char *Callers,
+			   User *BadUse, bool Emit, const char *Reason)
+{
+	std::string Line;
+	raw_string_ostream Out(Line);
+
+	Out << "{\"obj\":";
+	writeJsonEnvironment(Out, "FMODRET_CANDIDATES_OBJECT");
+	Out << ",\"target\":";
+	writeJsonEnvironment(Out, "FMODRET_CANDIDATES_TARGET");
+	Out << ",\"compiler\":\"llvm\",\"symbol\":";
+	writeJsonString(Out, F.getName());
+	Out << ",\"verdict\":\"" << (Emit ? "emit" : "reject")
+	    << "\",\"reason\":";
+	writeJsonString(Out, Reason);
+	Out << ",\"linkage\":\"" << (F.hasLocalLinkage() ? "local" : "global")
+	    << "\",\"weak\":" << (F.hasWeakAnyLinkage() ? "true" : "false")
+	    << ",\"available_externally\":"
+	    << (F.hasAvailableExternallyLinkage() ? "true" : "false")
+	    << ",\"address_taken\":" << (F.hasAddressTaken() ? "true" : "false")
+	    << ",\"return\":";
+	if (F.getReturnType()->isIntegerTy())
+		Out << "\"i" << F.getReturnType()->getIntegerBitWidth() << '"';
+	else
+		Out << "\"non_integer\"";
+	Out << ",\"clean\":";
+	if (CleanChecked)
+		Out << (Clean ? "true" : "false");
+	else
+		Out << "null";
+	Out << ",\"clean_returns_seen\":" << Info.CleanReturns
+	    << ",\"blocked_blocks_seen\":" << Info.BlockedBlocks
+	    << ",\"callers\":";
+	writeJsonString(Out, Callers);
+	if (auto *I = dyn_cast_or_null<Instruction>(BadUse)) {
+		Out << ",\"caller\":";
+		writeJsonString(Out, I->getFunction()->getName());
+		if (const DebugLoc &Loc = I->getDebugLoc()) {
+			Out << ",\"callsite_file\":";
+			writeJsonString(Out, Loc->getFilename());
+			Out << ",\"callsite_line\":" << Loc.getLine();
+		}
+	} else if (BadUse) {
+		Out << ",\"caller\":\"non_call_use\"";
+	}
+	Out << '}';
+	Out.flush();
+	errs() << Line << '\n';
+}
+
+static void reportAlreadyRun()
+{
+	std::string Line;
+	raw_string_ostream Out(Line);
+
+	Out << "{\"obj\":";
+	writeJsonEnvironment(Out, "FMODRET_CANDIDATES_OBJECT");
+	Out << ",\"target\":";
+	writeJsonEnvironment(Out, "FMODRET_CANDIDATES_TARGET");
+	Out << ",\"compiler\":\"llvm\",\"symbol\":null,"
+	       "\"verdict\":\"skip\",\"reason\":\"pass_already_run\"}";
+	Out.flush();
+	errs() << Line << '\n';
 }
 
 static void emitCandidates(Module &M, ArrayRef<Constant *> Fns)
@@ -470,32 +600,75 @@ class FmodretCandidatesPass : public PassInfoMixin<FmodretCandidatesPass>
 public:
 	PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM)
 	{
+		bool Debug = debugEnabled();
+
 		// LTO can run this twice, do a smarter processing later,
 		// for now do not duplicate the section
-		if (M.getNamedMetadata("fmodret_candidates.done"))
+		if (M.getNamedMetadata("fmodret_candidates.done")) {
+			if (Debug)
+				reportAlreadyRun();
 			return PreservedAnalyses::all();
+		}
 
 		SmallVector<Constant *> Fns; // XXX: why small vector? Is 10K small?
 		auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
 		for (Function &F : M) {
-			if (F.isDeclaration() ||
-			    F.hasWeakAnyLinkage() || // to be removed later when we can track __weak properly
-			    F.hasAvailableExternallyLinkage() ||
-			    (F.hasLocalLinkage() && F.hasAddressTaken()) || // to be removed later when we add tracking
-			    !F.getReturnType()->isIntegerTy())
+			if (F.isDeclaration())
 				continue;
 
-			unsigned Width = F.getReturnType()->getIntegerBitWidth();
-			if (Width != 32 && Width != 64)
-				continue;
+			bool SupportedReturn = F.getReturnType()->isIntegerTy() &&
+				(F.getReturnType()->getIntegerBitWidth() == 32 ||
+				 F.getReturnType()->getIntegerBitWidth() == 64);
+			bool Weak = F.hasWeakAnyLinkage(); // to be removed later when we can track __weak properly
+			bool AvailableExternally = F.hasAvailableExternallyLinkage();
+			bool LocalAddressTaken = F.hasLocalLinkage() && F.hasAddressTaken(); // to be removed later when we add tracking
+			bool Eligible = SupportedReturn && !Weak &&
+					!AvailableExternally && !LocalAddressTaken;
+			bool CleanChecked = SupportedReturn && (Debug || Eligible);
+			bool Clean = false;
+			bool CallersOK = true;
+			CleanPathInfo Info;
+			User *BadUse = nullptr;
+			const char *Callers = "not_checked";
+			const char *Reason;
 
-			auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
-			auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-			if (functionHasCleanErrnoPath(F, LVI, DT) &&
-			    (!F.hasLocalLinkage() ||
-			     localCallersHandleError(F, FAM)))
+			if (CleanChecked) {
+				auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
+				auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+				Clean = functionHasCleanErrnoPath(F, LVI, DT, Info);
+			}
+			if (Eligible && Clean && F.hasLocalLinkage()) {
+				CallersOK = localCallersHandleError(F, FAM, BadUse);
+				Callers = CallersOK ? "checked" : "failed";
+			} else if (Eligible && Clean) {
+				Callers = "not_local";
+			}
+
+			if (!SupportedReturn)
+				Reason = "unsupported_return_type";
+			else if (!Clean)
+				Reason = Info.CleanReturns ? "clean_returns_without_errno" :
+					 Info.BlockedBlocks ? "no_clean_return_after_side_effect" :
+					 "no_clean_return";
+			else if (Weak)
+				Reason = "weak_linkage";
+			else if (AvailableExternally)
+				Reason = "available_externally";
+			else if (LocalAddressTaken)
+				Reason = "local_address_taken";
+			else if (!CallersOK)
+				Reason = isa<CallInst>(BadUse) ?
+					 "local_caller_unhandled" : "local_non_call_use";
+			else
+				Reason = "clean_errno_path";
+
+			bool Emit = Eligible && Clean && CallersOK;
+			if (Emit)
 				Fns.push_back(&F);
+			if (Debug)
+				reportDecision(F, CleanChecked, Clean, Info, Callers,
+					       BadUse, Emit, Reason);
 		}
 
 		if (Fns.empty())
