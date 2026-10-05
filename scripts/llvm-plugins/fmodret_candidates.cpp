@@ -310,6 +310,32 @@ static bool noSideEffectsAfterCall(CallInst &Call, Instruction &End)
 	return false;
 }
 
+static bool directlyReturnsCall(CallInst &Call)
+{
+	Value *V = &Call;
+
+	for (unsigned Depth = 0; Depth < MaxValueDepth; Depth++) {
+		if (!V->hasOneUse())
+			return false;
+		auto *I = dyn_cast<Instruction>(*V->user_begin());
+
+		if (auto *Return = dyn_cast_or_null<ReturnInst>(I))
+			return Return->getReturnValue() == V &&
+			       noSideEffectsAfterCall(Call, *Return);
+		auto *Cast = dyn_cast_or_null<CastInst>(I);
+
+		if (!Cast || (!isa<SExtInst>(Cast) && !isa<TruncInst>(Cast)) ||
+		    Cast->getParent() != Call.getParent() ||
+		    !Cast->getSrcTy()->isIntegerTy() ||
+		    !Cast->getDestTy()->isIntegerTy() ||
+		    Cast->getSrcTy()->getIntegerBitWidth() < 32 ||
+		    Cast->getDestTy()->getIntegerBitWidth() < 32)
+			return false;
+		V = Cast;
+	}
+	return false;
+}
+
 static bool branchHandlesError(CallInst &Call, ICmpInst &Cmp,
 			       BranchInst &Branch, DominatorTree &DT,
 			       bool ErrorOnTrue)
@@ -372,6 +398,9 @@ static bool selectHandlesError(CallInst &Call, ICmpInst &Cmp,
 
 static bool callHandlesError(CallInst &Call, DominatorTree &DT)
 {
+	if (directlyReturnsCall(Call))
+		return true;
+
 	for (User *U : Call.users()) {
 		auto *Cmp = dyn_cast<ICmpInst>(U);
 		bool Negative, NonZero, ErrorOnTrue;
