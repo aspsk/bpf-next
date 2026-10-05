@@ -33,6 +33,7 @@
 struct fmodret_symbol {
 	char *name;
 	size_t nr_functions;
+	size_t nr_local_functions;
 	size_t nr_candidates;
 	size_t nr_traceable;
 	size_t nr_error_injectable;
@@ -57,6 +58,7 @@ struct elf_function {
 	size_t symtab_ndx;
 	size_t sym_ndx;
 	bool candidate;
+	bool local;
 	bool traceable;
 	bool error_injectable;
 };
@@ -111,6 +113,7 @@ static int append_fmodret_symbol(struct fmodret_symbol_list *list,
 		return -ENOMEM;
 	list->symbols[list->nr].name = copy;
 	list->symbols[list->nr].nr_functions = 0;
+	list->symbols[list->nr].nr_local_functions = 0;
 	list->symbols[list->nr].nr_candidates = 0;
 	list->symbols[list->nr].nr_traceable = 0;
 	list->symbols[list->nr].nr_error_injectable = 0;
@@ -158,6 +161,7 @@ static int add_elf_function(struct elf_function_list *list, const char *name,
 		.shndx = sym->st_shndx,
 		.symtab_ndx = symtab_ndx,
 		.sym_ndx = sym_ndx,
+		.local = GELF_ST_BIND(sym->st_info) == STB_LOCAL,
 	};
 	list->nr++;
 	return 0;
@@ -1156,6 +1160,7 @@ static int summarize_elf_functions(struct elf_function_list *functions,
 	while (i < functions->nr) {
 		struct fmodret_symbol *symbol;
 		size_t nr_candidates = 0;
+		size_t nr_local_functions = 0;
 		size_t nr_traceable = 0;
 		size_t nr_error_injectable = 0;
 		size_t j;
@@ -1165,6 +1170,7 @@ static int summarize_elf_functions(struct elf_function_list *functions,
 		     !strcmp(functions->functions[i].name,
 			     functions->functions[j].name); j++) {
 			nr_candidates += functions->functions[j].candidate;
+			nr_local_functions += functions->functions[j].local;
 			nr_traceable += functions->functions[j].traceable;
 			nr_error_injectable +=
 				functions->functions[j].error_injectable;
@@ -1180,6 +1186,7 @@ static int summarize_elf_functions(struct elf_function_list *functions,
 			return err;
 		symbol = &symbols->symbols[symbols->nr - 1];
 		symbol->nr_functions = j - i;
+		symbol->nr_local_functions = nr_local_functions;
 		symbol->nr_candidates = nr_candidates;
 		symbol->nr_traceable = nr_traceable;
 		symbol->nr_error_injectable = nr_error_injectable;
@@ -1354,6 +1361,8 @@ static int find_fmodret_ids(const char *elf_file, const struct btf *btf,
 	struct fmodret_symbol_list list = {};
 	const char *syscall_prefix = NULL;
 	size_t nr_result = 0;
+	size_t nr_local_candidates = 0;
+	size_t nr_local_added = 0;
 	size_t nr_not_attachable = 0;
 	size_t nr_not_allowed = 0;
 	size_t nr_without_btf = 0;
@@ -1375,9 +1384,12 @@ static int find_fmodret_ids(const char *elf_file, const struct btf *btf,
 
 	for (i = 0; i < list.nr; i++) {
 		const struct fmodret_symbol *symbol = &list.symbols[i];
+		bool local = symbol->nr_functions &&
+			     symbol->nr_local_functions == symbol->nr_functions;
 		bool allowed;
 		int id;
 
+		nr_local_candidates += local;
 		/*
 		 * BTF lookup is name-based and cannot select one of several local
 		 * ELF functions with the same name. Only admit the name when every
@@ -1397,7 +1409,8 @@ static int find_fmodret_ids(const char *elf_file, const struct btf *btf,
 					symbol->nr_functions);
 			continue;
 		}
-		allowed = !strncmp(symbol->name, SECURITY_PREFIX,
+		allowed = local ||
+			  !strncmp(symbol->name, SECURITY_PREFIX,
 				   sizeof(SECURITY_PREFIX) - 1) ||
 			  (error_injection ?
 			   symbol->nr_error_injectable == symbol->nr_functions :
@@ -1423,6 +1436,7 @@ static int find_fmodret_ids(const char *elf_file, const struct btf *btf,
 		}
 
 		result[nr_result++].id = id;
+		nr_local_added += local;
 		if (verbose >= 2)
 			fprintf(stderr, "fmodret: added %s: BTF ID %d\n",
 				symbol->name, id);
@@ -1432,10 +1446,12 @@ static int find_fmodret_ids(const char *elf_file, const struct btf *btf,
 		qsort(result, nr_result, sizeof(*result), cmp_fmodret_ids);
 	if (1 || verbose) // XXX make it verbose later
 		fprintf(stderr,
-			"fmodret: %zu candidates, %zu added, %zu not added "
+			"fmodret: %zu candidates (%zu local), %zu added "
+			"(%zu local), %zu not added "
 			"(%zu unattachable or ambiguous, %zu outside runtime "
 			"allowlist, %zu without BTF)\n",
-			list.nr, nr_result, list.nr - nr_result,
+			list.nr, nr_local_candidates, nr_result,
+			nr_local_added, list.nr - nr_result,
 			nr_not_attachable, nr_not_allowed, nr_without_btf);
 
 	free_fmodret_symbols(&list);
