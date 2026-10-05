@@ -436,7 +436,7 @@ public:
 			if (F.isDeclaration() ||
 			    F.hasWeakAnyLinkage() || // to be removed later when we can track __weak properly
 			    F.hasAvailableExternallyLinkage() ||
-			    F.hasAddressTaken() || // to be removed later when we add tracking
+			    (F.hasLocalLinkage() && F.hasAddressTaken()) || // to be removed later when we add tracking
 			    !F.getReturnType()->isIntegerTy())
 				continue;
 
