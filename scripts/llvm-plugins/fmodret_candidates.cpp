@@ -263,11 +263,12 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 static bool returnsCallError(Value *V, CallInst &Call, BasicBlock *ReturnBB,
 			     BasicBlock *FromBB,
 			     SmallPtrSetImpl<const Instruction *> &ErrorUses,
+			     bool AllowConstant,
 			     unsigned Depth = 0)
 {
 	if (Depth == MaxValueDepth)
 		return false;
-	if (V == &Call || isErrnoConstant(V))
+	if (V == &Call || (AllowConstant && isErrnoConstant(V)))
 		return true;
 	if (auto *Phi = dyn_cast<PHINode>(V)) {
 		if (Phi->getParent() != ReturnBB || !Phi->hasOneUse())
@@ -276,7 +277,8 @@ static bool returnsCallError(Value *V, CallInst &Call, BasicBlock *ReturnBB,
 
 		if (Index < 0 ||
 		    !returnsCallError(Phi->getIncomingValue(Index), Call,
-					  ReturnBB, FromBB, ErrorUses, Depth + 1))
+					  ReturnBB, FromBB, ErrorUses,
+					  AllowConstant, Depth + 1))
 			return false;
 		ErrorUses.insert(Phi);
 		return true;
@@ -289,7 +291,8 @@ static bool returnsCallError(Value *V, CallInst &Call, BasicBlock *ReturnBB,
 		    Cast->getSrcTy()->getIntegerBitWidth() < 32 ||
 		    Cast->getDestTy()->getIntegerBitWidth() < 32 ||
 		    !returnsCallError(Cast->getOperand(0), Call, ReturnBB,
-					  FromBB, ErrorUses, Depth + 1))
+					      FromBB, ErrorUses,
+					      AllowConstant, Depth + 1))
 			return false;
 		ErrorUses.insert(Cast);
 		return true;
@@ -311,21 +314,22 @@ static bool noSideEffectsAfterCall(CallInst &Call, Instruction &End)
 }
 
 static bool branchHandlesError(CallInst &Call, ICmpInst &Cmp,
-			       BranchInst &Branch, DominatorTree &DT)
+			       BranchInst &Branch, DominatorTree &DT,
+			       bool ErrorOnTrue, bool AllowConstant)
 {
 	if (!Branch.isConditional() || Branch.getCondition() != &Cmp ||
 	    !noSideEffectsAfterCall(Call, Branch) ||
 	    Branch.getSuccessor(0) == Branch.getSuccessor(1))
 		return false;
 
-	BasicBlock *ErrorBB = Branch.getSuccessor(0);
-	BasicBlock *SuccessBB = Branch.getSuccessor(1);
+	BasicBlock *ErrorBB = Branch.getSuccessor(ErrorOnTrue ? 0 : 1);
+	BasicBlock *SuccessBB = Branch.getSuccessor(ErrorOnTrue ? 1 : 0);
 	auto *Return = dyn_cast<ReturnInst>(ErrorBB->getTerminator());
 	SmallPtrSet<const Instruction *, 8> ErrorUses;
 
 	if (!Return || !Return->getReturnValue() ||
 	    !returnsCallError(Return->getReturnValue(), Call, ErrorBB,
-			      Branch.getParent(), ErrorUses))
+			      Branch.getParent(), ErrorUses, AllowConstant))
 		return false;
 	ErrorUses.insert(Return);
 
@@ -345,7 +349,8 @@ static bool branchHandlesError(CallInst &Call, ICmpInst &Cmp,
 }
 
 static bool selectHandlesError(CallInst &Call, ICmpInst &Cmp,
-			       SelectInst &Select)
+			       SelectInst &Select, bool ErrorOnTrue,
+			       bool AllowConstant)
 {
 	if (Select.getCondition() != &Cmp || !Select.hasOneUse())
 		return false;
@@ -354,8 +359,10 @@ static bool selectHandlesError(CallInst &Call, ICmpInst &Cmp,
 
 	if (!Return || Return->getReturnValue() != &Select ||
 	    !noSideEffectsAfterCall(Call, *Return) ||
-	    !returnsCallError(Select.getTrueValue(), Call,
-			      Return->getParent(), Call.getParent(), ErrorUses))
+	    !returnsCallError(ErrorOnTrue ? Select.getTrueValue() :
+					    Select.getFalseValue(), Call,
+			      Return->getParent(), Call.getParent(), ErrorUses,
+			      AllowConstant))
 		return false;
 	for (User *U : Call.users()) {
 		if (U == &Cmp || U == &Select)
@@ -372,20 +379,35 @@ static bool callHandlesError(CallInst &Call, DominatorTree &DT)
 {
 	for (User *U : Call.users()) {
 		auto *Cmp = dyn_cast<ICmpInst>(U);
+		bool Negative, NonZero, ErrorOnTrue;
+		const ConstantInt *Zero;
 
-		if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_SLT ||
-		    Cmp->getOperand(0) != &Call ||
-		    !isa<ConstantInt>(Cmp->getOperand(1)) ||
-		    !cast<ConstantInt>(Cmp->getOperand(1))->isZero() ||
-		    !Cmp->hasOneUse())
+		if (!Cmp || !Cmp->hasOneUse())
 			continue;
+		Negative = Cmp->getPredicate() == ICmpInst::ICMP_SLT &&
+			   Cmp->getOperand(0) == &Call;
+		NonZero = Cmp->getPredicate() == ICmpInst::ICMP_NE ||
+			  Cmp->getPredicate() == ICmpInst::ICMP_EQ;
+		if (!Negative && !NonZero)
+			continue;
+		if (Cmp->getOperand(0) == &Call)
+			Zero = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+		else if (NonZero && Cmp->getOperand(1) == &Call)
+			Zero = dyn_cast<ConstantInt>(Cmp->getOperand(0));
+		else
+			continue;
+		if (!Zero || !Zero->isZero())
+			continue;
+		ErrorOnTrue = Negative || Cmp->getPredicate() == ICmpInst::ICMP_NE;
 
 		User *Guard = *Cmp->user_begin();
 		if (auto *Branch = dyn_cast<BranchInst>(Guard)) {
-			if (branchHandlesError(Call, *Cmp, *Branch, DT))
+			if (branchHandlesError(Call, *Cmp, *Branch, DT,
+					       ErrorOnTrue, Negative))
 				return true;
 		} else if (auto *Select = dyn_cast<SelectInst>(Guard)) {
-			if (selectHandlesError(Call, *Cmp, *Select))
+			if (selectHandlesError(Call, *Cmp, *Select,
+					       ErrorOnTrue, Negative))
 				return true;
 		}
 	}
