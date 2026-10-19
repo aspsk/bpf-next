@@ -161,6 +161,44 @@ static bool isErrnoConstant(const Value *V)
 	return N >= -MaxErrno && N < 0;
 }
 
+static bool valueMayBeErrno(Value *V,
+			    BasicBlock *BB,
+			    LazyValueInfo &LVI,
+			    DominatorTree &DT,
+			    const SmallPtrSetImpl<BasicBlock *> &CleanBBs,
+			    SmallPtrSetImpl<const Value *> &Seen,
+			    unsigned Depth)
+{
+	if (!V || Depth == MaxValueDepth)
+		return false;
+
+	if (isErrnoConstant(V) || dominatedByIsErr(V, BB, DT))
+		return true;
+
+	if (!Seen.insert(V).second)
+		return false;
+
+	if (auto *Phi = dyn_cast<PHINode>(V)) {
+		for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
+			Value *Incoming = Phi->getIncomingValue(i);
+			BasicBlock *Pred = Phi->getIncomingBlock(i);
+
+			if (!CleanBBs.contains(Pred))
+				continue;
+
+			if (Incoming->getType()->isIntegerTy() &&
+			    isErrnoRange(LVI.getConstantRangeOnEdge(Incoming, Pred, Phi->getParent()))) // why do we know the range here? Because of isIntegerTy()?
+				return true;
+
+			if (valueMayBeErrno(Incoming, Pred, LVI, DT, CleanBBs, Seen, Depth + 1))
+				return true;
+		}
+	}
+	Seen.erase(V);
+	return false;
+}
+
+
 static bool isCleanInstruction(const Instruction &I)
 {
 	if (auto *Intrinsic = dyn_cast<IntrinsicInst>(&I)) {
@@ -217,9 +255,9 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 		if (!Return || !Return->getReturnValue())
 			continue;
 
+		SmallPtrSet<const Value *, 32> Seen;
 		if (rangeAtUseIsErrno(Return->getOperandUse(0), LVI) ||
-		    isErrnoConstant(Return->getReturnValue()) ||
-		    dominatedByIsErr(Return->getReturnValue(), BB, DT))
+		    valueMayBeErrno(Return->getReturnValue(), BB, LVI, DT, CleanBBs, Seen, 0))
 			return true;
 	}
 	return false;
