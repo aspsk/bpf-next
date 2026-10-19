@@ -91,6 +91,7 @@
 #include <bpf/libbpf.h>
 #include "btf_colors.h"
 #include <subcmd/parse-options.h>
+#include <subcmd/run-command.h>
 
 #include "fmodret.h"
 
@@ -2077,6 +2078,23 @@ out:
 	return err;
 }
 
+static int remove_fmodret_candidates(const char *elf_path)
+{
+	const char *argv[] = {
+		getenv("OBJCOPY") ?: "objcopy",
+		"--remove-section=.BTF_fmodret_candidates",
+		"--",
+		elf_path,
+		NULL,
+	};
+	int err;
+
+	err = run_command_v_opt(argv, 0);
+	if (err)
+		pr_err("FAILED to remove fmod-ret candidates from %s\n", elf_path);
+	return err;
+}
+
 static const char * const resolve_btfids_usage[] = {
 	"resolve_btfids [<options>] <ELF object>",
 	"resolve_btfids --patch_btfids <.BTF_ids file> [--btf_link <section:module:btf-file>] <ELF object>",
@@ -2247,5 +2265,7 @@ out:
 		elf_end(obj.efile.elf);
 		close(obj.efile.fd);
 	}
+	if (!err)
+		err = remove_fmodret_candidates(obj.path);
 	return err;
 }
