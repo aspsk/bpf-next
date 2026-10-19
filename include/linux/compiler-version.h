@@ -24,6 +24,11 @@
 #include <generated/gcc-plugins.h>
 #endif
 
+/* Rebuild objects when the Clang fmodret candidates plugin changes. */
+#ifdef CLANG_FMODRET_PLUGIN
+#include <generated/llvm-plugins.h>
+#endif
+
 /*
  * If the randstruct seed itself changes (whether for GCC plugins or
  * Clang), the entire tree needs to be rebuilt since the randomization of
