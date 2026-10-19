@@ -1780,6 +1780,7 @@ config HAVE_GENERIC_TIF_BITS
 source "kernel/gcov/Kconfig"
 
 source "scripts/gcc-plugins/Kconfig"
+source "scripts/llvm-plugins/Kconfig"
 
 config FUNCTION_ALIGNMENT_4B
 	bool
