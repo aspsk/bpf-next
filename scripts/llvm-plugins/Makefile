@@ -11,6 +11,8 @@ quiet_cmd_llvm_plugin = HOSTCXX $@
       cmd_llvm_plugin = $(HOSTCXX) $(KBUILD_HOSTCXXFLAGS) $(llvm_cxxflags) \
 		-fPIC -shared -o $@ $(src)/$(notdir $(@:.so=.cpp)) $(llvm_ldflags)
 
+$(obj)/bpf_scan_ir.so: $(src)/fmodret_metadata.h
+
 $(obj)/%.so: $(src)/%.cpp FORCE
 	$(call if_changed,llvm_plugin)
 
