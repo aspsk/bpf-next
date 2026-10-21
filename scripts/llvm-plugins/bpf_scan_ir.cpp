@@ -434,6 +434,10 @@ static ErrorMap traceError(const CallBase &Call, int Error)
 		} else if (Term->getNumSuccessors() == 1 &&
 			   Term->getOpcode() == Instruction::Br) {
 			Next.push_back(Term->getSuccessor(0));
+		} else if (isa<CallBrInst>(Term)) {
+			// asm goto may take the fallthrough or any declared label.
+			for (const BasicBlock *Succ : successors(P.BB))
+				Next.push_back(Succ);
 		} else {
 			// Includes unreachable, exceptional exits and indirect branches.
 			return {};
