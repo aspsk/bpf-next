@@ -964,6 +964,27 @@ static bool in_symbol_range(const struct symbol_range *r, size_t shndx,
 	       address >= r->start.st_value && address < r->end;
 }
 
+static bool jump_label_reference(const GElf_Ehdr *ehdr,
+				 const struct symbol_range *table, size_t shndx,
+				 GElf_Addr site, unsigned int type, size_t ptr_size)
+{
+	size_t entry_size = 8 + ptr_size;
+	GElf_Addr field;
+
+	/* These architectures use two relative s32 code labels followed by a
+	 * pointer-sized key. Only the code labels are patching metadata; a key
+	 * that references a function must still fail the runtime-reference audit.
+	 */
+	if (ptr_size != 8 ||
+	    !((ehdr->e_machine == EM_AARCH64 && type == R_AARCH64_PREL32) ||
+	      (ehdr->e_machine == EM_X86_64 && type == R_X86_64_PC32)) ||
+	    !in_symbol_range(table, shndx, site) ||
+	    (table->end - table->start.st_value) % entry_size)
+		return false;
+	field = (site - table->start.st_value) % entry_size;
+	return field == 0 || field == 4;
+}
+
 static bool described_call(const struct error_graph *g, size_t caller,
 			   size_t callee)
 {
@@ -1009,7 +1030,7 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 		{ "__start_mcount_loc", "__stop_mcount_loc" },
 		{ "__start_error_injection_whitelist", "__stop_error_injection_whitelist" },
 	};
-	struct symbol_range roots[4] = {}, skip[2] = {};
+	struct symbol_range roots[4] = {}, skip[2] = {}, jump_table = {};
 	Elf_Scn *scn = NULL;
 	GElf_Ehdr ehdr;
 	size_t shstrndx, i;
@@ -1030,6 +1051,10 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 			if (err)
 				return err;
 		}
+		err = get_symbol_range(elf, "__start___jump_table",
+				       "__stop___jump_table", &jump_table);
+		if (err)
+			return err;
 	}
 	while ((scn = elf_nextscn(elf, scn))) {
 		GElf_Shdr shdr, target;
@@ -1141,7 +1166,8 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 				}
 			for (j = 0; j < 2; j++)
 				handled |= in_symbol_range(&skip[j], shdr.sh_info, site);
-			if (handled)
+			if (handled || jump_label_reference(&ehdr, &jump_table,
+							   shdr.sh_info, site, type, ptr_size))
 				continue;
 			if (!described_call(g, caller, node))
 				record_unmodelled_reference(g, node,
