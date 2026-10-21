@@ -770,6 +770,7 @@ struct error_call {
 	size_t caller, callee;
 	size_t next_in, next_out, metadata_offset;
 	unsigned int flags, nr_cases, ordinal;
+	bool weak_definition;
 	struct error_case *cases;
 };
 
@@ -778,6 +779,8 @@ struct error_node {
 	GElf_Addr value;
 	Elf64_Section shndx;
 	unsigned int flags, definitions;
+	unsigned int strong_flags, weak_flags;
+	unsigned int strong_definitions, weak_definitions;
 	size_t incoming, outgoing, clean_via;
 	size_t nr_unmodelled_refs, reference_caller;
 	const char *reference_section, *reference_reason;
@@ -791,6 +794,7 @@ struct error_graph {
 	struct error_call *calls;
 	size_t nr_nodes, nr_calls, capacity;
 	size_t nr_records, nr_defined_records, nr_reference_records;
+	size_t nr_overridden_weak, nr_discarded_calls;
 	bool audited_text;
 };
 
@@ -869,7 +873,8 @@ static int init_error_graph(struct error_graph *g,
 static int add_error_call(struct error_graph *g, size_t caller, size_t callee,
 			   unsigned int flags, unsigned int nr_cases,
 			   const unsigned char *p, unsigned int encoding,
-			   size_t metadata_offset, unsigned int ordinal)
+			   size_t metadata_offset, unsigned int ordinal,
+			   bool weak_definition)
 {
 	struct error_call *c;
 	unsigned int i;
@@ -893,7 +898,9 @@ static int add_error_call(struct error_graph *g, size_t caller, size_t callee,
 	c = &g->calls[g->nr_calls];
 	*c = (struct error_call){ .caller = caller, .callee = callee,
 		.flags = flags, .nr_cases = nr_cases,
-		.metadata_offset = metadata_offset, .ordinal = ordinal };
+		.metadata_offset = metadata_offset, .ordinal = ordinal,
+		.weak_definition = weak_definition,
+		.next_in = NO_NODE, .next_out = NO_NODE };
 	c->cases = calloc(nr_cases, sizeof(*c->cases));
 	if (!c->cases)
 		return -ENOMEM;
@@ -916,13 +923,7 @@ static int add_error_call(struct error_graph *g, size_t caller, size_t callee,
 	}
 	if (expected)
 		return -EINVAL;
-	c->next_out = g->nodes[caller].outgoing;
-	g->nodes[caller].outgoing = g->nr_calls - 1;
-	c->next_in = NO_NODE;
-	if (callee != NO_NODE) {
-		c->next_in = g->nodes[callee].incoming;
-		g->nodes[callee].incoming = g->nr_calls - 1;
-	}
+
 	return 0;
 }
 
@@ -1232,8 +1233,16 @@ static int parse_error_graph(Elf *elf, const struct elf_function_list *functions
 			print_function_flags(node == NO_NODE ? NULL : &g->nodes[node], offset, flags);
 		if (node != NO_NODE) {
 			if (flags & FMODRET_FN_DEFINED) {
-				g->nodes[node].definitions++;
-				g->nodes[node].flags |= flags;
+				struct error_node *n = &g->nodes[node];
+
+				if (flags & FMODRET_FN_WEAK) {
+					n->weak_definitions++;
+					n->weak_flags |= flags;
+				} else {
+					n->strong_definitions++;
+					n->strong_flags |= flags;
+				}
+				n->flags |= flags & FMODRET_FN_ESCAPED;
 			} else {
 				g->nodes[node].flags |= flags & FMODRET_FN_ESCAPED;
 			}
@@ -1255,7 +1264,8 @@ static int parse_error_graph(Elf *elf, const struct elf_function_list *functions
 			if (nr_cases > (end - pos) / FMODRET_META_CASE_SIZE)
 				goto invalid;
 			err = add_error_call(g, node, callee, call_flags, nr_cases, buf + pos,
-					     encoding, pos - FMODRET_META_CALL_SIZE(ptr_size), i + 1);
+					     encoding, pos - FMODRET_META_CALL_SIZE(ptr_size), i + 1,
+					     flags & FMODRET_FN_WEAK);
 			if (err)
 				return err;
 			pos += nr_cases * FMODRET_META_CASE_SIZE;
@@ -1268,6 +1278,45 @@ static int parse_error_graph(Elf *elf, const struct elf_function_list *functions
 invalid:
 	fprintf(stderr, "invalid or old fmodret metadata at offset %#zx; rebuild all plugin objects\n", offset);
 	return -EINVAL;
+}
+
+/* A weak definition reference is interposable: after linking it can point
+ * at the winning strong body. Select descriptions before constructing either
+ * adjacency list, so losing clean seeds and calls cannot affect either pass.
+ * Preserve escape evidence from every input record; it can describe a use
+ * outside the losing weak body. Weak-only and ambiguous bodies stay unproved.
+ */
+static void select_error_descriptions(struct error_graph *g)
+{
+	size_t i;
+
+	for (i = 0; i < g->nr_nodes; i++) {
+		struct error_node *n = &g->nodes[i];
+
+		if (n->strong_definitions) {
+			n->flags |= n->strong_flags;
+			n->definitions = n->strong_definitions;
+			g->nr_overridden_weak += n->weak_definitions;
+		} else {
+			n->flags |= n->weak_flags;
+			n->definitions = n->weak_definitions;
+		}
+	}
+	for (i = 0; i < g->nr_calls; i++) {
+		struct error_call *c = &g->calls[i];
+		struct error_node *caller = &g->nodes[c->caller];
+
+		if (c->weak_definition && caller->strong_definitions) {
+			g->nr_discarded_calls++;
+			continue;
+		}
+		c->next_out = caller->outgoing;
+		caller->outgoing = i;
+		if (c->callee != NO_NODE) {
+			c->next_in = g->nodes[c->callee].incoming;
+			g->nodes[c->callee].incoming = i;
+		}
+	}
 }
 
 static bool graph_node_known(const struct error_node *n)
@@ -1500,10 +1549,11 @@ static void print_function_resolution(const struct error_graph *g, size_t node)
 	size_t e;
 
 	fprintf(stderr, "fmodret function: %s section=%u address=%#llx flags=%#x "
-		"definitions=%u linkage=%s clean=%s candidate=%s "
+		"definitions=%u strong-descriptions=%u weak-descriptions=%u "
+		"linkage=%s clean=%s candidate=%s "
 		"errno-proven=%u/%u syscall=%s propagation-reasons=",
 		n->name, (unsigned int)n->shndx, (unsigned long long)n->value,
-		n->flags, n->definitions,
+		n->flags, n->definitions, n->strong_definitions, n->weak_definitions,
 		n->flags & FMODRET_FN_LOCAL ? "local" : "global",
 		!n->clean ? "no" : n->clean_via == NO_NODE ? "atomic" : "constructed",
 		n->clean && !mask ? "yes" : !n->clean ? "no:not-clean" : "no:unproven",
@@ -1555,6 +1605,9 @@ static int resolve_error_graph(struct error_graph *g,
 			"%zu references), %zu described bodies, %zu ELF bodies, %zu calls\n",
 			g->nr_records, g->nr_defined_records, g->nr_reference_records,
 			described, g->nr_nodes, g->nr_calls);
+	if (verbose)
+		fprintf(stderr, "fmodret definitions: %zu overridden weak descriptions, "
+			"%zu discarded call sites\n", g->nr_overridden_weak, g->nr_discarded_calls);
 	if (!g->nr_nodes) {
 		if (verbose) {
 			fprintf(stderr, "fmodret clean: 0 atomic, 0 constructed, 0 total\n");
@@ -1571,7 +1624,8 @@ static int resolve_error_graph(struct error_graph *g,
 	for (i = 0; i < g->nr_nodes; i++) {
 		struct error_node *n = &g->nodes[i];
 
-		if (n->definitions == 1 && (n->flags & FMODRET_FN_CLEAN_SEED)) {
+		if (n->definitions == 1 && !(n->flags & FMODRET_FN_WEAK) &&
+		    (n->flags & FMODRET_FN_CLEAN_SEED)) {
 			n->clean = true;
 			queue[tail++] = i;
 		}
@@ -1585,6 +1639,7 @@ static int resolve_error_graph(struct error_graph *g,
 			struct error_node *caller = &g->nodes[c->caller];
 
 			if (!caller->clean && caller->definitions == 1 &&
+			    !(caller->flags & FMODRET_FN_WEAK) &&
 			    (caller->flags & FMODRET_FN_INTEGER) &&
 			    (c->flags & FMODRET_CALL_CLEAN_PREFIX) && all_errors_known(c)) {
 				caller->clean = true;
@@ -1714,6 +1769,7 @@ static int read_error_metadata(Elf *elf, Elf_Scn *scn, size_t ptr_size,
 				encoding, verbose);
 	if (err)
 		goto out;
+	select_error_descriptions(&g);
 	err = graph_relocations(elf, functions, &g, elf_ndxscn(scn), &shdr,
 				buf, refs, ptr_size, encoding, true);
 	if (err)
