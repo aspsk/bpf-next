@@ -497,6 +497,25 @@ static bool isDispatchTable(StringRef Name)
 	       Name == "ia32_sys_call_table" || Name == "x32_sys_call_table";
 }
 
+static bool assemblyReferences(StringRef Assembly, StringRef Name)
+{
+	if (Name.empty())
+		return false;
+	auto SymbolChar = [](char C) {
+		return (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') ||
+		       (C >= '0' && C <= '9') || C == '_' || C == '.' || C == '$';
+	};
+	for (size_t Pos = Assembly.find(Name); Pos != StringRef::npos;
+	     Pos = Assembly.find(Name, Pos + Name.size())) {
+		size_t End = Pos + Name.size();
+
+		if ((!Pos || !SymbolChar(Assembly[Pos - 1])) &&
+		    (End == Assembly.size() || !SymbolChar(Assembly[End])))
+			return true;
+	}
+	return false;
+}
+
 static bool addressEscapes(const Value *V, SmallPtrSetImpl<const Value *> &Seen)
 {
 	if (!Seen.insert(V).second)
@@ -611,7 +630,7 @@ public:
 			bool Defined = !F.isDeclaration();
 			SmallPtrSet<const Value *, 32> Seen;
 			unsigned Flags = Defined ? FMODRET_FN_DEFINED : 0;
-			if (addressEscapes(&F, Seen) || Assembly.find(F.getName().str()) != std::string::npos)
+			if (addressEscapes(&F, Seen) || assemblyReferences(Assembly, F.getName()))
 				Flags |= FMODRET_FN_ESCAPED;
 			if (!Defined && !(Flags & FMODRET_FN_ESCAPED))
 				continue;
