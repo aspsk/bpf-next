@@ -985,6 +985,54 @@ static bool jump_label_reference(const GElf_Ehdr *ehdr,
 	return field == 0 || field == 4;
 }
 
+static bool arm64_code_metadata_reference(Elf *elf, const char *name,
+					 Elf_Scn *scn, const GElf_Shdr *shdr,
+					 size_t offset, const GElf_Sym *sym,
+					 GElf_Sxword addend, unsigned int encoding)
+{
+	Elf_Data *data;
+	GElf_Shdr code;
+	GElf_Addr address;
+	size_t field;
+
+	if (!strcmp(name, ".altinstructions")) {
+		/* arm64 struct alt_instr: two s32 offsets, u16 cpucap and
+		 * two u8 lengths. The second offset can name a real callback.
+		 */
+		if (shdr->sh_size % 12)
+			return false;
+		field = offset % 12;
+		if (!field)
+			return true;
+		if (field != 4)
+			return false;
+		data = elf_getdata(scn, NULL);
+		if (!data || data->d_off || data->d_size != shdr->sh_size)
+			return false;
+		return !(read_elf_value((unsigned char *)data->d_buf + offset + 4,
+				       2, encoding) & (1U << 15));
+	}
+	if (strcmp(name, "__bug_table"))
+		return false;
+	/* A bug record points at a BRK #BUG_BRK_IMM instruction. Check the
+	 * instruction instead of guessing the configuration-dependent record
+	 * size. Filename references and arbitrary function pointers stay audited.
+	 */
+	scn = elf_getscn(elf, sym->st_shndx);
+	if (!scn || !gelf_getshdr(scn, &code) || !(code.sh_flags & SHF_EXECINSTR))
+		return false;
+	address = sym->st_value + addend;
+	if (address < code.sh_addr || address - code.sh_addr > code.sh_size ||
+	    code.sh_size - (address - code.sh_addr) < 4)
+		return false;
+	data = elf_getdata(scn, NULL);
+	if (!data || data->d_off || data->d_size != code.sh_size)
+		return false;
+	/* AArch64 instructions are little endian even in a big-endian ELF. */
+	return read_elf_value((unsigned char *)data->d_buf + address - code.sh_addr,
+			      4, ELFDATA2LSB) == 0xd4210000;
+}
+
 static bool described_call(const struct error_graph *g, size_t caller,
 			   size_t callee)
 {
@@ -1168,6 +1216,10 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 				handled |= in_symbol_range(&skip[j], shdr.sh_info, site);
 			if (handled || jump_label_reference(&ehdr, &jump_table,
 							   shdr.sh_info, site, type, ptr_size))
+				continue;
+			if (ehdr.e_machine == EM_AARCH64 && type == R_AARCH64_PREL32 &&
+			    arm64_code_metadata_reference(elf, name, target_scn, &target,
+							  offset, &sym, rela.r_addend, encoding))
 				continue;
 			if (!described_call(g, caller, node))
 				record_unmodelled_reference(g, node,
