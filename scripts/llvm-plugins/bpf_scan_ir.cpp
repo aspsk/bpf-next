@@ -317,8 +317,18 @@ static bool evaluateCondition(const Value *V, const CallBase &Call, int Error,
 		return true;
 	}
 	auto *Cmp = dyn_cast<ICmpInst>(V);
-	if (!Cmp || !Cmp->getOperand(0)->getType()->isIntegerTy() ||
-	    Depth >= MaxValueDepth)
+	if (Depth >= MaxValueDepth)
+		return false;
+	if (!Cmp) {
+		// Cleanup can use a boolean PHI/select to choose return or loop.
+		// Resolve it on this path before considering both successors.
+		auto Map = evaluateValue(V, Call, Error, Preds, Depth + 1);
+		if (Map.Kind != FMODRET_ERROR_CONSTANT)
+			return false;
+		Truth = Map.Replacement != 0;
+		return true;
+	}
+	if (!Cmp->getOperand(0)->getType()->isIntegerTy())
 		return false;
 	auto L = evaluateValue(Cmp->getOperand(0), Call, Error, Preds, Depth + 1);
 	auto R = evaluateValue(Cmp->getOperand(1), Call, Error, Preds, Depth + 1);
