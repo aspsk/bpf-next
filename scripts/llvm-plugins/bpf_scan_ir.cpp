@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* bpf_scan_ir: optimizer-last LLVM IR analysis for BPF. */
 
+#include "fmodret_metadata.h"
+
+#include <algorithm>
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LazyValueInfo.h"
@@ -14,6 +18,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -269,18 +274,305 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 	return false;
 }
 
-static void emitCandidates(Module &M, ArrayRef<Constant *> Fns)
+// Propagation deliberately ignores cleanup side effects. Only returned values
+// and control flow matter here; prefix cleanliness is collected independently.
+struct ErrorMap {
+	unsigned Kind = FMODRET_ERROR_UNKNOWN;
+	int Replacement = 0;
+
+	bool operator==(const ErrorMap &Other) const
+	{
+		return Kind == Other.Kind && Replacement == Other.Replacement;
+	}
+};
+
+struct ErrorCase {
+	int First, Last;
+	ErrorMap Map;
+};
+
+struct CallDescription {
+	Function *Callee;
+	unsigned Flags;
+	SmallVector<ErrorCase, 4> Cases;
+};
+
+struct FunctionDescription {
+	Function *Fn;
+	unsigned Flags;
+	SmallVector<CallDescription, 8> Calls;
+};
+
+using Predecessors = DenseMap<const BasicBlock *, const BasicBlock *>;
+
+static ErrorMap evaluateValue(const Value *V, const CallBase &Call, int Error,
+			      const Predecessors &Preds, unsigned Depth = 0);
+
+static bool evaluateCondition(const Value *V, const CallBase &Call, int Error,
+			      const Predecessors &Preds, bool &Truth,
+			      unsigned Depth)
 {
-	auto *PtrTy = PointerType::getUnqual(M.getContext());
-	auto *ArrTy = ArrayType::get(PtrTy, Fns.size());
-	auto isConstant = true;
-	auto *GV = new GlobalVariable(M, ArrTy, isConstant,
-				      GlobalValue::PrivateLinkage,
-				      ConstantArray::get(ArrTy, Fns),
-				      "fmodret_candidates.table");
-	GV->setSection(".BTF_fmodret_candidates");
-	GV->setAlignment(M.getDataLayout().getPointerABIAlignment(0));
-	appendToUsed(M, {GV});
+	if (auto *C = dyn_cast<ConstantInt>(V)) {
+		Truth = !C->isZero();
+		return true;
+	}
+	auto *Cmp = dyn_cast<ICmpInst>(V);
+	if (!Cmp || !Cmp->getOperand(0)->getType()->isIntegerTy() ||
+	    Depth >= MaxValueDepth)
+		return false;
+	auto L = evaluateValue(Cmp->getOperand(0), Call, Error, Preds, Depth + 1);
+	auto R = evaluateValue(Cmp->getOperand(1), Call, Error, Preds, Depth + 1);
+	if (!L.Kind || !R.Kind)
+		return false;
+	unsigned Width = Cmp->getOperand(0)->getType()->getIntegerBitWidth();
+	if (Width != 32 && Width != 64)
+		return false;
+	APInt Left(Width, L.Kind == FMODRET_ERROR_IDENTITY ? Error : L.Replacement, true);
+	APInt Right(Width, R.Kind == FMODRET_ERROR_IDENTITY ? Error : R.Replacement, true);
+	Truth = ICmpInst::compare(Left, Right, Cmp->getPredicate());
+	return true;
+}
+
+static ErrorMap evaluateValue(const Value *V, const CallBase &Call, int Error,
+			      const Predecessors &Preds, unsigned Depth)
+{
+	if (!V || Depth >= MaxValueDepth)
+		return {};
+	if (V == &Call)
+		return {FMODRET_ERROR_IDENTITY, 0};
+	if (auto *C = dyn_cast<ConstantInt>(V)) {
+		if (C->getBitWidth() <= 64 && C->getValue().isSignedIntN(32))
+			return {FMODRET_ERROR_CONSTANT, (int)C->getSExtValue()};
+		return {};
+	}
+	if (auto *Cast = dyn_cast<CastInst>(V)) {
+		// These casts preserve every member of the negative errno domain.
+		if ((isa<SExtInst>(Cast) || isa<TruncInst>(Cast) || isa<BitCastInst>(Cast)) &&
+		    Cast->getSrcTy()->isIntegerTy() &&
+		    Cast->getDestTy()->isIntegerTy() &&
+		    Cast->getSrcTy()->getIntegerBitWidth() >= 32 &&
+		    Cast->getDestTy()->getIntegerBitWidth() >= 32)
+			return evaluateValue(Cast->getOperand(0), Call, Error, Preds, Depth + 1);
+		return {};
+	}
+	if (auto *Phi = dyn_cast<PHINode>(V)) {
+		auto It = Preds.find(Phi->getParent());
+		if (It == Preds.end())
+			return {};
+		int I = Phi->getBasicBlockIndex(It->second);
+		return I < 0 ? ErrorMap{} :
+			evaluateValue(Phi->getIncomingValue(I), Call, Error, Preds, Depth + 1);
+	}
+	if (auto *Select = dyn_cast<SelectInst>(V)) {
+		bool Truth;
+		if (evaluateCondition(Select->getCondition(), Call, Error, Preds, Truth, Depth + 1))
+			return evaluateValue(Select->getOperand(Truth ? 1 : 2), Call, Error,
+					     Preds, Depth + 1);
+		auto L = evaluateValue(Select->getTrueValue(), Call, Error, Preds, Depth + 1);
+		auto R = evaluateValue(Select->getFalseValue(), Call, Error, Preds, Depth + 1);
+		return L == R ? L : ErrorMap{};
+	}
+	return {};
+}
+
+static ErrorMap traceError(const CallBase &Call, int Error)
+{
+	struct Path {
+		const BasicBlock *BB;
+		Predecessors Preds;
+	};
+	SmallVector<Path, 8> Work;
+	Path Initial;
+	Initial.BB = Call.getParent();
+	Work.push_back(std::move(Initial));
+	ErrorMap Result;
+	bool HaveResult = false;
+	unsigned Budget = 256;
+
+	while (!Work.empty()) {
+		if (!Budget--)
+			return {};
+		auto P = Work.pop_back_val();
+		const Instruction *Term = P.BB->getTerminator();
+		if (auto *Ret = dyn_cast<ReturnInst>(Term)) {
+			auto Map = evaluateValue(Ret->getReturnValue(), Call, Error, P.Preds);
+			if (Map.Kind == FMODRET_ERROR_CONSTANT &&
+			    (Map.Replacement >= 0 || Map.Replacement < -MaxErrno))
+				return {};
+			if (!Map.Kind || (HaveResult && !(Result == Map)))
+				return {};
+			Result = Map;
+			HaveResult = true;
+			continue;
+		}
+		SmallVector<const BasicBlock *, 4> Next;
+#if LLVM_VERSION_MAJOR >= 24
+		if (auto *Br = dyn_cast<CondBrInst>(Term)) {
+#else
+		if (auto *Br = dyn_cast<BranchInst>(Term); Br && Br->isConditional()) {
+#endif
+			bool Truth;
+			if (evaluateCondition(Br->getCondition(), Call, Error, P.Preds, Truth, 0))
+				Next.push_back(Br->getSuccessor(Truth ? 0 : 1));
+			else {
+				Next.push_back(Br->getSuccessor(0));
+				Next.push_back(Br->getSuccessor(1));
+			}
+		} else if (auto *Sw = dyn_cast<SwitchInst>(Term)) {
+			auto Map = evaluateValue(Sw->getCondition(), Call, Error, P.Preds);
+			if (Map.Kind) {
+				int N = Map.Kind == FMODRET_ERROR_IDENTITY ? Error : Map.Replacement;
+				const BasicBlock *Dest = Sw->getDefaultDest();
+				for (auto C : Sw->cases())
+					if (C.getCaseValue()->getValue() == APInt(Sw->getCondition()->getType()->getIntegerBitWidth(), N, true))
+						Dest = C.getCaseSuccessor();
+				Next.push_back(Dest);
+			} else {
+				for (const BasicBlock *Succ : successors(P.BB))
+					Next.push_back(Succ);
+			}
+		} else if (Term->getNumSuccessors() == 1 &&
+			   Term->getOpcode() == Instruction::Br) {
+			Next.push_back(Term->getSuccessor(0));
+		} else {
+			// Includes unreachable, exceptional exits and indirect branches.
+			return {};
+		}
+		for (const BasicBlock *Succ : Next) {
+			if (Succ == Call.getParent() || P.Preds.count(Succ))
+				return {}; // No proof of termination for a cycle.
+			auto Q = P;
+			Q.Preds[Succ] = P.BB;
+			Q.BB = Succ;
+			Work.push_back(std::move(Q));
+		}
+	}
+	return HaveResult ? Result : ErrorMap{};
+}
+
+static SmallVector<ErrorCase, 4> describeErrors(const CallBase &Call)
+{
+	SmallVector<ErrorCase, 4> Cases;
+	SmallVector<int, 16> Cuts = {-MaxErrno, 0};
+	if (!Call.getType()->isIntegerTy(32) && !Call.getType()->isIntegerTy(64))
+		return {{-MaxErrno, -1, {}}};
+	// Only identity and constant expressions are evaluated. Splitting at every
+	// comparison/switch constant makes their truth invariant in each interval.
+	auto AddCut = [&](const ConstantInt *C) {
+		if (!C || C->getBitWidth() > 64 || !C->getValue().isSignedIntN(32))
+			return;
+		int64_t N = C->getSExtValue();
+		if (N >= -MaxErrno && N < 0) {
+			Cuts.push_back(N);
+			Cuts.push_back(N + 1);
+		}
+	};
+	// Include constants feeding PHIs/selects too: a comparison threshold
+	// need not occur directly as an ICmp operand.
+	for (const BasicBlock &BB : *Call.getFunction())
+		for (const Instruction &I : BB)
+			for (const Use &U : I.operands())
+				AddCut(dyn_cast<ConstantInt>(U.get()));
+	llvm::sort(Cuts);
+	Cuts.erase(std::unique(Cuts.begin(), Cuts.end()), Cuts.end());
+	if (Cuts.size() > 128)
+		return {{-MaxErrno, -1, {}}};
+	for (unsigned I = 1; I < Cuts.size(); I++) {
+		ErrorCase C{Cuts[I - 1], Cuts[I] - 1, traceError(Call, Cuts[I - 1])};
+		if (!Cases.empty() && Cases.back().Map == C.Map)
+			Cases.back().Last = C.Last;
+		else
+			Cases.push_back(C);
+	}
+	return Cases;
+}
+
+static bool isDispatchTable(StringRef Name)
+{
+	return Name == "sys_call_table" || Name == "compat_sys_call_table" ||
+	       Name == "ia32_sys_call_table" || Name == "x32_sys_call_table";
+}
+
+static bool addressEscapes(const Value *V, SmallPtrSetImpl<const Value *> &Seen)
+{
+	if (!Seen.insert(V).second)
+		return false;
+	for (const Use &U : V->uses()) {
+		const User *User = U.getUser();
+		if (auto *Call = dyn_cast<CallBase>(User)) {
+			if (&U == &Call->getCalledOperandUse())
+				continue;
+			return true;
+		}
+		if (auto *GV = dyn_cast<GlobalVariable>(User)) {
+			// These references describe the function rather than calling it.
+			if (isDispatchTable(GV->getName()) ||
+			    GV->getSection() == "_error_injection_whitelist")
+				continue;
+			return true;
+		}
+		if (isa<Constant>(User) && !isa<GlobalValue>(User)) {
+			if (addressEscapes(User, Seen))
+				return true;
+			continue;
+		}
+		return true;
+	}
+	return false;
+}
+
+static void findCleanPrefixes(Function &F, SmallPtrSetImpl<const CallBase *> &Clean)
+{
+	SmallPtrSet<BasicBlock *, 32> Seen;
+	SmallVector<BasicBlock *, 16> Work{&F.getEntryBlock()};
+	Seen.insert(&F.getEntryBlock());
+	while (!Work.empty()) {
+		BasicBlock *BB = Work.pop_back_val();
+		bool Dirty = false;
+		for (Instruction &I : *BB) {
+			if (auto *Call = dyn_cast<CallBase>(&I))
+				Clean.insert(Call);
+			if (!isCleanInstruction(I)) {
+				Dirty = true;
+				break;
+			}
+		}
+		if (!Dirty)
+			for (BasicBlock *Succ : successors(BB))
+				if (Seen.insert(Succ).second)
+					Work.push_back(Succ);
+	}
+}
+
+static void emitDescriptions(Module &M, ArrayRef<FunctionDescription> Functions)
+{
+	LLVMContext &C = M.getContext();
+	auto *I32 = Type::getInt32Ty(C);
+	auto *Ptr = PointerType::getUnqual(C);
+	auto N = [&](unsigned V) -> Constant * { return ConstantInt::get(I32, V); };
+	auto Struct = [&](ArrayRef<Constant *> Fields) -> Constant * {
+		return ConstantStruct::getAnon(C, Fields, true);
+	};
+	unsigned PtrSize = M.getDataLayout().getPointerSize();
+	for (const auto &F : Functions) {
+		SmallVector<Constant *, 16> Calls;
+		unsigned Size = FMODRET_META_HEADER_SIZE(PtrSize);
+		for (const auto &Call : F.Calls) {
+			SmallVector<Constant *, 8> Cases;
+			for (const auto &E : Call.Cases)
+				Cases.push_back(Struct({N(E.First), N(E.Last), N(E.Map.Kind), N(E.Map.Replacement)}));
+			Constant *Callee = Call.Callee ? (Constant *)Call.Callee : ConstantPointerNull::get(Ptr);
+			Calls.push_back(Struct({Callee, N(Call.Flags), N(Cases.size()), Struct(Cases)}));
+			Size += FMODRET_META_CALL_SIZE(PtrSize) + Cases.size() * FMODRET_META_CASE_SIZE;
+		}
+		Constant *Record = Struct({N(FMODRET_META_MAGIC), N(FMODRET_META_VERSION),
+			N(Size), N(F.Flags), F.Fn, N(Calls.size()), N(0), Struct(Calls)});
+		auto *GV = new GlobalVariable(M, Record->getType(), true, GlobalValue::PrivateLinkage,
+					      Record, "fmodret.function." + F.Fn->getName());
+		GV->setSection(".BTF_fmodret_candidates");
+		GV->setAlignment(M.getDataLayout().getPointerABIAlignment(0));
+		appendToUsed(M, {GV});
+	}
 }
 
 #if LLVM_VERSION_MAJOR >= 24
@@ -297,31 +589,60 @@ public:
 		if (M.getNamedMetadata("bpf_scan_ir.done"))
 			return PreservedAnalyses::all();
 
-		SmallVector<Constant *> Fns;
+		std::string Assembly = M.getModuleInlineAsm();
+		for (Function &F : M)
+			for (BasicBlock &BB : F)
+				for (Instruction &I : BB)
+					if (auto *Call = dyn_cast<CallBase>(&I))
+						if (auto *Asm = dyn_cast<InlineAsm>(Call->getCalledOperand()))
+							Assembly += "\n" + Asm->getAsmString();
+		SmallVector<FunctionDescription, 32> Descriptions;
 		auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
+		// Finish collecting every fact before introducing metadata references.
 		for (Function &F : M) {
-			if (F.isDeclaration() ||
-			    F.hasWeakAnyLinkage() || // to be removed later when we can track __weak properly
-			    F.hasAvailableExternallyLinkage() ||
-			    F.hasAddressTaken() || // to be removed later when we add tracking
-			    !F.getReturnType()->isIntegerTy())
+			if (F.isIntrinsic() || F.hasAvailableExternallyLinkage() ||
+			    (F.isDeclaration() && F.use_empty()))
 				continue;
-
-			unsigned Width = F.getReturnType()->getIntegerBitWidth();
-			if (Width != 32 && Width != 64)
+			bool Defined = !F.isDeclaration();
+			SmallPtrSet<const Value *, 32> Seen;
+			unsigned Flags = Defined ? FMODRET_FN_DEFINED : 0;
+			if (addressEscapes(&F, Seen) || Assembly.find(F.getName().str()) != std::string::npos)
+				Flags |= FMODRET_FN_ESCAPED;
+			if (!Defined && !(Flags & FMODRET_FN_ESCAPED))
 				continue;
-
-			auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
-			auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-			if (functionHasCleanErrnoPath(F, LVI, DT))
-				Fns.push_back(&F);
+			if (F.hasLocalLinkage())
+				Flags |= FMODRET_FN_LOCAL;
+			if (F.isWeakForLinker())
+				Flags |= FMODRET_FN_WEAK;
+			if (F.getReturnType()->isIntegerTy(32) || F.getReturnType()->isIntegerTy(64)) {
+				Flags |= FMODRET_FN_INTEGER;
+				if (Defined) {
+					auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
+					auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+					if (functionHasCleanErrnoPath(F, LVI, DT))
+						Flags |= FMODRET_FN_CLEAN_SEED;
+				}
+			}
+			FunctionDescription D{&F, Flags, {}};
+			if (Defined) {
+				SmallPtrSet<const CallBase *, 32> Prefixes;
+				findCleanPrefixes(F, Prefixes);
+				for (BasicBlock &BB : F)
+					for (Instruction &I : BB)
+						if (auto *Call = dyn_cast<CallBase>(&I)) {
+							auto *Callee = dyn_cast<Function>(Call->getCalledOperand()->stripPointerCasts());
+							if (Callee && Callee->isIntrinsic())
+								Callee = nullptr;
+							D.Calls.push_back({Callee, Prefixes.contains(Call) ?
+								FMODRET_CALL_CLEAN_PREFIX : 0U, describeErrors(*Call)});
+						}
+			}
+			Descriptions.push_back(std::move(D));
 		}
-
-		if (Fns.empty())
+		if (Descriptions.empty())
 			return PreservedAnalyses::all();
-
-		emitCandidates(M, Fns);
+		emitDescriptions(M, Descriptions);
 		M.getOrInsertNamedMetadata("bpf_scan_ir.done");
 
 		PreservedAnalyses PA;

@@ -15,13 +15,19 @@ if LLVM_PLUGINS
 config CLANG_PLUGIN_BPF_SCAN_IR
 	bool "Scan optimized LLVM IR for BPF"
 	depends on DEBUG_INFO_BTF
+	depends on !LTO_CLANG
 	default y
 	help
 	  Run bpf_scan_ir at optimizer-last to collect metadata for BPF.
 	  The current analysis discovers fmod_ret candidates.
 
-	  Emit compiler-derived references to functions which may return errno.
-	  The resolve_btfids tool uses this metadata to construct the fmod_ret
-	  allow-list.
+	  Describe functions, direct calls, clean prefixes and errno propagation
+	  in one build-only ELF section. The resolve_btfids tool derives clean
+	  functions and admits functions only when every negative errno
+	  propagates through all callers to a syscall table entry.
+
+	  Unknown callers, escaped addresses and unproved cycles are rejected.
+	  This analysis currently requires a non-LTO build, so descriptions refer
+	  to the final optimized functions in each compilation unit.
 
 endif
