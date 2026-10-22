@@ -28,7 +28,8 @@
  * ADDRESS_TAKEN is diagnostic only. ESCAPED denotes an untracked use, not
  * merely taking an address or passing it through a described callback flow.
  *
- * CLEAN_SEED describes an existing side-effect-free errno path. CLEAN_PREFIX
+ * CLEAN_SEED describes an existing side-effect-free integer errno or ERR_PTR
+ * path. Both return kinds participate in clean-function derivation. CLEAN_PREFIX
  * covers entry through the instruction before the call. Error cases describe
  * all continuations after a failed call, irrespective of cleanup side effects.
  * UNKNOWN includes discarded results, unsupported expressions and loops.
@@ -41,11 +42,11 @@
  * NETLINK_RCV is an endpoint flag for a callback returning an errno to
  * netlink_rcv_skb(). It describes framework handling, including the -EINTR
  * path without an ACK, rather than guaranteed error delivery to userspace.
- * Pointer results are propagation relays only.
+ * Pointer results can be clean relays but are not injection candidates.
  * These facts cover negative errno injection only, not arbitrary return values.
  */
 #define FMODRET_META_MAGIC 0x46524d32U
-#define FMODRET_META_VERSION 4U
+#define FMODRET_META_VERSION 5U
 #define FMODRET_META_ERRNOS 4095
 #define FMODRET_META_HEADER_SIZE(ptr_size) (24 + (ptr_size))
 #define FMODRET_META_PARAM_SIZE 8
@@ -62,7 +63,7 @@
 #define FMODRET_FN_ESCAPED (1U << 3)
 #define FMODRET_FN_WEAK (1U << 4)
 #define FMODRET_FN_INTEGER (1U << 5)
-/* Error pointers can relay errno values without becoming injection candidates. */
+/* Error pointers can be clean and relay errno values without being candidates. */
 #define FMODRET_FN_ERRPTR (1U << 6)
 #define FMODRET_FN_RET64 (1U << 7)
 #define FMODRET_FN_ADDRESS_TAKEN (1U << 8)
