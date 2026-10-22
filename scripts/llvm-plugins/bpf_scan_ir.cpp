@@ -201,12 +201,297 @@ static bool isErrnoConstant(const Value *V, const DataLayout &DL)
 	return N >= -MaxErrno && N < 0;
 }
 
+using BooleanFacts = DenseMap<const Value *, bool>;
+
+static bool knownBoolean(const Value *V, const BooleanFacts &Facts, bool &Truth,
+			 unsigned Depth = 0, const Value *Ignore = nullptr)
+{
+	if (Depth >= MaxValueDepth)
+		return false;
+	if (auto *C = dyn_cast<ConstantInt>(V)) {
+		Truth = !C->isZero();
+		return true;
+	}
+	auto It = Facts.find(V);
+	if (V != Ignore && It != Facts.end()) {
+		Truth = It->second;
+		return true;
+	}
+	if (auto *B = dyn_cast<BinaryOperator>(V); B && B->getType()->isIntegerTy(1)) {
+		bool L = false, R = false;
+		bool KL = knownBoolean(B->getOperand(0), Facts, L, Depth + 1, Ignore);
+		bool KR = knownBoolean(B->getOperand(1), Facts, R, Depth + 1, Ignore);
+
+		if (B->getOpcode() == Instruction::And && ((KL && !L) || (KR && !R)))
+			Truth = false;
+		else if (B->getOpcode() == Instruction::Or && ((KL && L) || (KR && R)))
+			Truth = true;
+		else if (KL && KR && (B->getOpcode() == Instruction::And ||
+			 B->getOpcode() == Instruction::Or || B->getOpcode() == Instruction::Xor))
+			Truth = B->getOpcode() == Instruction::And ? L && R :
+				B->getOpcode() == Instruction::Or ? L || R : L != R;
+		else
+			return false;
+		return true;
+	}
+	if (auto *C = dyn_cast<ICmpInst>(V);
+	    C && C->isEquality() && C->getOperand(0)->getType()->isIntegerTy(1)) {
+		bool L, R;
+		if (knownBoolean(C->getOperand(0), Facts, L, Depth + 1, Ignore) &&
+		    knownBoolean(C->getOperand(1), Facts, R, Depth + 1, Ignore)) {
+			Truth = C->getPredicate() == CmpInst::ICMP_EQ ? L == R : L != R;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool assumeBoolean(const Value *V, bool Truth, BooleanFacts &Facts,
+			  unsigned Depth = 0)
+{
+	if (Depth >= MaxValueDepth || Facts.size() >= MaxValueDepth)
+		return false;
+	bool Known;
+	if (knownBoolean(V, Facts, Known))
+		return Known == Truth;
+	Facts[V] = Truth;
+	if (auto *B = dyn_cast<BinaryOperator>(V); B && B->getType()->isIntegerTy(1)) {
+		if ((B->getOpcode() == Instruction::And && Truth) ||
+		    (B->getOpcode() == Instruction::Or && !Truth))
+			return assumeBoolean(B->getOperand(0), Truth, Facts, Depth + 1) &&
+			       assumeBoolean(B->getOperand(1), Truth, Facts, Depth + 1);
+		if (B->getOpcode() == Instruction::Xor) {
+			for (unsigned I = 0; I < 2; I++)
+				if (auto *C = dyn_cast<ConstantInt>(B->getOperand(I)))
+					return assumeBoolean(B->getOperand(1 - I),
+						Truth != !C->isZero(), Facts, Depth + 1);
+		}
+	}
+	if (auto *C = dyn_cast<ICmpInst>(V);
+	    C && C->isEquality() && C->getOperand(0)->getType()->isIntegerTy(1)) {
+		for (unsigned I = 0; I < 2; I++)
+			if (auto *K = dyn_cast<ConstantInt>(C->getOperand(I)))
+				return assumeBoolean(C->getOperand(1 - I),
+					(Truth == (C->getPredicate() == CmpInst::ICMP_EQ)) ==
+					!K->isZero(), Facts, Depth + 1);
+	}
+	return true;
+}
+
+using UnsignedInterval = std::pair<APInt, APInt>;
+using UnsignedIntervals = SmallVector<UnsignedInterval, 4>;
+
+static UnsignedIntervals rangeIntervals(const ConstantRange &Range)
+{
+	unsigned Width = Range.getBitWidth();
+	APInt Zero(Width, 0), Last = APInt::getAllOnes(Width);
+	if (Range.isEmptySet())
+		return {};
+	if (Range.isFullSet())
+		return {{Zero, Last}};
+	if (Range.getLower().ult(Range.getUpper()))
+		return {{Range.getLower(), Range.getUpper() - 1}};
+	UnsignedIntervals Parts{{Range.getLower(), Last}};
+	if (!Range.getUpper().isZero())
+		Parts.emplace_back(Zero, Range.getUpper() - 1);
+	return Parts;
+}
+
+static bool conditionsConsistent(const BooleanFacts &Facts, const DataLayout &DL,
+				 LazyValueInfo *LVI = nullptr, Instruction *Context = nullptr)
+{
+	DenseMap<const Value *, UnsignedIntervals> Ranges;
+	for (const auto &Fact : Facts) {
+		bool Known;
+		if (knownBoolean(Fact.first, Facts, Known, 0, Fact.first) && Known != Fact.second)
+			return false;
+		auto *Cmp = dyn_cast<ICmpInst>(Fact.first);
+		if (!Cmp)
+			continue;
+		const Value *V = Cmp->getOperand(0), *K = Cmp->getOperand(1);
+		auto Pred = Cmp->getPredicate();
+		if (isa<Constant>(V) && !isa<Constant>(K)) {
+			std::swap(V, K);
+			Pred = CmpInst::getSwappedPredicate(Pred);
+		}
+		unsigned Width = V->getType()->isIntegerTy() ?
+			V->getType()->getIntegerBitWidth() :
+			isErrorPointerType(V->getType(), DL) ? DL.getPointerTypeSizeInBits(V->getType()) : 0;
+		if (!Width || Width > 64)
+			continue;
+		APInt Bits(Width, 0);
+		if (auto *C = dyn_cast<ConstantInt>(K))
+			Bits = C->getValue();
+		else if (auto *E = dyn_cast<ConstantExpr>(K);
+			 E && E->getOpcode() == Instruction::IntToPtr &&
+			 isa<ConstantInt>(E->getOperand(0)))
+			Bits = cast<ConstantInt>(E->getOperand(0))->getValue().zextOrTrunc(Width);
+		else if (!isa<ConstantPointerNull>(K))
+			continue;
+		if (!Fact.second)
+			Pred = CmpInst::getInversePredicate(Pred);
+		ConstantRange Region = ConstantRange::makeExactICmpRegion(Pred, Bits);
+		if (auto *Cast = dyn_cast<PtrToIntInst>(V);
+		    Cast && isErrorPointerType(Cast->getPointerOperand()->getType(), DL) &&
+		    Width == DL.getPointerTypeSizeInBits(Cast->getPointerOperand()->getType()))
+			V = Cast->getPointerOperand();
+		auto It = Ranges.find(V);
+		UnsignedIntervals Allowed = It == Ranges.end() ?
+			rangeIntervals(LVI && isa<Argument>(V) && V->getType()->isIntegerTy() ?
+				LVI->getConstantRange(const_cast<Value *>(V), Context, false) :
+				ConstantRange::getFull(Width)) : It->second;
+		UnsignedIntervals Intersection;
+		for (const auto &A : Allowed)
+			for (const auto &B : rangeIntervals(Region)) {
+				APInt Low = A.first.ugt(B.first) ? A.first : B.first;
+				APInt High = A.second.ult(B.second) ? A.second : B.second;
+				if (Low.ule(High))
+					Intersection.emplace_back(std::move(Low), std::move(High));
+			}
+		if (Intersection.empty())
+			return false;
+		Ranges.insert_or_assign(V, std::move(Intersection));
+	}
+	return true;
+}
+
+// Unknown select choices need an actual witness for the supported condition
+// language. Unsupported relations and exhausted searches do not establish one.
+static bool collectConditionAtoms(const Value *V, SmallPtrSetImpl<const Value *> &Atoms,
+				  unsigned Depth = 0)
+{
+	if (Depth >= MaxValueDepth || Atoms.size() > 12)
+		return false;
+	if (isa<ConstantInt>(V))
+		return V->getType()->isIntegerTy(1);
+	if (isa<Argument>(V) && V->getType()->isIntegerTy(1)) {
+		Atoms.insert(V);
+		return true;
+	}
+	if (auto *B = dyn_cast<BinaryOperator>(V);
+	    B && B->getType()->isIntegerTy(1) &&
+	    (B->getOpcode() == Instruction::And || B->getOpcode() == Instruction::Or ||
+	     B->getOpcode() == Instruction::Xor))
+		return collectConditionAtoms(B->getOperand(0), Atoms, Depth + 1) &&
+		       collectConditionAtoms(B->getOperand(1), Atoms, Depth + 1);
+	auto *Cmp = dyn_cast<ICmpInst>(V);
+	if (!Cmp)
+		return false;
+	if (Cmp->isEquality() && Cmp->getOperand(0)->getType()->isIntegerTy(1))
+		return collectConditionAtoms(Cmp->getOperand(0), Atoms, Depth + 1) &&
+		       collectConditionAtoms(Cmp->getOperand(1), Atoms, Depth + 1);
+	const Value *A = Cmp->getOperand(0), *B = Cmp->getOperand(1);
+	if (isa<ConstantInt>(A))
+		std::swap(A, B);
+	if (!isa<Argument>(A) || !isa<ConstantInt>(B) ||
+	    !A->getType()->isIntegerTy() || A->getType()->getIntegerBitWidth() > 64)
+		return false;
+	Atoms.insert(V);
+	return true;
+}
+
+static bool conditionWitness(ArrayRef<const Value *> Atoms, unsigned Index,
+			      const BooleanFacts &Facts, LazyValueInfo &LVI,
+			      DominatorTree &DT, Instruction *Context, unsigned &Budget)
+{
+	if (!Budget)
+		return false;
+	Budget--;
+	if (!conditionsConsistent(Facts, Context->getModule()->getDataLayout(), &LVI, Context))
+		return false;
+	if (Index == Atoms.size())
+		return true;
+	auto *Atom = const_cast<Value *>(Atoms[Index]);
+	auto *Definition = dyn_cast<Instruction>(Atom);
+	ConstantRange Possible = !Definition || DT.dominates(Definition, Context) ?
+		LVI.getConstantRange(Atom, Context, false) : ConstantRange::getFull(1);
+	bool Truth;
+	if (knownBoolean(Atom, Facts, Truth))
+		return Possible.contains(APInt(1, Truth)) &&
+		       conditionWitness(Atoms, Index + 1, Facts, LVI, DT, Context, Budget);
+	for (unsigned Choice = 0; Choice < 2 && Budget; Choice++) {
+		if (!Possible.contains(APInt(1, Choice)))
+			continue;
+		BooleanFacts Assigned = Facts;
+		if (assumeBoolean(Atom, Choice, Assigned) &&
+		    conditionWitness(Atoms, Index + 1, Assigned, LVI, DT, Context, Budget))
+			return true;
+	}
+	return false;
+}
+
+static bool selectConditionsFeasible(const BooleanFacts &Facts, LazyValueInfo &LVI,
+				     DominatorTree &DT, Instruction *Context)
+{
+	SmallPtrSet<const Value *, 16> Unique;
+	for (const auto &Fact : Facts)
+		if (!collectConditionAtoms(Fact.first, Unique))
+			return false;
+	if (Unique.size() > 12)
+		return false;
+	// Stable IR order makes the bounded search independent of pointer hashes.
+	SmallVector<const Value *, 16> Atoms;
+	for (const Argument &A : Context->getFunction()->args())
+		if (Unique.contains(&A))
+			Atoms.push_back(&A);
+	for (const BasicBlock &BB : *Context->getFunction())
+		for (const Instruction &I : BB)
+			if (Unique.contains(&I))
+				Atoms.push_back(&I);
+	unsigned Budget = 256;
+	return conditionWitness(Atoms, 0, Facts, LVI, DT, Context, Budget);
+}
+
+static bool assumeEdge(BasicBlock *From, BasicBlock *To, BooleanFacts &Facts)
+{
+#if LLVM_VERSION_MAJOR >= 23
+	auto *Branch = dyn_cast<CondBrInst>(From->getTerminator());
+#else
+	auto *Branch = dyn_cast<BranchInst>(From->getTerminator());
+#endif
+	if (!Branch || Branch->getNumSuccessors() != 2 ||
+	    Branch->getSuccessor(0) == Branch->getSuccessor(1))
+		return true;
+	return assumeBoolean(Branch->getCondition(), Branch->getSuccessor(0) == To, Facts);
+}
+
+static bool blockConditions(BasicBlock *BB, DominatorTree &DT, BooleanFacts &Facts)
+{
+	BasicBlock *Target = BB;
+	for (unsigned Depth = 0; BB && Depth < MaxValueDepth; Depth++) {
+		for (Instruction &I : *BB)
+			if (auto *Assume = dyn_cast<AssumeInst>(&I))
+				if (!assumeBoolean(Assume->getArgOperand(0), true, Facts))
+					return false;
+		auto *Node = DT.getNode(BB);
+		if (!Node || !Node->getIDom())
+			return true;
+		BasicBlock *Dom = Node->getIDom()->getBlock();
+#if LLVM_VERSION_MAJOR >= 23
+		auto *Branch = dyn_cast<CondBrInst>(Dom->getTerminator());
+#else
+		auto *Branch = dyn_cast<BranchInst>(Dom->getTerminator());
+#endif
+		if (Branch && Branch->getNumSuccessors() == 2) {
+			bool T = DT.dominates(Branch->getSuccessor(0), Target);
+			bool F = DT.dominates(Branch->getSuccessor(1), Target);
+
+			if (T != F && !assumeBoolean(Branch->getCondition(), T, Facts))
+				return false;
+		}
+		BB = Dom;
+	}
+	return false;
+}
+
 static bool valueMayBeErrno(Value *V,
 			    BasicBlock *BB,
 			    LazyValueInfo &LVI,
 			    DominatorTree &DT,
 			    const SmallPtrSetImpl<BasicBlock *> &CleanBBs,
 			    SmallPtrSetImpl<const Value *> &Seen,
+			    const BooleanFacts &Facts,
+			    bool RequireWitness,
 			    unsigned Depth)
 {
 	if (!V || Depth == MaxValueDepth)
@@ -227,20 +512,59 @@ static bool valueMayBeErrno(Value *V,
 
 			if (!CleanBBs.contains(Pred))
 				continue;
+			BooleanFacts IncomingFacts = Facts;
+			if (!blockConditions(Pred, DT, IncomingFacts) ||
+			    !assumeEdge(Pred, Phi->getParent(), IncomingFacts) ||
+			    !conditionsConsistent(IncomingFacts, DL) ||
+			    (RequireWitness && !selectConditionsFeasible(IncomingFacts, LVI, DT,
+								  Pred->getTerminator())))
+				continue;
 
 			if (Incoming->getType()->isIntegerTy() &&
 			    isErrnoRange(LVI.getConstantRangeOnEdge(Incoming, Pred, Phi->getParent()))) // why do we know the range here? Because of isIntegerTy()?
 				return true;
 
-			if (valueMayBeErrno(Incoming, Pred, LVI, DT, CleanBBs, Seen, Depth + 1))
+			if (valueMayBeErrno(Incoming, Pred, LVI, DT, CleanBBs, Seen,
+					    IncomingFacts, RequireWitness, Depth + 1))
 				return true;
 		}
 	} else if (auto *Cast = dyn_cast<CastInst>(V)) {
 		if (preservesErrnoCast(Cast->getOpcode(), Cast->getSrcTy(),
 				       Cast->getDestTy(), DL) &&
 		    (rangeAtUseIsErrno(Cast->getOperandUse(0), LVI) ||
-		     valueMayBeErrno(Cast->getOperand(0), BB, LVI, DT, CleanBBs, Seen, Depth + 1)))
+		     valueMayBeErrno(Cast->getOperand(0), BB, LVI, DT, CleanBBs, Seen,
+				     Facts, RequireWitness, Depth + 1)))
 			return true;
+	} else if (auto *Select = dyn_cast<SelectInst>(V)) {
+		Value *Condition = Select->getCondition();
+		ConstantRange Possible = LVI.getConstantRange(Condition, BB->getTerminator(), false);
+		bool Known = false, Truth = false;
+
+		Known = knownBoolean(Condition, Facts, Truth);
+		if (Known || Possible.isSingleElement()) {
+			if (!Known)
+				Truth = !Possible.getSingleElement()->isZero();
+			if (!Possible.contains(APInt(1, Truth))) {
+				Seen.erase(V);
+				return false;
+			}
+			bool Error = valueMayBeErrno(Select->getOperand(Truth ? 1 : 2), BB, LVI,
+						DT, CleanBBs, Seen, Facts, RequireWitness, Depth + 1);
+			Seen.erase(V);
+			return Error;
+		}
+		for (unsigned Choice = 0; Choice < 2; Choice++) {
+			bool TakeTrue = Choice == 0;
+			if ((Known && Truth != TakeTrue) || !Possible.contains(APInt(1, TakeTrue)))
+				continue;
+			BooleanFacts SelectedFacts = Facts;
+			if (!assumeBoolean(Condition, TakeTrue, SelectedFacts) ||
+			    !selectConditionsFeasible(SelectedFacts, LVI, DT, BB->getTerminator()))
+				continue;
+			if (valueMayBeErrno(Select->getOperand(TakeTrue ? 1 : 2), BB, LVI,
+					    DT, CleanBBs, Seen, SelectedFacts, true, Depth + 1))
+				return true;
+		}
 	}
 	Seen.erase(V);
 	return false;
@@ -342,8 +666,12 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI,
 			continue;
 
 		SmallPtrSet<const Value *, 32> Seen;
+		BooleanFacts Facts;
+		if (!blockConditions(BB, DT, Facts) ||
+		    !conditionsConsistent(Facts, F.getParent()->getDataLayout()))
+			continue;
 		if (rangeAtUseIsErrno(Return->getOperandUse(0), LVI) ||
-		    valueMayBeErrno(Return->getReturnValue(), BB, LVI, DT, CleanBBs, Seen, 0))
+		    valueMayBeErrno(Return->getReturnValue(), BB, LVI, DT, CleanBBs, Seen, Facts, false, 0))
 			return true;
 	}
 	return false;
