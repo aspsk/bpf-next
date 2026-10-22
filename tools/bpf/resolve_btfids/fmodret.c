@@ -988,7 +988,9 @@ static bool jump_label_reference(const GElf_Ehdr *ehdr,
 static bool arm64_code_metadata_reference(Elf *elf, const char *name,
 					 Elf_Scn *scn, const GElf_Shdr *shdr,
 					 size_t offset, const GElf_Sym *sym,
-					 GElf_Sxword addend, unsigned int encoding)
+					 GElf_Sxword addend, unsigned int encoding,
+					 const struct elf_function_list *functions,
+					 size_t node)
 {
 	Elf_Data *data;
 	GElf_Shdr code;
@@ -1012,6 +1014,34 @@ static bool arm64_code_metadata_reference(Elf *elf, const char *name,
 		return !(read_elf_value((unsigned char *)data->d_buf + offset + 4,
 				       2, encoding) & (1U << 15));
 	}
+	if (!strcmp(name, "__ex_table")) {
+		GElf_Ehdr ehdr;
+
+		/* arm64 exception entries contain s32 insn/fixup and u16 type/data.
+		 * The fault site identifies an instruction, not another caller.
+		 * A fixup is an intra-function continuation only when its fault site
+		 * belongs to the same function as the fixup target being audited.
+		 */
+		if (shdr->sh_size % 12)
+			return false;
+		field = offset % 12;
+		if (!field)
+			return true;
+		if (field != 4 || !gelf_getehdr(elf, &ehdr) || ehdr.e_type == ET_REL)
+			return false;
+		data = elf_getdata(scn, NULL);
+		if (!data || data->d_off || data->d_size != shdr->sh_size)
+			return false;
+		address = shdr->sh_addr + offset - 4 +
+			  (int32_t)read_elf_value((unsigned char *)data->d_buf + offset - 4,
+						 4, encoding);
+		return graph_function(functions, sym->st_shndx, address, true) == node;
+	}
+	/* Runtime-constant sections are arrays of s32 instruction offsets. */
+	if (!strncmp(name, "runtime_ptr_", 12) ||
+	    !strncmp(name, "runtime_shift_", 14) ||
+	    !strncmp(name, "runtime_mask_", 13))
+		return !(shdr->sh_size % 4) && !(offset % 4);
 	if (strcmp(name, "__bug_table"))
 		return false;
 	/* A bug record points at a BRK #BUG_BRK_IMM instruction. Check the
@@ -1219,7 +1249,8 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 				continue;
 			if (ehdr.e_machine == EM_AARCH64 && type == R_AARCH64_PREL32 &&
 			    arm64_code_metadata_reference(elf, name, target_scn, &target,
-							  offset, &sym, rela.r_addend, encoding))
+							  offset, &sym, rela.r_addend, encoding,
+							  functions, node))
 				continue;
 			if (!described_call(g, caller, node))
 				record_unmodelled_reference(g, node,
