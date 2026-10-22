@@ -905,6 +905,9 @@ static int add_error_call(struct error_graph *g, size_t caller, size_t callee,
 	if (!nr_cases || nr_cases > FMODRET_META_ERRNOS ||
 	    (flags & ~FMODRET_CALL_FLAGS) || (result & (result - 1)))
 		return -EINVAL;
+	if (((flags & FMODRET_CALL_NULL_ALLOCATOR) && result != FMODRET_CALL_RESULT_PTR) ||
+	    ((flags & FMODRET_CALL_NULL_ERROR) && !(flags & FMODRET_CALL_NULL_ALLOCATOR)))
+		return -EINVAL;
 	if (g->nr_calls == g->capacity) {
 		size_t cap = g->capacity ? g->capacity * 2 : 1024;
 		void *calls;
@@ -1455,7 +1458,8 @@ static int parse_error_graph(Elf *elf, const struct elf_function_list *functions
 			callee_param = read_elf_value(buf + pos + ptr_size + 8, 4, encoding);
 			bindings = read_elf_value(buf + pos + ptr_size + 12, 4, encoding);
 			if (callee_param != FMODRET_NO_PARAM &&
-			    (callee != NO_NODE || callee_param >= params || bindings))
+			    (callee != NO_NODE || callee_param >= params || bindings ||
+			     (call_flags & FMODRET_CALL_NULL_ALLOCATOR)))
 				goto invalid;
 			pos += FMODRET_META_CALL_SIZE(ptr_size);
 			if (nr_cases > (end - pos) / FMODRET_META_CASE_SIZE)
@@ -2056,9 +2060,11 @@ static void print_function_resolution(const struct error_graph *g, size_t node)
 		const struct error_call *c = &g->calls[n->clean_via];
 
 		fprintf(stderr, "fmodret clean-source: %s@%#llx callee=%s@%#llx "
-			"call=%u metadata=%#zx\n", n->name, (unsigned long long)n->value,
-			g->nodes[c->callee].name, (unsigned long long)g->nodes[c->callee].value,
-			c->ordinal, c->metadata_offset);
+			"call=%u metadata=%#zx contract=%s\n", n->name, (unsigned long long)n->value,
+			c->callee == NO_NODE ? "<allocator>" : g->nodes[c->callee].name,
+			c->callee == NO_NODE ? 0ULL : (unsigned long long)g->nodes[c->callee].value,
+			c->ordinal, c->metadata_offset,
+			c->flags & FMODRET_CALL_NULL_ERROR ? "allocator-NULL-error" : "errno-return");
 	}
 	if (n->incomplete)
 		fprintf(stderr, "fmodret coverage-rejected: %s@%#llx references=%zu "
@@ -2090,6 +2096,7 @@ static int resolve_error_graph(struct error_graph *g,
 	size_t ack_calls = 0, ack_cases = 0, rcv_calls = 0, rcv_cases = 0;
 	size_t address_taken = 0, address_passed = 0;
 	size_t pointer_clean = 0, pointer_atomic = 0;
+	size_t alloc_calls = 0, alloc_errors = 0, alloc_prefixes = 0, alloc_seeds = 0;
 	size_t rejections[ERROR_REJECTION_COUNT] = {};
 	uint64_t full[ERROR_WORDS];
 
@@ -2113,6 +2120,8 @@ static int resolve_error_graph(struct error_graph *g,
 			fprintf(stderr, "fmodret clean: 0 atomic, 0 constructed, 0 total\n");
 			fprintf(stderr, "fmodret clean-types: 0 integers, 0 error-pointer relays "
 				"(0 atomic, 0 constructed)\n");
+			fprintf(stderr, "fmodret clean-allocations: 0 allocator calls, "
+				"0 NULL-to-error returns, 0 clean prefixes, 0 seeded callers\n");
 			fprintf(stderr, "fmodret propagation: 0 clean candidate bodies, "
 				"0 failed, 0 passed; 0 syscall entries\n");
 			fprintf(stderr, "fmodret endpoints: 0 calls, 0 errno intervals "
@@ -2142,6 +2151,35 @@ static int resolve_error_graph(struct error_graph *g,
 		}
 	}
 	atomic = tail;
+	for (e = 0; e < g->nr_input_calls; e++) {
+		struct error_call *c = &g->calls[e];
+		struct error_node *caller = &g->nodes[c->caller];
+
+		if ((c->weak_definition && caller->strong_definitions) ||
+		    !(c->flags & FMODRET_CALL_NULL_ALLOCATOR))
+			continue;
+		alloc_calls++;
+		if (verbose)
+			fprintf(stderr, "fmodret allocation-call: caller=%s callee=%s "
+				"call=%u prefix=%s NULL-outcome=%s\n", caller->name,
+				c->callee == NO_NODE ? "<allocator>" : g->nodes[c->callee].name,
+				c->ordinal, c->flags & FMODRET_CALL_CLEAN_PREFIX ? "clean" : "dirty",
+				c->flags & FMODRET_CALL_NULL_ERROR ? "negative-return" : "unknown");
+		if (!(c->flags & FMODRET_CALL_NULL_ERROR))
+			continue;
+		alloc_errors++;
+		if (!(c->flags & FMODRET_CALL_CLEAN_PREFIX))
+			continue;
+		alloc_prefixes++;
+		if (!caller->clean && caller->definitions == 1 &&
+		    !(caller->flags & FMODRET_FN_WEAK) &&
+		    (caller->flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR))) {
+			caller->clean = true;
+			caller->clean_via = e;
+			queue[tail++] = c->caller;
+			alloc_seeds++;
+		}
+	}
 	while (head < tail) {
 		size_t node = queue[head++];
 
@@ -2281,6 +2319,9 @@ static int resolve_error_graph(struct error_graph *g,
 		fprintf(stderr, "fmodret clean-types: %zu integers, %zu error-pointer relays "
 			"(%zu atomic, %zu constructed)\n", clean - pointer_clean,
 			pointer_clean, pointer_atomic, pointer_clean - pointer_atomic);
+		fprintf(stderr, "fmodret clean-allocations: %zu allocator calls, "
+			"%zu NULL-to-error returns, %zu clean prefixes, %zu seeded callers\n",
+			alloc_calls, alloc_errors, alloc_prefixes, alloc_seeds);
 		fprintf(stderr, "fmodret candidates: %zu clean integer bodies (%zu local, %zu global)\n",
 			candidates, local, global);
 		fprintf(stderr, "fmodret address-use: %zu clean integer address-taken bodies, "
@@ -2447,6 +2488,8 @@ static int read_fmodret_candidates(const char *path,
 			fprintf(stderr, "fmodret clean: 0 atomic, 0 constructed, 0 total\n");
 			fprintf(stderr, "fmodret clean-types: 0 integers, 0 error-pointer relays "
 				"(0 atomic, 0 constructed)\n");
+			fprintf(stderr, "fmodret clean-allocations: 0 allocator calls, "
+				"0 NULL-to-error returns, 0 clean prefixes, 0 seeded callers\n");
 			fprintf(stderr, "fmodret propagation: 0 clean candidate bodies, "
 				"0 failed, 0 passed; 0 syscall entries\n");
 		}
