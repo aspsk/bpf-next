@@ -24,7 +24,8 @@ config CLANG_PLUGIN_BPF_SCAN_IR
 	  Describe functions, direct calls, clean prefixes and errno propagation
 	  in one build-only ELF section. The resolve_btfids tool derives clean
 	  functions and admits functions only when every negative errno
-	  propagates through all callers to a syscall table entry.
+	  propagates through all callers to a syscall table entry or is reported
+	  through netlink_ack().
 
 	  Unknown callers, escaped addresses and unproved cycles are rejected.
 	  This analysis currently requires a non-LTO build, so descriptions refer

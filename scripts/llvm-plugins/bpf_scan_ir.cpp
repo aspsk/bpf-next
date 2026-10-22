@@ -275,7 +275,7 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 }
 
 // Propagation deliberately ignores cleanup side effects. Only returned values
-// and control flow matter here; prefix cleanliness is collected independently.
+// and explicit error reports matter here; prefix cleanliness is independent.
 struct ErrorMap {
 	unsigned Kind = FMODRET_ERROR_UNKNOWN;
 	int Replacement = 0;
@@ -343,6 +343,34 @@ static bool evaluateCondition(const Value *V, const CallBase &Call, int Error,
 	auto *Cmp = dyn_cast<ICmpInst>(V);
 	if (Depth >= MaxValueDepth)
 		return false;
+	if (auto *Op = dyn_cast<BinaryOperator>(V); Op && Op->getType()->isIntegerTy(1)) {
+		unsigned Opcode = Op->getOpcode();
+		if (Opcode == Instruction::And || Opcode == Instruction::Or ||
+		    Opcode == Instruction::Xor) {
+			bool L = false, R = false;
+			bool KnownL = evaluateCondition(Op->getOperand(0), Call, Error,
+						Preds, L, Depth + 1);
+			bool KnownR = evaluateCondition(Op->getOperand(1), Call, Error,
+						Preds, R, Depth + 1);
+
+			// A negative errno makes (ack_requested || err != 0) true
+			// even when the request flags are unknown.
+			if (Opcode == Instruction::Or && ((KnownL && L) || (KnownR && R))) {
+				Truth = true;
+				return true;
+			}
+			if (Opcode == Instruction::And && ((KnownL && !L) || (KnownR && !R))) {
+				Truth = false;
+				return true;
+			}
+			if (KnownL && KnownR) {
+				Truth = Opcode == Instruction::Or ? L || R :
+					Opcode == Instruction::And ? L && R : L != R;
+				return true;
+			}
+			return false;
+		}
+	}
 	if (!Cmp) {
 		// Cleanup can use a boolean PHI/select to choose return or loop.
 		// Resolve it on this path before considering both successors.
@@ -417,24 +445,68 @@ static ErrorMap evaluateValue(const Value *V, const CallBase &Call, int Error,
 	return {};
 }
 
-static ErrorMap traceError(const CallBase &Call, int Error)
+static const CallInst *netlinkAck(const Instruction &I)
+{
+	auto *Ack = dyn_cast<CallInst>(&I);
+	if (!Ack)
+		return nullptr;
+	auto *Callee = dyn_cast<Function>(Ack->getCalledOperand()->stripPointerCasts());
+	if (!Callee || Callee->getName() != "netlink_ack" ||
+	    !Callee->hasExternalLinkage())
+		return nullptr;
+	auto *Ty = Callee->getFunctionType();
+	if (Ty->isVarArg() || !Ty->getReturnType()->isVoidTy() ||
+	    Ty->getNumParams() != 4 || Ack->arg_size() != 4 ||
+	    !Ty->getParamType(0)->isPointerTy() ||
+	    !Ty->getParamType(1)->isPointerTy() ||
+	    !Ty->getParamType(2)->isIntegerTy(32) ||
+	    !Ty->getParamType(3)->isPointerTy() ||
+	    !Ack->getArgOperand(2)->getType()->isIntegerTy(32))
+		return nullptr;
+	return Ack;
+}
+
+static bool reportsNetlinkError(const Instruction &I, const CallBase &Call,
+			       int Error, const Predecessors &Preds)
+{
+	auto *Ack = netlinkAck(I);
+	if (!Ack)
+		return false;
+	auto Map = evaluateValue(Ack->getArgOperand(2), Call, Error, Preds);
+	int N = Map.Kind == FMODRET_ERROR_IDENTITY ? Error : Map.Replacement;
+	return Map.Kind && N >= -MaxErrno && N < 0;
+}
+
+static ErrorMap traceError(const CallBase &Call, int Error, bool HasNetlinkAck)
 {
 	struct Path {
 		const BasicBlock *BB;
+		const Instruction *Start;
 		Predecessors Preds;
 	};
 	SmallVector<Path, 8> Work;
 	Path Initial;
 	Initial.BB = Call.getParent();
+	Initial.Start = Call.getNextNode();
 	Work.push_back(std::move(Initial));
 	ErrorMap Result;
-	bool HaveResult = false;
+	bool HaveResult = false, HaveReport = false;
 	unsigned Budget = 256;
 
 	while (!Work.empty()) {
 		if (!Budget--)
 			return {};
 		auto P = Work.pop_back_val();
+		bool Reported = false;
+		// Start after the failed call, never at an earlier ACK in its block.
+		for (auto *I = HasNetlinkAck ? P.Start : nullptr; I; I = I->getNextNode()) {
+			if (!reportsNetlinkError(*I, Call, Error, P.Preds))
+				continue;
+			Reported = HaveReport = true;
+			break;
+		}
+		if (Reported)
+			continue;
 		const Instruction *Term = P.BB->getTerminator();
 		if (auto *Ret = dyn_cast<ReturnInst>(Term)) {
 			auto Map = evaluateValue(Ret->getReturnValue(), Call, Error, P.Preds);
@@ -490,16 +562,25 @@ static ErrorMap traceError(const CallBase &Call, int Error)
 			auto Q = P;
 			Q.Preds[Succ] = P.BB;
 			Q.BB = Succ;
+			Q.Start = &Succ->front();
 			Work.push_back(std::move(Q));
 		}
 	}
-	return HaveResult ? Result : ErrorMap{};
+	// Reported paths need no caller proof. If other paths return an error,
+	// preserve their mapping so those paths still depend on all callers.
+	if (HaveResult) {
+		if (HaveReport)
+			Result.Kind |= FMODRET_ERROR_NETLINK_ACK;
+		return Result;
+	}
+	return HaveReport ? ErrorMap{FMODRET_ERROR_NETLINK_ACK, 0} : ErrorMap{};
 }
 
 static SmallVector<ErrorCase, 4> describeErrors(const CallBase &Call)
 {
 	SmallVector<ErrorCase, 4> Cases;
 	SmallVector<int, 16> Cuts = {-MaxErrno, 0};
+	bool HasNetlinkAck = false;
 	Type *Ty = Call.getType();
 	const DataLayout &DL = Call.getModule()->getDataLayout();
 	bool Pointer = Ty->isPointerTy() && !DL.isNonIntegralPointerType(Ty) &&
@@ -520,15 +601,18 @@ static SmallVector<ErrorCase, 4> describeErrors(const CallBase &Call)
 	// Include constants feeding PHIs/selects too: a comparison threshold
 	// need not occur directly as an ICmp operand.
 	for (const BasicBlock &BB : *Call.getFunction())
-		for (const Instruction &I : BB)
+		for (const Instruction &I : BB) {
+			HasNetlinkAck |= netlinkAck(I) != nullptr;
 			for (const Use &U : I.operands())
 				AddCut(comparisonThreshold(U.get()));
+		}
 	llvm::sort(Cuts);
 	Cuts.erase(std::unique(Cuts.begin(), Cuts.end()), Cuts.end());
 	if (Cuts.size() > 128)
 		return {{-MaxErrno, -1, {}}};
 	for (unsigned I = 1; I < Cuts.size(); I++) {
-		ErrorCase C{Cuts[I - 1], Cuts[I] - 1, traceError(Call, Cuts[I - 1])};
+		ErrorCase C{Cuts[I - 1], Cuts[I] - 1,
+			    traceError(Call, Cuts[I - 1], HasNetlinkAck)};
 		if (!Cases.empty() && Cases.back().Map == C.Map)
 			Cases.back().Last = C.Last;
 		else
