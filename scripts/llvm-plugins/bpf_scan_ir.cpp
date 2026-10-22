@@ -308,6 +308,30 @@ using Predecessors = DenseMap<const BasicBlock *, const BasicBlock *>;
 static ErrorMap evaluateValue(const Value *V, const CallBase &Call, int Error,
 			      const Predecessors &Preds, unsigned Depth = 0);
 
+static bool preservesErrnoCast(unsigned Opcode, Type *Src, Type *Dst,
+			       const DataLayout &DL)
+{
+	if (Src->isIntegerTy() && Dst->isIntegerTy())
+		return (Opcode == Instruction::SExt || Opcode == Instruction::Trunc ||
+			Opcode == Instruction::BitCast) &&
+		       Src->getIntegerBitWidth() >= 32 && Dst->getIntegerBitWidth() >= 32;
+	if (Opcode == Instruction::IntToPtr && Src->isIntegerTy() &&
+	    Dst->isPointerTy() && !DL.isNonIntegralPointerType(Dst)) {
+		unsigned Bits = DL.getPointerTypeSizeInBits(Dst);
+
+		// inttoptr zero-extends a narrower integer, losing a negative errno.
+		return Bits >= 32 && Src->getIntegerBitWidth() >= Bits;
+	}
+	if (Opcode == Instruction::PtrToInt && Src->isPointerTy() &&
+	    Dst->isIntegerTy() && !DL.isNonIntegralPointerType(Src)) {
+		unsigned Bits = Dst->getIntegerBitWidth();
+
+		return Bits >= 32 && Bits <= DL.getPointerTypeSizeInBits(Src);
+	}
+	return Opcode == Instruction::BitCast && Src->isPointerTy() &&
+	       Dst->isPointerTy() && Src == Dst;
+}
+
 static bool evaluateCondition(const Value *V, const CallBase &Call, int Error,
 			      const Predecessors &Preds, bool &Truth,
 			      unsigned Depth)
@@ -328,13 +352,17 @@ static bool evaluateCondition(const Value *V, const CallBase &Call, int Error,
 		Truth = Map.Replacement != 0;
 		return true;
 	}
-	if (!Cmp->getOperand(0)->getType()->isIntegerTy())
+	Type *Ty = Cmp->getOperand(0)->getType();
+	const DataLayout &DL = Call.getModule()->getDataLayout();
+	if (!Ty->isIntegerTy() &&
+	    (!Ty->isPointerTy() || DL.isNonIntegralPointerType(Ty)))
 		return false;
 	auto L = evaluateValue(Cmp->getOperand(0), Call, Error, Preds, Depth + 1);
 	auto R = evaluateValue(Cmp->getOperand(1), Call, Error, Preds, Depth + 1);
 	if (!L.Kind || !R.Kind)
 		return false;
-	unsigned Width = Cmp->getOperand(0)->getType()->getIntegerBitWidth();
+	unsigned Width = Ty->isPointerTy() ? DL.getPointerTypeSizeInBits(Ty) :
+					   Ty->getIntegerBitWidth();
 	if (Width != 32 && Width != 64)
 		return false;
 	APInt Left(Width, L.Kind == FMODRET_ERROR_IDENTITY ? Error : L.Replacement, true);
@@ -350,19 +378,23 @@ static ErrorMap evaluateValue(const Value *V, const CallBase &Call, int Error,
 		return {};
 	if (V == &Call)
 		return {FMODRET_ERROR_IDENTITY, 0};
+	if (isa<ConstantPointerNull>(V))
+		return {FMODRET_ERROR_CONSTANT, 0};
 	if (auto *C = dyn_cast<ConstantInt>(V)) {
 		if (C->getBitWidth() <= 64 && C->getValue().isSignedIntN(32))
 			return {FMODRET_ERROR_CONSTANT, (int)C->getSExtValue()};
 		return {};
 	}
 	if (auto *Cast = dyn_cast<CastInst>(V)) {
-		// These casts preserve every member of the negative errno domain.
-		if ((isa<SExtInst>(Cast) || isa<TruncInst>(Cast) || isa<BitCastInst>(Cast)) &&
-		    Cast->getSrcTy()->isIntegerTy() &&
-		    Cast->getDestTy()->isIntegerTy() &&
-		    Cast->getSrcTy()->getIntegerBitWidth() >= 32 &&
-		    Cast->getDestTy()->getIntegerBitWidth() >= 32)
+		if (preservesErrnoCast(Cast->getOpcode(), Cast->getSrcTy(), Cast->getDestTy(),
+				       Call.getModule()->getDataLayout()))
 			return evaluateValue(Cast->getOperand(0), Call, Error, Preds, Depth + 1);
+		return {};
+	}
+	if (auto *Expr = dyn_cast<ConstantExpr>(V); Expr && Expr->isCast()) {
+		if (preservesErrnoCast(Expr->getOpcode(), Expr->getOperand(0)->getType(),
+				       Expr->getType(), Call.getModule()->getDataLayout()))
+			return evaluateValue(Expr->getOperand(0), Call, Error, Preds, Depth + 1);
 		return {};
 	}
 	if (auto *Phi = dyn_cast<PHINode>(V)) {
@@ -468,7 +500,11 @@ static SmallVector<ErrorCase, 4> describeErrors(const CallBase &Call)
 {
 	SmallVector<ErrorCase, 4> Cases;
 	SmallVector<int, 16> Cuts = {-MaxErrno, 0};
-	if (!Call.getType()->isIntegerTy(32) && !Call.getType()->isIntegerTy(64))
+	Type *Ty = Call.getType();
+	const DataLayout &DL = Call.getModule()->getDataLayout();
+	bool Pointer = Ty->isPointerTy() && !DL.isNonIntegralPointerType(Ty) &&
+		(DL.getPointerTypeSizeInBits(Ty) == 32 || DL.getPointerTypeSizeInBits(Ty) == 64);
+	if (!Ty->isIntegerTy(32) && !Ty->isIntegerTy(64) && !Pointer)
 		return {{-MaxErrno, -1, {}}};
 	// Only identity and constant expressions are evaluated. Splitting at every
 	// comparison/switch constant makes their truth invariant in each interval.
@@ -486,7 +522,7 @@ static SmallVector<ErrorCase, 4> describeErrors(const CallBase &Call)
 	for (const BasicBlock &BB : *Call.getFunction())
 		for (const Instruction &I : BB)
 			for (const Use &U : I.operands())
-				AddCut(dyn_cast<ConstantInt>(U.get()));
+				AddCut(comparisonThreshold(U.get()));
 	llvm::sort(Cuts);
 	Cuts.erase(std::unique(Cuts.begin(), Cuts.end()), Cuts.end());
 	if (Cuts.size() > 128)
@@ -657,6 +693,11 @@ public:
 						Flags |= FMODRET_FN_CLEAN_SEED;
 				}
 			}
+			if (F.getReturnType()->isPointerTy() &&
+			    !M.getDataLayout().isNonIntegralPointerType(F.getReturnType()) &&
+			    (M.getDataLayout().getPointerTypeSizeInBits(F.getReturnType()) == 32 ||
+			     M.getDataLayout().getPointerTypeSizeInBits(F.getReturnType()) == 64))
+				Flags |= FMODRET_FN_ERRPTR;
 			FunctionDescription D{&F, Flags, {}};
 			if (Defined) {
 				SmallPtrSet<const CallBase *, 32> Prefixes;
