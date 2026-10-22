@@ -110,7 +110,7 @@ static bool dominatedByIsErr(const Value *V, BasicBlock *BB, DominatorTree &DT)
 	while (BB) {
 		BasicBlock *Dom = DT.getNode(BB)->getIDom() ?
 			DT.getNode(BB)->getIDom()->getBlock() : nullptr;
-#if LLVM_VERSION_MAJOR >= 24
+#if LLVM_VERSION_MAJOR >= 23
 		auto *Branch = Dom ? dyn_cast<CondBrInst>(Dom->getTerminator()) : nullptr;
 #else
 		auto *Branch = Dom ? dyn_cast<BranchInst>(Dom->getTerminator()) : nullptr;
@@ -528,7 +528,7 @@ static ErrorMap traceError(const CallBase &Call, int Error, bool HasNetlinkAck)
 			continue;
 		}
 		SmallVector<const BasicBlock *, 4> Next;
-#if LLVM_VERSION_MAJOR >= 24
+#if LLVM_VERSION_MAJOR >= 23
 		if (auto *Br = dyn_cast<CondBrInst>(Term)) {
 #else
 		if (auto *Br = dyn_cast<BranchInst>(Term); Br && Br->isConditional()) {
@@ -553,8 +553,11 @@ static ErrorMap traceError(const CallBase &Call, int Error, bool HasNetlinkAck)
 				for (const BasicBlock *Succ : successors(P.BB))
 					Next.push_back(Succ);
 			}
-		} else if (Term->getNumSuccessors() == 1 &&
-			   Term->getOpcode() == Instruction::Br) {
+#if LLVM_VERSION_MAJOR >= 23
+		} else if (isa<UncondBrInst>(Term)) {
+#else
+		} else if (isa<BranchInst>(Term) && Term->getNumSuccessors() == 1) {
+#endif
 			Next.push_back(Term->getSuccessor(0));
 		} else if (isa<CallBrInst>(Term)) {
 			// asm goto may take the fallthrough or any declared label.
@@ -867,13 +870,19 @@ public:
 		if (M.getNamedMetadata("bpf_scan_ir.done"))
 			return PreservedAnalyses::all();
 
-		std::string Assembly = M.getModuleInlineAsm();
+		std::string Assembly;
+#if LLVM_VERSION_MAJOR >= 23
+		for (const auto &Fragment : M.getModuleInlineAsm())
+			Assembly += Fragment.Asm;
+#else
+		Assembly = M.getModuleInlineAsm();
+#endif
 		for (Function &F : M)
 			for (BasicBlock &BB : F)
 				for (Instruction &I : BB)
 					if (auto *Call = dyn_cast<CallBase>(&I))
 						if (auto *Asm = dyn_cast<InlineAsm>(Call->getCalledOperand()))
-							Assembly += "\n" + Asm->getAsmString();
+							Assembly += (Twine("\n") + Asm->getAsmString()).str();
 		SmallVector<FunctionDescription, 32> Descriptions;
 		auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
