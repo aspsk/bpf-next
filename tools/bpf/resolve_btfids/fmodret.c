@@ -1263,6 +1263,7 @@ static void print_function_flags(const struct error_node *node, size_t offset,
 		{ FMODRET_FN_ESCAPED, "escaped" },
 		{ FMODRET_FN_WEAK, "weak" },
 		{ FMODRET_FN_INTEGER, "integer" },
+		{ FMODRET_FN_ERRPTR, "error_pointer_relay" },
 	};
 	size_t i;
 
@@ -1399,7 +1400,8 @@ static void select_error_descriptions(struct error_graph *g)
 
 static bool graph_node_known(const struct error_node *n)
 {
-	return n->definitions == 1 && (n->flags & FMODRET_FN_INTEGER) &&
+	return n->definitions == 1 &&
+	       (n->flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR)) &&
 	       !(n->flags & (FMODRET_FN_ESCAPED | FMODRET_FN_WEAK)) && !n->incomplete;
 }
 
@@ -1515,7 +1517,7 @@ static unsigned int error_rejection_mask(const struct error_graph *g, size_t nod
 		reasons |= 1U << ERROR_MISSING_DESCRIPTION;
 	else if (n->definitions != 1)
 		reasons |= 1U << ERROR_MULTIPLE_DESCRIPTIONS;
-	if (!(n->flags & FMODRET_FN_INTEGER))
+	if (!(n->flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR)))
 		reasons |= 1U << ERROR_NON_INTEGER;
 	if (n->flags & FMODRET_FN_WEAK)
 		reasons |= 1U << ERROR_WEAK;
@@ -1702,7 +1704,8 @@ static int resolve_error_graph(struct error_graph *g,
 	for (i = 0; i < g->nr_nodes; i++) {
 		struct error_node *n = &g->nodes[i];
 
-		if (n->definitions == 1 && !(n->flags & FMODRET_FN_WEAK) &&
+		if (n->definitions == 1 && (n->flags & FMODRET_FN_INTEGER) &&
+		    !(n->flags & FMODRET_FN_WEAK) &&
 		    (n->flags & FMODRET_FN_CLEAN_SEED)) {
 			n->clean = true;
 			queue[tail++] = i;
