@@ -732,7 +732,10 @@ static bool addressEscapes(const Value *V, SmallPtrSetImpl<const Value *> &Seen)
 		if (auto *GV = dyn_cast<GlobalVariable>(User)) {
 			// These references describe the function rather than calling it.
 			if (isDispatchTable(GV->getName()) ||
-			    GV->getSection() == "_error_injection_whitelist")
+			    GV->getSection() == "_error_injection_whitelist" ||
+			    GV->getName() == "llvm.used" ||
+			    GV->getName() == "llvm.compiler.used" ||
+			    GV->getSection() == ".discard.addressable")
 				continue;
 			return true;
 		}
@@ -882,9 +885,11 @@ public:
 			bool Defined = !F.isDeclaration();
 			SmallPtrSet<const Value *, 32> Seen;
 			unsigned Flags = Defined ? FMODRET_FN_DEFINED : 0;
+			if (F.hasAddressTaken())
+				Flags |= FMODRET_FN_ADDRESS_TAKEN;
 			if (addressEscapes(&F, Seen) || assemblyReferences(Assembly, F.getName()))
 				Flags |= FMODRET_FN_ESCAPED;
-			if (!Defined && !(Flags & FMODRET_FN_ESCAPED))
+			if (!Defined && !(Flags & (FMODRET_FN_ESCAPED | FMODRET_FN_ADDRESS_TAKEN)))
 				continue;
 			if (F.hasLocalLinkage())
 				Flags |= FMODRET_FN_LOCAL;
