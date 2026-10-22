@@ -19,11 +19,16 @@
  * all continuations after a failed call, irrespective of cleanup side effects.
  * UNKNOWN includes discarded results, unsupported expressions and loops.
  * Identity includes sign-preserving integer and ERR_PTR/PTR_ERR casts;
- * CONSTANT maps to an errno. Pointer results are propagation relays only.
+ * CONSTANT maps to an errno. NETLINK_ACK is a flag for paths ending at
+ * netlink_ack() with a proven negative errno in its error argument. Any
+ * remaining paths must satisfy the accompanying IDENTITY/CONSTANT mapping;
+ * NETLINK_ACK alone means all paths report the error. Reported paths do not
+ * contribute to clean-function derivation.
+ * Pointer results are propagation relays only.
  * These facts cover negative errno injection only, not arbitrary return values.
  */
 #define FMODRET_META_MAGIC 0x46524d32U
-#define FMODRET_META_VERSION 1U
+#define FMODRET_META_VERSION 2U
 #define FMODRET_META_ERRNOS 4095
 #define FMODRET_META_HEADER_SIZE(ptr_size) (24 + (ptr_size))
 #define FMODRET_META_CALL_SIZE(ptr_size) (8 + (ptr_size))
@@ -44,5 +49,7 @@
 #define FMODRET_ERROR_UNKNOWN 0
 #define FMODRET_ERROR_IDENTITY 1
 #define FMODRET_ERROR_CONSTANT 2
+#define FMODRET_ERROR_RETURN_MASK 3
+#define FMODRET_ERROR_NETLINK_ACK (1U << 2)
 
 #endif

@@ -908,16 +908,19 @@ static int add_error_call(struct error_graph *g, size_t caller, size_t callee,
 	g->nr_calls++;
 	for (i = 0; i < nr_cases; i++, p += FMODRET_META_CASE_SIZE) {
 		struct error_case *e = &c->cases[i];
+		unsigned int kind;
 
 		e->first = (int32_t)read_elf_value(p, 4, encoding);
 		e->last = (int32_t)read_elf_value(p + 4, 4, encoding);
 		e->kind = read_elf_value(p + 8, 4, encoding);
 		e->replacement = (int32_t)read_elf_value(p + 12, 4, encoding);
+		kind = e->kind & FMODRET_ERROR_RETURN_MASK;
 		if (e->first != expected || e->last < e->first || e->last >= 0 ||
-		    e->kind > FMODRET_ERROR_CONSTANT ||
-		    (e->kind == FMODRET_ERROR_CONSTANT &&
+		    (e->kind & ~(FMODRET_ERROR_RETURN_MASK | FMODRET_ERROR_NETLINK_ACK)) ||
+		    kind > FMODRET_ERROR_CONSTANT ||
+		    (kind == FMODRET_ERROR_CONSTANT &&
 		     (e->replacement >= 0 || e->replacement < -FMODRET_META_ERRNOS)) ||
-		    (e->kind != FMODRET_ERROR_CONSTANT && e->replacement))
+		    (kind != FMODRET_ERROR_CONSTANT && e->replacement))
 			return -EINVAL;
 		expected = e->last + 1;
 	}
@@ -1094,7 +1097,8 @@ static void record_unmodelled_reference(struct error_graph *g, size_t node,
 /* Read pointer relocations before parsing records, then audit the other ELF
  * references after the call graph exists. An unmodelled caller blocks proof.
  * In particular, assembly and objects built without the plugin are not assumed
- * to propagate errors. Actual syscall table entries are the only roots.
+ * to propagate errors. Actual syscall table entries are function roots;
+ * explicit error-reporting endpoints are carried by individual call cases.
  */
 static int graph_relocations(Elf *elf, const struct elf_function_list *functions,
 			     struct error_graph *g, size_t metadata_ndx,
@@ -1449,12 +1453,14 @@ static void all_errors(uint64_t *bits)
 	bits[ERROR_WORDS - 1] = UINT64_MAX >> (ERROR_WORDS * 64 - FMODRET_META_ERRNOS);
 }
 
-static bool all_errors_known(const struct error_call *c)
+static bool all_errors_returned(const struct error_call *c)
 {
 	unsigned int i;
 
 	for (i = 0; i < c->nr_cases; i++)
-		if (!c->cases[i].kind)
+		/* Sending an ACK is a side effect, not a clean return path. */
+		if (c->cases[i].kind != FMODRET_ERROR_IDENTITY &&
+		    c->cases[i].kind != FMODRET_ERROR_CONSTANT)
 			return false;
 	return true;
 }
@@ -1468,8 +1474,12 @@ static void error_preimage(const struct error_call *c, const uint64_t *parent,
 	for (i = 0; i < c->nr_cases; i++) {
 		const struct error_case *e = &c->cases[i];
 		unsigned int first = -e->last - 1, last = -e->first - 1;
+		unsigned int kind = e->kind & FMODRET_ERROR_RETURN_MASK;
 
-		if (!e->kind || (e->kind == FMODRET_ERROR_CONSTANT &&
+		/* ACK-only cases need no caller proof. Mixed cases still require
+		 * every path returning an errno to reach a caller's endpoint.
+		 */
+		if (!e->kind || (kind == FMODRET_ERROR_CONSTANT &&
 				!error_bit(parent, e->replacement)))
 			continue;
 		for (word = first / 64; word <= last / 64; word++) {
@@ -1479,7 +1489,7 @@ static void error_preimage(const struct error_call *c, const uint64_t *parent,
 				mask &= UINT64_MAX << (first % 64);
 			if (word == last / 64)
 				mask &= UINT64_MAX >> (63 - last % 64);
-			result[word] |= mask & (e->kind == FMODRET_ERROR_IDENTITY ? parent[word] : UINT64_MAX);
+			result[word] |= mask & (kind == FMODRET_ERROR_IDENTITY ? parent[word] : UINT64_MAX);
 		}
 	}
 }
@@ -1622,13 +1632,16 @@ static void print_blocked_call(const struct error_graph *g,
 	const struct error_node *caller = &g->nodes[call->caller];
 	const struct error_node *callee = &g->nodes[call->callee];
 	unsigned int missing;
+	unsigned int kind = c->kind & FMODRET_ERROR_RETURN_MASK;
 	int sample = c->first;
 
-	if (c->kind == FMODRET_ERROR_IDENTITY) {
+	if (kind == FMODRET_ERROR_IDENTITY) {
 		missing = missing_errors(caller->good, c->first, c->last, &sample);
-	} else if (c->kind == FMODRET_ERROR_CONSTANT) {
+	} else if (kind == FMODRET_ERROR_CONSTANT) {
 		missing = error_bit(caller->good, c->replacement) ? 0 :
 			  c->last - c->first + 1;
+	} else if (c->kind & FMODRET_ERROR_NETLINK_ACK) {
+		return;
 	} else {
 		missing = c->last - c->first + 1;
 	}
@@ -1642,12 +1655,14 @@ static void print_blocked_call(const struct error_graph *g,
 		call->ordinal, call->metadata_offset,
 		call->flags & FMODRET_CALL_CLEAN_PREFIX ? "clean" : "dirty",
 		c->first, c->last, missing, sample);
-	if (c->kind == FMODRET_ERROR_IDENTITY)
+	if (kind == FMODRET_ERROR_IDENTITY)
 		fprintf(stderr, "identity caller-errno=%d", sample);
-	else if (c->kind == FMODRET_ERROR_CONSTANT)
+	else if (kind == FMODRET_ERROR_CONSTANT)
 		fprintf(stderr, "constant(%d) caller-errno=%d", c->replacement, c->replacement);
 	else
 		fprintf(stderr, "unknown (discarded/unsupported/loop not distinguished in metadata)");
+	if (c->kind & FMODRET_ERROR_NETLINK_ACK)
+		fprintf(stderr, " reported-paths=netlink_ack");
 	fprintf(stderr, " caller-reasons=");
 	print_rejection_mask(error_rejection_mask(g, call->caller));
 	fprintf(stderr, "\n");
@@ -1706,6 +1721,7 @@ static int resolve_error_graph(struct error_graph *g,
 	size_t *queue, head = 0, tail = 0, count = 0;
 	size_t i, e, atomic = 0, clean = 0, proven = 0, roots = 0, described = 0;
 	size_t candidates = 0, failed = 0, local = 0, global = 0;
+	size_t ack_calls = 0, ack_cases = 0;
 	size_t rejections[ERROR_REJECTION_COUNT] = {};
 	uint64_t full[ERROR_WORDS];
 
@@ -1724,6 +1740,8 @@ static int resolve_error_graph(struct error_graph *g,
 			fprintf(stderr, "fmodret clean: 0 atomic, 0 constructed, 0 total\n");
 			fprintf(stderr, "fmodret propagation: 0 clean candidate bodies, "
 				"0 failed, 0 passed; 0 syscall entries\n");
+			fprintf(stderr, "fmodret endpoints: 0 calls, 0 errno intervals "
+				"with netlink_ack paths\n");
 		}
 		return 0;
 	}
@@ -1753,7 +1771,7 @@ static int resolve_error_graph(struct error_graph *g,
 			if (!caller->clean && caller->definitions == 1 &&
 			    !(caller->flags & FMODRET_FN_WEAK) &&
 			    (caller->flags & FMODRET_FN_INTEGER) &&
-			    (c->flags & FMODRET_CALL_CLEAN_PREFIX) && all_errors_known(c)) {
+			    (c->flags & FMODRET_CALL_CLEAN_PREFIX) && all_errors_returned(c)) {
 				caller->clean = true;
 				caller->clean_via = e;
 				queue[tail++] = c->caller;
@@ -1828,6 +1846,34 @@ static int resolve_error_graph(struct error_graph *g,
 			       graph_node_known(n) && !memcmp(n->good, full, sizeof(full));
 	}
 	if (verbose) {
+		for (e = 0; e < g->nr_calls; e++) {
+			const struct error_call *c = &g->calls[e];
+			bool has_ack = false;
+			unsigned int j;
+
+			for (j = 0; j < c->nr_cases; j++) {
+				const struct error_case *ec = &c->cases[j];
+
+				if (!(ec->kind & FMODRET_ERROR_NETLINK_ACK))
+					continue;
+				has_ack = true;
+				ack_cases++;
+				fprintf(stderr, "fmodret error-report: caller=%s@%#llx "
+					"callee=%s call=%u metadata=%#zx input=[%d,%d] "
+					"terminator=netlink_ack remaining=%s replacement=%d\n",
+					g->nodes[c->caller].name,
+					(unsigned long long)g->nodes[c->caller].value,
+					c->callee == NO_NODE ? "<indirect>" :
+					g->nodes[c->callee].name, c->ordinal,
+					c->metadata_offset, ec->first, ec->last,
+					(ec->kind & FMODRET_ERROR_RETURN_MASK) == FMODRET_ERROR_IDENTITY ?
+					"identity" : (ec->kind & FMODRET_ERROR_RETURN_MASK) == FMODRET_ERROR_CONSTANT ?
+					"constant" : "none", ec->replacement);
+			}
+			ack_calls += has_ack;
+		}
+		fprintf(stderr, "fmodret endpoints: %zu calls, %zu errno intervals "
+			"with netlink_ack paths\n", ack_calls, ack_cases);
 		fprintf(stderr, "fmodret clean: %zu atomic, %zu constructed, %zu total\n",
 			atomic, clean - atomic, clean);
 		fprintf(stderr, "fmodret candidates: %zu clean bodies (%zu local, %zu global)\n",
