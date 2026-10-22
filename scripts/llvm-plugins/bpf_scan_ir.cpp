@@ -4,10 +4,13 @@
 #include "fmodret_metadata.h"
 
 #include <algorithm>
+#include <memory>
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/LazyValueInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Config/llvm-config.h"
 #if LLVM_VERSION_MAJOR >= 19
 #include "llvm/IR/Analysis.h"
@@ -244,33 +247,71 @@ static bool valueMayBeErrno(Value *V,
 }
 
 
-static bool isCleanInstruction(const Instruction &I)
-{
-	if (auto *Intrinsic = dyn_cast<IntrinsicInst>(&I)) {
-		switch (Intrinsic->getIntrinsicID()) {
-		case Intrinsic::assume:
-		case Intrinsic::lifetime_start:
-		case Intrinsic::lifetime_end:
-		case Intrinsic::invariant_start:
-		case Intrinsic::invariant_end:
-			return true;
-		default:
-			break;
-		}
-	}
-	return !I.mayHaveSideEffects();
-}
+class CleanInstructions {
+	DominatorTree &DT;
+	DenseMap<const Instruction *, bool> PrivateWrites;
 
-static bool cleanBB(BasicBlock *BB)
+	bool privateDestination(const Value *Pointer, const Instruction &I)
+	{
+		auto It = PrivateWrites.find(&I);
+		if (It != PrivateWrites.end())
+			return It->second;
+		auto *Allocation = dyn_cast<AllocaInst>(getUnderlyingObject(Pointer));
+		bool Private = false;
+
+		if (Allocation && Allocation->getFunction() == I.getFunction()) {
+			// A later call may receive the initialized object. Only captures
+			// that can precede this write make the write externally visible.
+#if LLVM_VERSION_MAJOR >= 21
+			Private = !PointerMayBeCapturedBefore(Allocation, true, &I, &DT,
+							     true, 256);
+#else
+			Private = !PointerMayBeCapturedBefore(Allocation, true, true, &I,
+								     &DT, true, 256);
+#endif
+		}
+		PrivateWrites[&I] = Private;
+		return Private;
+	}
+
+public:
+	explicit CleanInstructions(DominatorTree &DT) : DT(DT) {}
+
+	bool isClean(const Instruction &I)
+	{
+		if (auto *Store = dyn_cast<StoreInst>(&I))
+			return !Store->isVolatile() && !Store->isAtomic() &&
+			       privateDestination(Store->getPointerOperand(), I);
+		if (auto *Memory = dyn_cast<MemIntrinsic>(&I))
+			return !Memory->isVolatile() &&
+			       privateDestination(Memory->getRawDest(), I);
+		if (auto *Intrinsic = dyn_cast<IntrinsicInst>(&I)) {
+			switch (Intrinsic->getIntrinsicID()) {
+			case Intrinsic::assume:
+			case Intrinsic::lifetime_start:
+			case Intrinsic::lifetime_end:
+			case Intrinsic::invariant_start:
+			case Intrinsic::invariant_end:
+				return true;
+			default:
+				break;
+			}
+		}
+		return !I.mayHaveSideEffects();
+	}
+};
+
+static bool cleanBB(BasicBlock *BB, CleanInstructions &Clean)
 {
 	for (Instruction &I : *BB) {
-		if (!isCleanInstruction(I))
+		if (!Clean.isClean(I))
 			return false;
 	}
 	return true;
 }
 
-static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, DominatorTree &DT)
+static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI,
+				     DominatorTree &DT, CleanInstructions &Clean)
 {
 	SmallPtrSet<BasicBlock *, 32> CleanEntries;
 	SmallPtrSet<BasicBlock *, 32> CleanBBs;
@@ -281,7 +322,7 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 	Worklist.push_back(&F.getEntryBlock());
 	while (!Worklist.empty()) {
 		BasicBlock *BB = Worklist.pop_back_val();
-		if (!cleanBB(BB))
+		if (!cleanBB(BB, Clean))
 			continue;
 
 		CleanBBs.insert(BB);
@@ -824,7 +865,8 @@ static CallDescription describeCall(CallBase &Call, bool CleanPrefix)
 	return D;
 }
 
-static void findCleanPrefixes(Function &F, SmallPtrSetImpl<const CallBase *> &Clean)
+static void findCleanPrefixes(Function &F, SmallPtrSetImpl<const CallBase *> &Prefixes,
+			      CleanInstructions &Clean)
 {
 	SmallPtrSet<BasicBlock *, 32> Seen;
 	SmallVector<BasicBlock *, 16> Work{&F.getEntryBlock()};
@@ -834,8 +876,8 @@ static void findCleanPrefixes(Function &F, SmallPtrSetImpl<const CallBase *> &Cl
 		bool Dirty = false;
 		for (Instruction &I : *BB) {
 			if (auto *Call = dyn_cast<CallBase>(&I))
-				Clean.insert(Call);
-			if (!isCleanInstruction(I)) {
+				Prefixes.insert(Call);
+			if (!Clean.isClean(I)) {
 				Dirty = true;
 				break;
 			}
@@ -944,11 +986,15 @@ public:
 				Flags |= FMODRET_FN_INTEGER;
 			if (isErrorPointerType(F.getReturnType(), M.getDataLayout()))
 				Flags |= FMODRET_FN_ERRPTR;
+			std::unique_ptr<CleanInstructions> Clean;
+			if (Defined)
+				Clean = std::make_unique<CleanInstructions>(
+					FAM.getResult<DominatorTreeAnalysis>(F));
 			if (Defined && (Flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR))) {
 				auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
 				auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
-				if (functionHasCleanErrnoPath(F, LVI, DT))
+				if (functionHasCleanErrnoPath(F, LVI, DT, *Clean))
 					Flags |= FMODRET_FN_CLEAN_SEED;
 			}
 			FunctionDescription D{&F, Flags, {}, {}};
@@ -959,7 +1005,7 @@ public:
 						closedCallbackParameter(&A, Uses) ? FMODRET_PARAM_CLOSED : 0U);
 				}
 				SmallPtrSet<const CallBase *, 32> Prefixes;
-				findCleanPrefixes(F, Prefixes);
+				findCleanPrefixes(F, Prefixes, *Clean);
 				for (BasicBlock &BB : F)
 					for (Instruction &I : BB)
 						if (auto *Call = dyn_cast<CallBase>(&I)) {
