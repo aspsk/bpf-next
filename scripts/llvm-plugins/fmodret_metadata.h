@@ -32,6 +32,12 @@
  * path. Both return kinds participate in clean-function derivation. CLEAN_PREFIX
  * covers entry through the instruction before the call. Error cases describe
  * all continuations after a failed call, irrespective of cleanup side effects.
+ * Call NULL_ALLOCATOR identifies a trusted allocator with a resource-clean NULL
+ * failure. NULL_ERROR additionally proves that NULL returns a negative integer
+ * errno or ERR_PTR on every continuation. Together with CLEAN_PREFIX it seeds
+ * cleanliness of the caller. The ordinary cases still cover negative errnos;
+ * NULL is not added to the errno domain and is not assumed to be an error for
+ * arbitrary pointer-returning helpers.
  * UNKNOWN includes discarded results, unsupported expressions and loops.
  * Identity includes sign-preserving integer and ERR_PTR/PTR_ERR casts;
  * CONSTANT maps to an errno. NETLINK_ACK is a flag for paths ending at
@@ -46,7 +52,7 @@
  * These facts cover negative errno injection only, not arbitrary return values.
  */
 #define FMODRET_META_MAGIC 0x46524d32U
-#define FMODRET_META_VERSION 5U
+#define FMODRET_META_VERSION 6U
 #define FMODRET_META_ERRNOS 4095
 #define FMODRET_META_HEADER_SIZE(ptr_size) (24 + (ptr_size))
 #define FMODRET_META_PARAM_SIZE 8
@@ -73,9 +79,12 @@
 #define FMODRET_CALL_RESULT32 (1U << 1)
 #define FMODRET_CALL_RESULT64 (1U << 2)
 #define FMODRET_CALL_RESULT_PTR (1U << 3)
+#define FMODRET_CALL_NULL_ALLOCATOR (1U << 4)
+#define FMODRET_CALL_NULL_ERROR (1U << 5)
 #define FMODRET_CALL_RESULT_MASK (FMODRET_CALL_RESULT32 | FMODRET_CALL_RESULT64 | \
 				  FMODRET_CALL_RESULT_PTR)
-#define FMODRET_CALL_FLAGS (FMODRET_CALL_CLEAN_PREFIX | FMODRET_CALL_RESULT_MASK)
+#define FMODRET_CALL_FLAGS (FMODRET_CALL_CLEAN_PREFIX | FMODRET_CALL_RESULT_MASK | \
+			    FMODRET_CALL_NULL_ALLOCATOR | FMODRET_CALL_NULL_ERROR)
 
 #define FMODRET_ERROR_UNKNOWN 0
 #define FMODRET_ERROR_IDENTITY 1
