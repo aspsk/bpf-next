@@ -142,12 +142,13 @@ static bool dominatedByIsErr(const Value *V, BasicBlock *BB, DominatorTree &DT)
 
 		if (!Dom)
 			break;
-		if (!Branch || Branch->getNumSuccessors() != 2) {
+		if (!Branch || Branch->getNumSuccessors() != 2 ||
+		    Branch->getSuccessor(0) == Branch->getSuccessor(1)) {
 			BB = Dom;
 			continue;
 		}
-		TruePath = DT.dominates(Branch->getSuccessor(0), BB);
-		FalsePath = DT.dominates(Branch->getSuccessor(1), BB);
+		TruePath = DT.dominates(BasicBlockEdge(Dom, Branch->getSuccessor(0)), BB);
+		FalsePath = DT.dominates(BasicBlockEdge(Dom, Branch->getSuccessor(1)), BB);
 		if (TruePath != FalsePath &&
 		    conditionImpliesIsErr(Branch->getCondition(), TruePath, Pointer, DL))
 			return true;
@@ -472,9 +473,10 @@ static bool blockConditions(BasicBlock *BB, DominatorTree &DT, BooleanFacts &Fac
 #else
 		auto *Branch = dyn_cast<BranchInst>(Dom->getTerminator());
 #endif
-		if (Branch && Branch->getNumSuccessors() == 2) {
-			bool T = DT.dominates(Branch->getSuccessor(0), Target);
-			bool F = DT.dominates(Branch->getSuccessor(1), Target);
+		if (Branch && Branch->getNumSuccessors() == 2 &&
+		    Branch->getSuccessor(0) != Branch->getSuccessor(1)) {
+			bool T = DT.dominates(BasicBlockEdge(Dom, Branch->getSuccessor(0)), Target);
+			bool F = DT.dominates(BasicBlockEdge(Dom, Branch->getSuccessor(1)), Target);
 
 			if (T != F && !assumeBoolean(Branch->getCondition(), T, Facts))
 				return false;
