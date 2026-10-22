@@ -92,7 +92,7 @@ vmlinux_link()
 	ldflags="${ldflags} ${wl}--script=${objtree}/${KBUILD_LDS}"
 	# Keep relocations for the non-allocatable candidate section.
 	if [ "${output}" = ".tmp_vmlinux1" ] &&
-	   is_enabled CONFIG_CLANG_PLUGIN_FMODRET_CANDIDATES; then
+	   is_enabled CONFIG_CLANG_PLUGIN_BPF_SCAN_IR; then
 		ldflags="${ldflags} ${wl}--emit-relocs"
 	fi
 
