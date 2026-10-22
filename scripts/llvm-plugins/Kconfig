@@ -21,13 +21,15 @@ config CLANG_PLUGIN_BPF_SCAN_IR
 	  Run bpf_scan_ir at optimizer-last to collect metadata for BPF.
 	  The current analysis discovers fmod_ret candidates.
 
-	  Describe functions, direct calls, clean prefixes and errno propagation
-	  in one build-only ELF section. The resolve_btfids tool derives clean
-	  functions and admits functions only when every negative errno
+	  Describe functions, calls, callback arguments, clean prefixes and errno
+	  propagation in one build-only ELF section. The resolve_btfids tool derives
+	  clean functions and admits functions only when every negative errno
 	  propagates through all callers to a syscall table entry or is reported
-	  through netlink_ack().
+	  through netlink_ack(), or is handled by netlink_rcv_skb callback dispatch.
 
-	  Unknown callers, escaped addresses and unproved cycles are rejected.
+	  Function addresses passed to direct calls and forwarded through callback
+	  parameters are resolved when every use of the pointer is accounted for.
+	  Unknown callers, untracked address escapes and unproved cycles are rejected.
 	  This analysis currently requires a non-LTO build, so descriptions refer
 	  to the final optimized functions in each compilation unit.
 
