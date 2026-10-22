@@ -18,7 +18,8 @@
  * covers entry through the instruction before the call. Error cases describe
  * all continuations after a failed call, irrespective of cleanup side effects.
  * UNKNOWN includes discarded results, unsupported expressions and loops.
- * Identity includes sign-preserving integer casts; CONSTANT maps to an errno.
+ * Identity includes sign-preserving integer and ERR_PTR/PTR_ERR casts;
+ * CONSTANT maps to an errno. Pointer results are propagation relays only.
  * These facts cover negative errno injection only, not arbitrary return values.
  */
 #define FMODRET_META_MAGIC 0x46524d32U
@@ -34,7 +35,9 @@
 #define FMODRET_FN_ESCAPED (1U << 3)
 #define FMODRET_FN_WEAK (1U << 4)
 #define FMODRET_FN_INTEGER (1U << 5)
-#define FMODRET_FN_FLAGS ((1U << 6) - 1)
+/* Error pointers can relay errno values without becoming injection candidates. */
+#define FMODRET_FN_ERRPTR (1U << 6)
+#define FMODRET_FN_FLAGS ((1U << 7) - 1)
 
 #define FMODRET_CALL_CLEAN_PREFIX (1U << 0)
 
