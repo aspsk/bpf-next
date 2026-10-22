@@ -23,7 +23,9 @@ config CLANG_PLUGIN_BPF_SCAN_IR
 
 	  Describe functions, calls, callback arguments, clean prefixes and errno
 	  propagation in one build-only ELF section. The resolve_btfids tool derives
-	  clean functions and admits functions only when every negative errno
+	  clean integer and ERR_PTR-returning functions. Error-pointer helpers can
+	  establish cleanliness of their callers but are not injection candidates.
+	  Admit integer-returning functions only when every negative errno
 	  propagates through all callers to a syscall table entry or is reported
 	  through netlink_ack(), or is handled by netlink_rcv_skb callback dispatch.
 

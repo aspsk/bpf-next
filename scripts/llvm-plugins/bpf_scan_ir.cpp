@@ -37,6 +37,16 @@ namespace {
 static constexpr int MaxErrno = 4095;
 static constexpr unsigned MaxValueDepth = 64;
 
+static bool preservesErrnoCast(unsigned Opcode, Type *Src, Type *Dst,
+			       const DataLayout &DL);
+
+static bool isErrorPointerType(Type *Ty, const DataLayout &DL)
+{
+	return Ty->isPointerTy() && !DL.isNonIntegralPointerType(Ty) &&
+	       (DL.getPointerTypeSizeInBits(Ty) == 32 ||
+		DL.getPointerTypeSizeInBits(Ty) == 64);
+}
+
 static const Value *convertedPointer(const Value *V)
 {
 	for (unsigned Depth = 0; V && Depth < MaxValueDepth; Depth++) {
@@ -51,9 +61,17 @@ static const Value *convertedPointer(const Value *V)
 	return nullptr;
 }
 
-static bool matchesPointer(const Value *V, const Value *Pointer)
+static bool matchesPointer(const Value *V, const Value *Pointer,
+			   const DataLayout &DL)
 {
-	return V == Pointer || convertedPointer(V) == Pointer;
+	if (V == Pointer)
+		return true;
+	auto *Cast = dyn_cast<PtrToIntInst>(V);
+
+	// A comparison of only the low pointer bits cannot establish IS_ERR.
+	return Cast && Cast->getPointerOperand() == Pointer &&
+	       Cast->getType()->getIntegerBitWidth() ==
+		DL.getPointerTypeSizeInBits(Pointer->getType());
 }
 
 static const ConstantInt *comparisonThreshold(const Value *V)
@@ -66,7 +84,8 @@ static const ConstantInt *comparisonThreshold(const Value *V)
 	return nullptr;
 }
 
-static bool conditionImpliesIsErr(Value *Condition, bool Truth, const Value *Pointer)
+static bool conditionImpliesIsErr(Value *Condition, bool Truth, const Value *Pointer,
+				  const DataLayout &DL)
 {
 	auto *Cmp = dyn_cast<ICmpInst>(Condition);
 	CmpInst::Predicate Pred;
@@ -79,14 +98,14 @@ static bool conditionImpliesIsErr(Value *Condition, bool Truth, const Value *Poi
 	Pred = Cmp->getPredicate();
 	Integer = Cmp->getOperand(0);
 	Threshold = comparisonThreshold(Cmp->getOperand(1));
-	if (!matchesPointer(Integer, Pointer)) {
+	if (!matchesPointer(Integer, Pointer, DL)) {
 		Integer = Cmp->getOperand(1);
 		Threshold = comparisonThreshold(Cmp->getOperand(0));
 		Pred = CmpInst::getSwappedPredicate(Pred);
 	}
-	if (!Threshold || !matchesPointer(Integer, Pointer))
+	if (!Threshold || !matchesPointer(Integer, Pointer, DL))
 		return false;
-	if (Threshold->getBitWidth() != 32 && Threshold->getBitWidth() != 64)
+	if (Threshold->getBitWidth() != DL.getPointerTypeSizeInBits(Pointer->getType()))
 		return false;
 	if (!Truth)
 		Pred = CmpInst::getInversePredicate(Pred);
@@ -102,9 +121,10 @@ static bool conditionImpliesIsErr(Value *Condition, bool Truth, const Value *Poi
 
 static bool dominatedByIsErr(const Value *V, BasicBlock *BB, DominatorTree &DT)
 {
-	const Value *Pointer = convertedPointer(V);
+	const DataLayout &DL = BB->getModule()->getDataLayout();
+	const Value *Pointer = V->getType()->isPointerTy() ? V : convertedPointer(V);
 
-	if (!Pointer)
+	if (!Pointer || !isErrorPointerType(Pointer->getType(), DL))
 		return false;
 
 	while (BB) {
@@ -126,7 +146,7 @@ static bool dominatedByIsErr(const Value *V, BasicBlock *BB, DominatorTree &DT)
 		TruePath = DT.dominates(Branch->getSuccessor(0), BB);
 		FalsePath = DT.dominates(Branch->getSuccessor(1), BB);
 		if (TruePath != FalsePath &&
-		    conditionImpliesIsErr(Branch->getCondition(), TruePath, Pointer))
+		    conditionImpliesIsErr(Branch->getCondition(), TruePath, Pointer, DL))
 			return true;
 		BB = Dom;
 	}
@@ -154,8 +174,20 @@ static bool rangeAtUseIsErrno(const Use &U, LazyValueInfo &LVI)
 	       isErrnoRange(LVI.getConstantRangeAtUse(U, false));
 }
 
-static bool isErrnoConstant(const Value *V)
+static bool isErrnoConstant(const Value *V, const DataLayout &DL)
 {
+	if (auto *Expr = dyn_cast<ConstantExpr>(V);
+	    Expr && Expr->getOpcode() == Instruction::IntToPtr &&
+	    isErrorPointerType(Expr->getType(), DL)) {
+		auto *C = dyn_cast<ConstantInt>(Expr->getOperand(0));
+
+		if (!C)
+			return false;
+		unsigned Width = DL.getPointerTypeSizeInBits(Expr->getType());
+		APInt Bits = C->getValue().zextOrTrunc(Width);
+
+		return Bits.uge(APInt(Width, 0) - APInt(Width, MaxErrno));
+	}
 	auto *C = dyn_cast<ConstantInt>(V);
 	int64_t N;
 
@@ -177,7 +209,9 @@ static bool valueMayBeErrno(Value *V,
 	if (!V || Depth == MaxValueDepth)
 		return false;
 
-	if (isErrnoConstant(V) || dominatedByIsErr(V, BB, DT))
+	const DataLayout &DL = BB->getModule()->getDataLayout();
+
+	if (isErrnoConstant(V, DL) || dominatedByIsErr(V, BB, DT))
 		return true;
 
 	if (!Seen.insert(V).second)
@@ -199,8 +233,8 @@ static bool valueMayBeErrno(Value *V,
 				return true;
 		}
 	} else if (auto *Cast = dyn_cast<CastInst>(V)) {
-		// Zero extension does not preserve a negative bit pattern
-		if (!isa<ZExtInst>(Cast) &&
+		if (preservesErrnoCast(Cast->getOpcode(), Cast->getSrcTy(),
+				       Cast->getDestTy(), DL) &&
 		    (rangeAtUseIsErrno(Cast->getOperandUse(0), LVI) ||
 		     valueMayBeErrno(Cast->getOperand(0), BB, LVI, DT, CleanBBs, Seen, Depth + 1)))
 			return true;
@@ -906,20 +940,17 @@ public:
 				Flags |= FMODRET_FN_WEAK;
 			if (F.getReturnType()->isIntegerTy(64))
 				Flags |= FMODRET_FN_RET64;
-			if (F.getReturnType()->isIntegerTy(32) || F.getReturnType()->isIntegerTy(64)) {
+			if (F.getReturnType()->isIntegerTy(32) || F.getReturnType()->isIntegerTy(64))
 				Flags |= FMODRET_FN_INTEGER;
-				if (Defined) {
-					auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
-					auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-					if (functionHasCleanErrnoPath(F, LVI, DT))
-						Flags |= FMODRET_FN_CLEAN_SEED;
-				}
-			}
-			if (F.getReturnType()->isPointerTy() &&
-			    !M.getDataLayout().isNonIntegralPointerType(F.getReturnType()) &&
-			    (M.getDataLayout().getPointerTypeSizeInBits(F.getReturnType()) == 32 ||
-			     M.getDataLayout().getPointerTypeSizeInBits(F.getReturnType()) == 64))
+			if (isErrorPointerType(F.getReturnType(), M.getDataLayout()))
 				Flags |= FMODRET_FN_ERRPTR;
+			if (Defined && (Flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR))) {
+				auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
+				auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+
+				if (functionHasCleanErrnoPath(F, LVI, DT))
+					Flags |= FMODRET_FN_CLEAN_SEED;
+			}
 			FunctionDescription D{&F, Flags, {}, {}};
 			if (Defined) {
 				for (Argument &A : F.args()) {
