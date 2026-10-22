@@ -1346,6 +1346,7 @@ static void print_function_flags(const struct error_node *node, size_t offset,
 		{ FMODRET_FN_INTEGER, "integer" },
 		{ FMODRET_FN_ERRPTR, "error_pointer_relay" },
 		{ FMODRET_FN_RET64, "integer_return64" },
+		{ FMODRET_FN_ADDRESS_TAKEN, "address_taken" },
 	};
 	size_t i;
 
@@ -1403,9 +1404,10 @@ static int parse_error_graph(Elf *elf, const struct elf_function_list *functions
 					n->strong_definitions++;
 					n->strong_flags |= flags;
 				}
-				n->flags |= flags & FMODRET_FN_ESCAPED;
+				n->flags |= flags & (FMODRET_FN_ESCAPED | FMODRET_FN_ADDRESS_TAKEN);
 			} else {
-				g->nodes[node].flags |= flags & FMODRET_FN_ESCAPED;
+				g->nodes[node].flags |= flags &
+					(FMODRET_FN_ESCAPED | FMODRET_FN_ADDRESS_TAKEN);
 			}
 		}
 		if ((calls || params) && !(flags & FMODRET_FN_DEFINED))
@@ -1539,6 +1541,9 @@ static void select_error_descriptions(struct error_graph *g)
 
 static bool graph_node_known(const struct error_node *n)
 {
+	/* ADDRESS_TAKEN is not a veto. ESCAPED, unresolved argument flows and
+	 * unmodelled linked references describe the remaining coverage gaps.
+	 */
 	return n->definitions == 1 &&
 	       (n->flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR)) &&
 	       !(n->flags & (FMODRET_FN_ESCAPED | FMODRET_FN_WEAK)) &&
@@ -2035,11 +2040,12 @@ static void print_function_resolution(const struct error_graph *g, size_t node)
 
 	fprintf(stderr, "fmodret function: %s section=%u address=%#llx flags=%#x "
 		"definitions=%u strong-descriptions=%u weak-descriptions=%u "
-		"linkage=%s clean=%s candidate=%s "
+		"linkage=%s address-taken=%s clean=%s candidate=%s "
 		"errno-proven=%u/%u syscall=%s propagation-reasons=",
 		n->name, (unsigned int)n->shndx, (unsigned long long)n->value,
 		n->flags, n->definitions, n->strong_definitions, n->weak_definitions,
 		n->flags & FMODRET_FN_LOCAL ? "local" : "global",
+		n->flags & FMODRET_FN_ADDRESS_TAKEN ? "yes" : "no",
 		!n->clean ? "no" : n->clean_via == NO_NODE ? "atomic" : "constructed",
 		n->clean && !mask ? "yes" : !n->clean ? "no:not-clean" : "no:unproven",
 		error_count(n->good), FMODRET_META_ERRNOS, n->terminal ? "yes" : "no");
@@ -2081,6 +2087,7 @@ static int resolve_error_graph(struct error_graph *g,
 	size_t i, e, atomic = 0, clean = 0, proven = 0, roots = 0, described = 0;
 	size_t candidates = 0, failed = 0, local = 0, global = 0;
 	size_t ack_calls = 0, ack_cases = 0, rcv_calls = 0, rcv_cases = 0;
+	size_t address_taken = 0, address_passed = 0;
 	size_t rejections[ERROR_REJECTION_COUNT] = {};
 	uint64_t full[ERROR_WORDS];
 
@@ -2198,6 +2205,10 @@ static int resolve_error_graph(struct error_graph *g,
 			candidates++;
 			local += !!(g->nodes[i].flags & FMODRET_FN_LOCAL);
 			global += !(g->nodes[i].flags & FMODRET_FN_LOCAL);
+			if (g->nodes[i].flags & FMODRET_FN_ADDRESS_TAKEN) {
+				address_taken++;
+				address_passed += passed;
+			}
 			proven += passed;
 			failed += !passed;
 			if (!passed)
@@ -2257,6 +2268,9 @@ static int resolve_error_graph(struct error_graph *g,
 			atomic, clean - atomic, clean);
 		fprintf(stderr, "fmodret candidates: %zu clean bodies (%zu local, %zu global)\n",
 			candidates, local, global);
+		fprintf(stderr, "fmodret address-use: %zu clean address-taken bodies, "
+			"%zu passed, %zu failed\n", address_taken, address_passed,
+			address_taken - address_passed);
 		fprintf(stderr, "fmodret propagation: %zu clean candidate bodies, "
 			"%zu failed, %zu passed; %zu syscall entries\n",
 			candidates, failed, proven, roots);

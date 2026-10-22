@@ -29,6 +29,8 @@ config CLANG_PLUGIN_BPF_SCAN_IR
 
 	  Function addresses passed to direct calls and forwarded through callback
 	  parameters are resolved when every use of the pointer is accounted for.
+	  Taking an address is diagnostic and does not itself exclude a function.
+	  Compiler retention annotations do not count as runtime address escapes.
 	  Unknown callers, untracked address escapes and unproved cycles are rejected.
 	  This analysis currently requires a non-LTO build, so descriptions refer
 	  to the final optimized functions in each compilation unit.

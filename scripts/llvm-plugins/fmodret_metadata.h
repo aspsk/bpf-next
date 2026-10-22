@@ -25,6 +25,8 @@
  * Function RET64 distinguishes 64-bit integer results. Call result flags
  * distinguish 32-bit integers, 64-bit integers and pointers, for checking a
  * resolved callback's result representation before reusing its errno cases.
+ * ADDRESS_TAKEN is diagnostic only. ESCAPED denotes an untracked use, not
+ * merely taking an address or passing it through a described callback flow.
  *
  * CLEAN_SEED describes an existing side-effect-free errno path. CLEAN_PREFIX
  * covers entry through the instruction before the call. Error cases describe
@@ -43,7 +45,7 @@
  * These facts cover negative errno injection only, not arbitrary return values.
  */
 #define FMODRET_META_MAGIC 0x46524d32U
-#define FMODRET_META_VERSION 3U
+#define FMODRET_META_VERSION 4U
 #define FMODRET_META_ERRNOS 4095
 #define FMODRET_META_HEADER_SIZE(ptr_size) (24 + (ptr_size))
 #define FMODRET_META_PARAM_SIZE 8
@@ -63,7 +65,8 @@
 /* Error pointers can relay errno values without becoming injection candidates. */
 #define FMODRET_FN_ERRPTR (1U << 6)
 #define FMODRET_FN_RET64 (1U << 7)
-#define FMODRET_FN_FLAGS ((1U << 8) - 1)
+#define FMODRET_FN_ADDRESS_TAKEN (1U << 8)
+#define FMODRET_FN_FLAGS ((1U << 9) - 1)
 
 #define FMODRET_CALL_CLEAN_PREFIX (1U << 0)
 #define FMODRET_CALL_RESULT32 (1U << 1)
