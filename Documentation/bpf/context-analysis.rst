@@ -160,6 +160,14 @@ unit, with ``format``, ``version``, ``unit``, ``types``, ``tokens`` and
 ``functions``. Version 2 adds symbolic-token declarations. IR transport
 version 3 adds write events (address and byte width) and memory-effect
 coverage. Version 2 remains readable without the new preservation proofs.
+Version 3 also records pointer snapshots and ordered capture events. Each
+snapshot identifies one SSA pointer value from a load or a supported getter.
+Repeated reads have distinct identities. A capture executed again in a loop
+invalidates ownership tied to that definition's previous dynamic instance.
+When the captured pointer is passed directly to a callee, its ownership can
+be expressed relative to that callee's argument. Snapshot IDs never enter
+runtime tags. Possible acquisition paths are expanded for display, while
+entry paths requiring an unproved relation to a reloaded field are omitted.
 Function and call numbers are document local. Direct global calls resolve to
 the selected strong/weak linked symbol. Local calls first resolve within their
 compilation unit. Function records retain contracts, argument substitutions,
