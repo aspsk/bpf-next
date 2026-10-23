@@ -114,9 +114,24 @@ struct AssemblyReferences {
 
 	void collect(StringRef Text)
 	{
-		if ((Text.contains(".include") || Text.contains(".incbin") ||
-		     Text.contains(".macro") || Text.contains(".altmacro") ||
-		     Text.contains(".irp")) && !localRegisterAsm(Text))
+		std::string Directives;
+		for (unsigned char C : Text)
+			if (C != ' ' && C != '\t' && C != '\r' && C != '\n')
+				Directives.push_back(C);
+		/* ARM64 exception-table entries also emit these definitions. The
+		 * exact repeat body manufactures assembler-local constants only;
+		 * the surrounding instructions and references remain opaque here.
+		 */
+		StringRef Registers =
+			".irpnum,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30"
+			".equ.L__gpr_num_x\\num,\\num.equ.L__gpr_num_w\\num,\\num.endr"
+			".equ.L__gpr_num_xzr,31.equ.L__gpr_num_wzr,31";
+		for (size_t P; (P = Directives.find(Registers.str())) != std::string::npos;)
+			Directives.erase(P, Registers.size());
+		StringRef Rest(Directives);
+		if ((Rest.contains(".include") || Rest.contains(".incbin") ||
+		     Rest.contains(".macro") || Rest.contains(".altmacro") ||
+		     Rest.contains(".irp")) && !localRegisterAsm(Text))
 			Opaque = true;
 		while (!Text.empty()) {
 			auto IsSymbol = [](unsigned char C) {
