@@ -624,7 +624,7 @@ static const struct expression *substitute(struct context *c,
 	unsigned int pos;
 	const struct expression *result;
 
-	if (input->has_local)
+	if (input->has_local || input->has_snapshot)
 		return NULL;
 	if (!input->has_arg)
 		return input;
@@ -1724,6 +1724,11 @@ static void record_exit(struct analysis *a, const struct state *s, enum conditio
 	for (i = 0; i < s->nr_ownership; ++i)
 		if (s->ownership[i].delta > 1 || s->ownership[i].delta < -1)
 			a->complete = a->exits_known = false;
+	for (i = 0; i < s->delta.n; ++i)
+		if (s->delta.v[i].lock->has_snapshot) {
+			a->complete = a->exits_known = false;
+			a->f->reason = "exit ownership depends on a callee-local pointer capture";
+		}
 	a->exits = resize(a->exits, a->nr_exits + 1, sizeof(*a->exits));
 	e = &a->exits[a->nr_exits++];
 	memset(e, 0, sizeof(*e));

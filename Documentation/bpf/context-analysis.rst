@@ -168,6 +168,9 @@ When the captured pointer is passed directly to a callee, its ownership can
 be expressed relative to that callee's argument. Snapshot IDs never enter
 runtime tags. Possible acquisition paths are expanded for display, while
 entry paths requiring an unproved relation to a reloaded field are omitted.
+Net exit effects containing a callee-local snapshot cannot be exported as
+caller ownership. Incoming argument substitution may bind a caller's captured
+value, but a callee's private snapshot number never denotes that value.
 Function and call numbers are document local. Direct global calls resolve to
 the selected strong/weak linked symbol. Local calls first resolve within their
 compilation unit. Function records retain contracts, argument substitutions,

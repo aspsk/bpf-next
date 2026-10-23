@@ -312,3 +312,18 @@ int alias_release_case(struct wrapped_lock *obj)
 	test_unlock(&obj->inner);
 	return after_alias_release(obj);
 }
+
+static NOINLINE void acquire_from_holder(struct test_holder *holder)
+{
+	test_lock(&holder->current->lock);
+}
+
+static NOINLINE int after_foreign_snapshot(struct test_object *obj) { return obj->counter; }
+
+int foreign_snapshot_case(struct test_holder *first, struct test_holder *second)
+{
+	struct test_object *obj = first->current;
+
+	acquire_from_holder(second);
+	return after_foreign_snapshot(obj);
+}

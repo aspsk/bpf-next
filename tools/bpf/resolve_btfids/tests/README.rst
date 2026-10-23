@@ -22,3 +22,5 @@ The runner also checks that rejection reasons distinguish these cases.
 Nested-lock cases distinguish declared releases of an inner instance from
 raw writes inside the outer capability's storage. Releases at an aliased
 address must still invalidate ownership.
+The caller and callee may both use snapshot number zero for different
+objects; a callee's private capture cannot establish caller ownership.
