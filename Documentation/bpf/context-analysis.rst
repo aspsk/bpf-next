@@ -155,6 +155,11 @@ requires a richer correlated state.
 Build-time identity and incompleteness
 -------------------------------------
 
+Three ``--verbose`` flags on resolve_btfids print the call, write or pointer
+capture which removes a definite ownership fact. ``BPF_CONTEXT_TRACE=NAME``
+restricts these ownership-loss diagnostics to one function. This diagnostic
+does not weaken unknown effects or change the emitted facts.
+
 The IR transport is versioned NUL-delimited JSON, one document per compilation
 unit, with ``format``, ``version``, ``unit``, ``types``, ``tokens`` and
 ``functions``. Version 2 adds symbolic-token declarations. IR transport
