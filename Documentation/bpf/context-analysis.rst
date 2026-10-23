@@ -78,6 +78,16 @@ for call-site ownership transitions. Exit-effect propagation is separate from
 internal-effect completeness: a caller can derive that it returns holding a
 lock even when an annotated callee's internal acquisitions are not fully known.
 Such a caller does not receive a complete-summary tag.
+For physical ``spinlock`` and ``raw_spinlock`` instances, ownership preservation
+also uses complete direct-call interfaces collected with annotations enabled.
+The Clang interface convention is no ownership transfer unless a release is
+declared. A complete caller-side interface can therefore preserve incoming
+spin ownership when the linked implementation did not opt in. This trusts the
+interface contract; it does not independently verify that unchecked body or
+certify its internal acquisitions. A missing external implementation, an
+analysis-disabled interface and an unresolved indirect call remain unknown.
+Bodies covered by analysis still contribute their writes and release effects,
+so a possibly overlapping write or release invalidates definite ownership.
 Raw memory writes also prevent completeness unless their semantics are supplied
 by a declared callee contract; this pass does not infer locking from atomic
 instruction patterns.
