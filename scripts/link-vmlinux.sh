@@ -90,6 +90,12 @@ vmlinux_link()
 	fi
 
 	ldflags="${ldflags} ${wl}--script=${objtree}/${KBUILD_LDS}"
+	# Keep native caller references for context analysis.
+	if [ "${output}" = ".tmp_vmlinux1" ] &&
+	   is_enabled CONFIG_CLANG_PLUGIN_BPF_CONTEXT_IR; then
+		ldflags="${ldflags} ${wl}--emit-relocs"
+		ldflags="${ldflags} ${wl}--defsym=__bpf_context_native_calls=1"
+	fi
 
 	# The kallsyms linking does not need debug symbols included.
 	if [ -n "${strip_debug}" ] ; then

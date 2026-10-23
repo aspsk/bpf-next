@@ -196,9 +196,9 @@ functions. Unmatched clones are incomplete, not matched by name prefixes.
 Ownership preservation is independent of complete acquisition/exit summaries.
 A monotone fixed point collects possible invalidating writes and ownership
 releases, including through loops and recursion. Trusted contracts describe
-ownership changes across primitive calls. Opaque calls, bodies without context
-coverage, unrepresentable effects and analysis-budget exhaustion prevent a
-preservation proof. Writes to fresh local stack storage cannot clobber a
+ownership changes across primitive calls. Opaque calls, missing body coverage
+without a usable ownership interface, unrepresentable effects and analysis-budget
+exhaustion prevent a preservation proof. Writes to fresh local stack storage cannot clobber a
 caller's valid lock.
 
 At each call or write, retain ownership only when its lock storage is provably
@@ -226,6 +226,21 @@ Acquisition budgets and propagated incompleteness are counted separately.
 Without a closed caller set, no derived entry ownership
 is emitted. In particular, externally callable functions cannot acquire an
 entry guarantee merely because their observed C callers hold a lock.
+
+For a global definition, Kbuild retains native relocations in the first linked
+image and supplies the absolute symbol ``__bpf_context_native_calls=1`` to
+record ``--emit-relocs`` coverage. The resolver requires that marker and
+allocated text relocations before closing any global caller set. This is
+supported for linked x86-64 and ARM64 images, including the relocatable ARM64
+kernel. Relocatable object files and ordinary shared libraries retain open
+global caller sets.
+
+Every native entry reference must be a direct call or tail call accounted for
+by a surviving, unambiguous selected IR caller. Additional assembly callers,
+native function-pointer uses, exported addresses and declaration-side escapes
+keep the set open. Known unwind and function-tracing metadata references do not
+introduce callers. These checks are independent of the target body's effects;
+its entry context is sampled before executing that body.
 
 The analysis copy expands indirect calls whose complete target set is a
 bounded selection or PHI of function constants with matching prototypes.
@@ -257,7 +272,9 @@ prevents a complete runtime summary. Assembly references make the
 referenced functions' caller sets incomplete;
 block addresses and function addresses passed to assembly also escape. Empty
 inline-assembly templates, including compiler memory barriers, preserve lock
-ownership. Other assembly remains an opaque effect at its own call site.
+ownership. Exact ARM64 memory barriers and thread-register reads, and x86 memory
+fences, preserve ownership too. Other assembly remains an opaque effect at its
+own call site.
 Assembly directives that import unseen text or construct symbol names retain a
 conservative translation-unit escape fallback. The fixed ARM64 sysreg
 register-number macros are recognized as local non-call templates for escape
