@@ -55,6 +55,12 @@ struct clobber {
 	bool release;
 };
 
+struct clobbers {
+	struct clobber *v;
+	unsigned int n;
+	bool unknown;
+};
+
 struct substitution {
 	const struct expression *input, *result;
 };
@@ -66,6 +72,7 @@ struct site {
 	const struct expression **args;
 	unsigned int nargs, propagated_may;
 	bool unrepresentable_may;
+	bool interface_covered;
 	struct facts held;
 	struct substitution *substitutions;
 	unsigned int nr_substitutions, substitution_slots;
@@ -116,9 +123,7 @@ struct function {
 	bool memory_covered;
 	bool may_incomplete, may_budget;
 	unsigned int loaded_may;
-	bool clobber_unknown;
-	struct clobber *clobbers;
-	unsigned int nr_clobbers;
+	struct clobbers memory_clobbers, spin_clobbers;
 	const struct expression **snapshots;
 	unsigned int nr_snapshots;
 	bool dirty, body_dirty, entry_dirty, notify_callers, notify_body;
@@ -163,7 +168,7 @@ struct context {
 	struct name_id *names, *btf_names, *elf_names;
 	unsigned int nr_btf_names, nr_elf_names;
 	struct btf *btf;
-	bool *capabilities, *reentrant;
+	bool *capabilities, *spin_capabilities, *reentrant;
 	struct context_token *tokens;
 	unsigned int nr_tokens;
 	struct emitted_tag **emitted;
@@ -1102,9 +1107,10 @@ static void resolve_functions(struct context *c)
 				if (s->reference >= 0 && (unsigned int)s->reference < f->doc->nr_functions) {
 					struct function *ref = &c->functions[f->doc->functions[s->reference]];
 
+					s->interface_covered = ref->memory_covered;
 					s->callee = ref->definition;
 					/* Keep declaration contracts when no body was collected. */
-					if (!s->callee && ref->declared.n)
+					if (!s->callee && (ref->declared.n || s->interface_covered))
 						s->callee = ref;
 					if (s->callee) {
 						struct function *g = s->callee;
@@ -1117,30 +1123,30 @@ static void resolve_functions(struct context *c)
 	}
 }
 
-static bool add_clobber(struct function *f, struct clobber effect)
+static bool add_clobber(struct clobbers *set, struct clobber effect)
 {
 	unsigned int i;
 
-	if (f->clobber_unknown)
+	if (set->unknown)
 		return false;
 	if (!effect.address || (!effect.release && !effect.width) ||
 	    (effect.address->has_local && effect.address->has_load)) {
-		f->clobber_unknown = true;
+		set->unknown = true;
 		return true;
 	}
 	/* This frame's own stack storage cannot be a caller's live lock. */
 	if (effect.address->has_local)
 		return false;
-	for (i = 0; i < f->nr_clobbers; ++i)
-		if (f->clobbers[i].address == effect.address &&
-		    f->clobbers[i].width == effect.width && f->clobbers[i].release == effect.release)
+	for (i = 0; i < set->n; ++i)
+		if (set->v[i].address == effect.address &&
+		    set->v[i].width == effect.width && set->v[i].release == effect.release)
 			return false;
-	if (f->nr_clobbers == 128) {
-		f->clobber_unknown = true;
+	if (set->n == 128) {
+		set->unknown = true;
 		return true;
 	}
-	f->clobbers = resize(f->clobbers, f->nr_clobbers + 1, sizeof(*f->clobbers));
-	f->clobbers[f->nr_clobbers++] = effect;
+	set->v = resize(set->v, set->n + 1, sizeof(*set->v));
+	set->v[set->n++] = effect;
 	return true;
 }
 
@@ -1148,19 +1154,20 @@ static bool add_clobber(struct function *f, struct clobber effect)
  * Cycles are allowed: unknown effects and possible clobbers only accumulate.
  * Trusted interface contracts describe ownership changes across the call.
  */
-static void derive_clobbers(struct context *c)
+static void derive_clobbers(struct context *c, bool spin)
 {
 	unsigned int i, j, k, h, round, known = 0;
 	bool changed = false;
 
 	for (i = 0; i < c->nr_functions; ++i) {
 		struct function *f = &c->functions[i];
+		struct clobbers *set = spin ? &f->spin_clobbers : &f->memory_clobbers;
 
-		f->clobber_unknown = !f->known_contract && (!f->defined || !f->memory_covered);
+		set->unknown = !f->known_contract && (!f->defined || !f->memory_covered);
 		if (f->known_contract) {
 			for (j = 0; j < f->declared.n; ++j)
 				if (f->declared.v[j].op == RELEASE)
-					add_clobber(f, (struct clobber){ f->declared.v[j].lock, 0, true });
+					add_clobber(set, (struct clobber){ f->declared.v[j].lock, 0, true });
 			continue;
 		}
 		for (j = 0; j < f->nr_blocks; ++j)
@@ -1168,35 +1175,48 @@ static void derive_clobbers(struct context *c)
 				struct site *s = &f->blocks[j].sites[k];
 
 				if (s->write)
-					add_clobber(f, (struct clobber){ expand_snapshots(c, f, s->address), s->width, false });
+					add_clobber(set, (struct clobber){ expand_snapshots(c, f, s->address), s->width, false });
 				else if (!s->capture && !s->callee)
-					f->clobber_unknown = true;
+					set->unknown = true;
 			}
 	}
 	for (round = 0; round < MAX_ROUNDS; ++round) {
 		changed = false;
 		for (i = 0; i < c->nr_functions; ++i) {
 			struct function *f = &c->functions[i];
+			struct clobbers *set = spin ? &f->spin_clobbers : &f->memory_clobbers;
 
-			if (f->known_contract || f->clobber_unknown)
+			if (f->known_contract || set->unknown)
 				continue;
-			for (j = 0; j < f->nr_blocks && !f->clobber_unknown; ++j)
-				for (k = 0; k < f->blocks[j].nr_sites && !f->clobber_unknown; ++k) {
+			for (j = 0; j < f->nr_blocks && !set->unknown; ++j)
+				for (k = 0; k < f->blocks[j].nr_sites && !set->unknown; ++k) {
 					struct site *s = &f->blocks[j].sites[k];
 					struct function *g = s->callee;
+					struct clobbers *from = g ? (spin ? &g->spin_clobbers : &g->memory_clobbers) : NULL;
 
 					if (s->write || s->capture)
 						continue;
-					if (!g || g->clobber_unknown) {
-						f->clobber_unknown = changed = true;
+					/* Clang's complete direct-call interface describes
+					 * ownership transfers even when a body is unavailable.
+					 * This is not a complete memory/acquisition summary.
+					 */
+					if (spin && s->interface_covered && g && g->defined && !g->covered) {
+						for (h = 0; h < g->declared.n; ++h)
+							if (g->declared.v[h].op == RELEASE)
+								changed |= add_clobber(set, (struct clobber){
+									substitute(c, g->declared.v[h].lock, s), 0, true });
+						continue;
+					}
+					if (!from || from->unknown) {
+						set->unknown = changed = true;
 						break;
 					}
-					for (h = 0; h < g->nr_clobbers && !f->clobber_unknown; ++h) {
-						struct clobber effect = g->clobbers[h];
+					for (h = 0; h < from->n && !set->unknown; ++h) {
+						struct clobber effect = from->v[h];
 
 						effect.address = substitute(c, effect.address, s);
 						effect.address = expand_snapshots(c, f, effect.address);
-						changed |= add_clobber(f, effect);
+						changed |= add_clobber(set, effect);
 					}
 				}
 		}
@@ -1204,13 +1224,15 @@ static void derive_clobbers(struct context *c)
 			break;
 	}
 	for (i = 0; i < c->nr_functions; ++i) {
+		struct clobbers *set = spin ? &c->functions[i].spin_clobbers : &c->functions[i].memory_clobbers;
+
 		if (changed)
-			c->functions[i].clobber_unknown = true;
-		known += !c->functions[i].clobber_unknown;
+			set->unknown = true;
+		known += !set->unknown;
 	}
 	if (c->verbose)
-		fprintf(stderr, "context-analysis: ownership preservation: %u tracked summaries, %u unknown; %u rounds\n",
-			known, c->nr_functions - known, round + 1);
+		fprintf(stderr, "context-analysis: %sownership preservation: %u tracked summaries, %u unknown; %u rounds\n",
+			spin ? "spin " : "", known, c->nr_functions - known, round + 1);
 }
 
 struct pending {
@@ -1288,6 +1310,8 @@ static void forget_ownership(struct state *s, const struct expression *lock)
 
 static bool clobber_aliases(struct context *c, struct function *f,
 			    const struct expression *lock, struct clobber effect);
+static bool spin_expression(struct context *c, struct function *f,
+			    const struct expression *lock);
 
 static void invalidate_clobber(struct context *c, struct function *f, struct state *s,
 			       struct clobber effect)
@@ -1311,22 +1335,55 @@ static void invalidate_clobber(struct context *c, struct function *f, struct sta
 	}
 }
 
-static void preserve_call(struct context *c, struct function *f, struct state *s,
-			  struct site *site)
+static bool call_clobbers(struct context *c, struct function *f, struct site *site,
+			  const struct expression *lock)
 {
 	unsigned int i;
 	struct function *g = site->callee;
+	bool spin = spin_expression(c, f, lock);
+	struct clobbers *set;
 
-	if (!g || g->clobber_unknown) {
-		destroy_state(s);
-		return;
+	if (!g)
+		return true;
+	if (spin && site->interface_covered && g->defined && !g->covered) {
+		for (i = 0; i < g->declared.n; ++i)
+			if (g->declared.v[i].op == RELEASE &&
+			    clobber_aliases(c, f, lock, (struct clobber){
+				    substitute(c, g->declared.v[i].lock, site), 0, true }))
+				return true;
+		return false;
 	}
-	for (i = 0; i < g->nr_clobbers; ++i) {
-		struct clobber effect = g->clobbers[i];
+	set = spin ? &g->spin_clobbers : &g->memory_clobbers;
+	if (set->unknown)
+		return true;
+	for (i = 0; i < set->n; ++i) {
+		struct clobber effect = set->v[i];
 
 		effect.address = substitute(c, effect.address, site);
-		invalidate_clobber(c, f, s, effect);
+		if (clobber_aliases(c, f, lock, effect))
+			return true;
 	}
+	return false;
+}
+
+static void preserve_call(struct context *c, struct function *f, struct state *s,
+			  struct site *site)
+{
+	unsigned int i = 0;
+
+	while (i < s->held.n) {
+		const struct expression *lock = s->held.v[i].lock;
+
+		if (call_clobbers(c, f, site, lock))
+			forget_ownership(s, lock);
+		else
+			++i;
+	}
+	for (i = 0; i < s->nr_pending;)
+		if (call_clobbers(c, f, site, s->pending[i].fact.lock))
+			s->pending[i] = s->pending[--s->nr_pending];
+		else
+			++i;
 }
 
 static void initialize_ownership(struct state *s)
@@ -2421,6 +2478,21 @@ static bool typed_expression(struct context *c, const struct btf_type *proto,
 		!*p && capability_at(c, loc.type, loc.offset, 0);
 }
 
+static bool spin_expression(struct context *c, struct function *f,
+			    const struct expression *lock)
+{
+	const struct btf_type *proto = f->native_proto ? btf__type_by_id(c->btf, f->native_proto) : NULL;
+	struct location loc;
+	const char *p = lock->text;
+	unsigned int type;
+
+	if (!native_expression(c, lock, false) ||
+	    !expression_location(c, proto, &p, &loc, 0) || *p ||
+	    !(type = capability_at(c, loc.type, loc.offset, 0)))
+		return false;
+	return c->spin_capabilities[type];
+}
+
 static bool address_base(const struct expression *expr, char *base, long long *offset)
 {
 	char text[MAX_EXPR];
@@ -2556,6 +2628,7 @@ static int emit_types(struct context *c)
 			}
 			if (matches && *cap && strlen(cap) < MAX_EXPR - 64 && !strchr(cap, ':')) {
 				c->capabilities[id] = true;
+				c->spin_capabilities[id] = !strcmp(cap, "spinlock") || !strcmp(cap, "raw_spinlock");
 				snprintf(tag, sizeof(tag), BPF_CONTEXT_TAG_PREFIX "capability:%s", cap);
 				err = add_tag(c, id, tag);
 				if (!err && cj_bool(d, cj_get(d, i, "reentrant"))) {
@@ -2759,7 +2832,8 @@ static void destroy_context(struct context *c)
 			free_value(f->blocks[j].ret);
 			free(f->blocks[j].sites);
 		}
-		free(f->blocks); free(f->incoming); free(f->visited_sites); free(f->clobbers); free(f->snapshots);
+		free(f->blocks); free(f->incoming); free(f->visited_sites);
+		free(f->memory_clobbers.v); free(f->spin_clobbers.v); free(f->snapshots);
 	}
 	while (d) {
 		struct document *next = d->next;
@@ -2797,6 +2871,7 @@ static void destroy_context(struct context *c)
 		free(c->tokens[i].capability);
 	}
 	free(c->tokens); free(c->reentrant);
+	free(c->spin_capabilities);
 	free(c->functions); free(c->names); free(c->elf_names); free(c->btf_names); free(c->capabilities);
 }
 
@@ -2897,6 +2972,8 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 	c.btf_names = resize(NULL, btf__type_cnt(btf), sizeof(*c.btf_names));
 	c.capabilities = resize(NULL, btf__type_cnt(btf) + 5 * c.nr_tokens, sizeof(*c.capabilities));
 	memset(c.capabilities, 0, (btf__type_cnt(btf) + 5 * c.nr_tokens) * sizeof(*c.capabilities));
+	c.spin_capabilities = resize(NULL, btf__type_cnt(btf) + 5 * c.nr_tokens, sizeof(*c.spin_capabilities));
+	memset(c.spin_capabilities, 0, (btf__type_cnt(btf) + 5 * c.nr_tokens) * sizeof(*c.spin_capabilities));
 	c.reentrant = resize(NULL, btf__type_cnt(btf) + 5 * c.nr_tokens, sizeof(*c.reentrant));
 	memset(c.reentrant, 0, (btf__type_cnt(btf) + 5 * c.nr_tokens) * sizeof(*c.reentrant));
 	for (i = 1; i < btf__type_cnt(btf); ++i) {
@@ -2921,7 +2998,8 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 			f->native_proto = t->type;
 	}
 
-	derive_clobbers(&c);
+	derive_clobbers(&c, false);
+	derive_clobbers(&c, true);
 	for (i = 0; i < c.nr_functions; ++i)
 		c.functions[i].dirty = c.functions[i].body_dirty = c.functions[i].entry_dirty = true;
 	for (round = 0; round < MAX_ROUNDS; ++round) {
