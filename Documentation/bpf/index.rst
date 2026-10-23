@@ -16,6 +16,7 @@ that goes into great technical depth about the BPF Architecture.
    libbpf/index
    standardization/index
    btf
+   context-analysis
    faq
    syscall_api
    helpers

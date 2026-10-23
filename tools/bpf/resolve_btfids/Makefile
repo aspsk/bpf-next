@@ -2,6 +2,8 @@
 include ../../scripts/Makefile.include
 include ../../scripts/Makefile.arch
 
+HOSTCFLAGS ?= -O2
+
 srctree := $(abspath $(CURDIR)/../../../)
 
 ifeq ($(V),1)
@@ -79,7 +81,7 @@ HOSTCFLAGS_resolve_btfids += -g \
 
 LIBS = $(LIBELF_LIBS) $(ZLIB_LIBS)
 
-export srctree OUTPUT HOSTCFLAGS_resolve_btfids Q HOSTCC HOSTLD HOSTAR
+export srctree OUTPUT HOSTCFLAGS HOSTCFLAGS_resolve_btfids Q HOSTCC HOSTLD HOSTAR
 include $(srctree)/tools/build/Makefile.include
 
 $(BINARY_IN): fixdep FORCE prepare | $(OUTPUT)

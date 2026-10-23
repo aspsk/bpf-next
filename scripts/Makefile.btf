@@ -32,6 +32,7 @@ export PAHOLE_FLAGS := $(pahole-flags-y)
 export BTF_INLINE := $(btf-inline)
 
 resolve-btfids-flags-y :=
+resolve-btfids-flags-$(CONFIG_CLANG_PLUGIN_BPF_CONTEXT_IR) += --context_analysis
 resolve-btfids-flags-$(CONFIG_WERROR) += --fatal_warnings
 resolve-btfids-flags-$(if $(KBUILD_EXTMOD),y) += --distill_base
 resolve-btfids-flags-$(if $(KBUILD_VERBOSE),y) += --verbose
