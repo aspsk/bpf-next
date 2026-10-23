@@ -157,14 +157,31 @@ Build-time identity and incompleteness
 
 The IR transport is versioned NUL-delimited JSON, one document per compilation
 unit, with ``format``, ``version``, ``unit``, ``types``, ``tokens`` and
-``functions``. Version 2 adds the symbolic-token declarations; the resolver
-rejects older transport versions rather than mixing identities.
+``functions``. Version 2 adds symbolic-token declarations. IR transport
+version 3 adds write events (address and byte width) and memory-effect
+coverage. Version 2 remains readable without the new preservation proofs.
 Function and call numbers are document local. Direct global calls resolve to
 the selected strong/weak linked symbol. Local calls first resolve within their
 compilation unit. Function records retain contracts, argument substitutions,
 CFG edges, call-result tests and returns. Optimization survivors are marked
 separately; deleted inline bodies may still describe calls made by surviving
 functions. Unmatched clones are incomplete, not matched by name prefixes.
+
+Ownership preservation is independent of complete acquisition/exit summaries.
+A monotone fixed point collects possible invalidating writes and ownership
+releases, including through loops and recursion. Trusted contracts describe
+ownership changes across primitive calls. Opaque calls, bodies without context
+coverage, unrepresentable effects and analysis-budget exhaustion prevent a
+preservation proof. Writes to fresh local stack storage cannot clobber a
+caller's valid lock.
+
+At each call or write, retain ownership only when its lock storage is provably
+disjoint from all possible invalidations. Byte ranges rooted in the same
+pointer can be separated using native BTF capability sizes. Different pointer
+arguments may alias and are not assumed disjoint. Raw stores conservatively
+invalidate symbolic contexts, whose implementation storage is not described
+by a physical lock path. Preserving an incoming lock does not certify a
+complete summary of locks acquired internally.
 
 Build diagnostics retain reasons for missing proofs. No ``unknown`` fact is
 loaded into the kernel. Without a closed caller set, no derived entry ownership
