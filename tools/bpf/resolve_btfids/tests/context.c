@@ -192,3 +192,27 @@ int recursive_case(struct test_object *obj, int count)
 	test_unlock(&obj->lock);
 	return ret;
 }
+
+struct test_object global_a, global_b;
+extern struct test_object global_alias __attribute__((alias("global_a")));
+
+static NOINLINE int after_global(void) { return global_a.counter; }
+static NOINLINE int after_global_alias(void) { return global_a.counter; }
+
+int global_case(void)
+{
+	int ret;
+
+	test_lock(&global_a.lock);
+	global_b.counter++;
+	ret = after_global();
+	test_unlock(&global_a.lock);
+	return ret;
+}
+
+int global_alias_case(void)
+{
+	test_lock(&global_a.lock);
+	global_alias.lock.state = 0;
+	return after_global_alias();
+}
