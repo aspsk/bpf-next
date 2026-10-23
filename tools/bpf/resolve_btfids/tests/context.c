@@ -241,3 +241,12 @@ int pending_corruption_case(struct test_object *obj)
 	obj->lock.state = 0;
 	return locked ? after_pending_corruption(obj) : 0;
 }
+
+static NOINLINE int after_unknown_release(struct test_object *obj) { return obj->counter; }
+
+int unknown_release_case(struct test_object *obj, struct test_object *other, int choose)
+{
+	test_lock(&obj->lock);
+	test_unlock(choose ? &obj->lock : &other->lock);
+	return after_unknown_release(obj);
+}
