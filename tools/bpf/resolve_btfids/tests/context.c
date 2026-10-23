@@ -250,3 +250,65 @@ int unknown_release_case(struct test_object *obj, struct test_object *other, int
 	test_unlock(choose ? &obj->lock : &other->lock);
 	return after_unknown_release(obj);
 }
+
+struct __attribute__((capability("outer"))) nested_lock {
+	int owner;
+	struct test_lock inner;
+	volatile int counter;
+};
+
+void take_outer(struct nested_lock *lock) ACQUIRE(lock);
+void drop_outer(struct nested_lock *lock) RELEASE(lock);
+static NOINLINE int after_inner_release(struct nested_lock *obj) { return obj->counter; }
+static NOINLINE int after_inner_write(struct nested_lock *obj) { return obj->counter; }
+
+int nested_case(struct nested_lock *obj)
+{
+	int ret;
+
+	take_outer(obj);
+	test_lock(&obj->inner);
+	test_unlock(&obj->inner);
+	ret = after_inner_release(obj);
+	drop_outer(obj);
+	return ret;
+}
+
+int nested_write_case(struct nested_lock *obj)
+{
+	take_outer(obj);
+	obj->inner.state = 0;
+	return after_inner_write(obj);
+}
+
+int try_outer(struct nested_lock *lock) __attribute__((try_acquire_capability(1, lock)));
+static NOINLINE int after_pending_inner(struct nested_lock *obj) { return obj->counter; }
+
+int pending_nested_case(struct nested_lock *obj)
+{
+	int locked = try_outer(obj);
+	int ret = 0;
+
+	test_lock(&obj->inner);
+	test_unlock(&obj->inner);
+	if (locked) {
+		ret = after_pending_inner(obj);
+		drop_outer(obj);
+	}
+	return ret;
+}
+
+struct __attribute__((capability("wrapper"))) wrapped_lock {
+	struct test_lock inner;
+	volatile int counter;
+};
+
+void take_wrapper(struct wrapped_lock *lock) ACQUIRE(lock);
+static NOINLINE int after_alias_release(struct wrapped_lock *obj) { return obj->counter; }
+
+int alias_release_case(struct wrapped_lock *obj)
+{
+	take_wrapper(obj);
+	test_unlock(&obj->inner);
+	return after_alias_release(obj);
+}

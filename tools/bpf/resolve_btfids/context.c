@@ -1657,10 +1657,9 @@ static void process_call(struct analysis *a, struct site *site, struct state *s)
 
 			for (j = 0; j < s->nr_pending;) {
 				const struct expression *pending = s->pending[j].fact.lock;
-				struct context_token *left = context_token(a->ctx, f.lock);
-				struct context_token *right = context_token(a->ctx, pending);
 				bool alias = pending == f.lock ||
-					(f.op == RELEASE && !(left && left->valid) && !(right && right->valid));
+					(f.op == RELEASE && clobber_aliases(a->ctx, a->f, pending,
+						(struct clobber){ f.lock, 0, true }));
 
 				if (!alias) {
 					++j;
@@ -2459,6 +2458,12 @@ static bool clobber_aliases(struct context *c, struct function *f,
 		return true;
 	if (!address_base(lock, a, &x) || !address_base(effect.address, b, &y))
 		return true;
+	/* A declared release changes ownership of that instance, not every
+	 * capability whose storage contains it. Raw writes still use extents.
+	 * Equal addresses remain potentially aliased wrapper capabilities.
+	 */
+	if (effect.release && !strcmp(a, b))
+		return x == y;
 	width = effect.release ? lock_width(c, f, effect.address) : effect.width;
 	size = lock_width(c, f, lock);
 	if (strcmp(a, b)) {
