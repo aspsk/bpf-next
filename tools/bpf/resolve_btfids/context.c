@@ -1544,7 +1544,7 @@ static bool refresh_may(struct context *c, struct function *f)
 	return old_may != f->may.n;
 }
 
-static void process_call(struct analysis *a, struct site *site, struct state *s)
+static void process_call_effects(struct analysis *a, struct site *site, struct state *s)
 {
 	struct function *callee = site->callee;
 	unsigned int i;
@@ -1710,6 +1710,28 @@ static void process_call(struct analysis *a, struct site *site, struct state *s)
 		a->complete = a->exits_known = false;
 		a->f->reason = "mixed exit effects need alias and ordering proof";
 		destroy_state(s);
+	}
+}
+
+static void process_call(struct analysis *a, struct site *site, struct state *s)
+{
+	struct facts before = {};
+	const char *filter = getenv("BPF_CONTEXT_TRACE");
+	bool trace = a->ctx->verbose > 2 && (!filter || !strcmp(filter, a->f->name));
+	unsigned int i;
+
+	if (trace)
+		merge(&before, &s->held);
+	process_call_effects(a, site, s);
+	if (trace) {
+		const char *event = site->write ? "write" : site->capture ? "capture" :
+			site->callee ? site->callee->name : "unknown call or assembly";
+
+		for (i = 0; i < before.n; ++i)
+			if (!contains(&s->held, &before.v[i]))
+				fprintf(stderr, "context-analysis: ownership-lost %s: call=%u event=%s lock=%s\n",
+					a->f->name, site->id, event, before.v[i].lock->text);
+		clear(&before);
 	}
 }
 
