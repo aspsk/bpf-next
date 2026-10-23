@@ -129,3 +129,66 @@ int replacement_case(struct test_holder *holder, struct test_object *other)
 	test_unlock(&obj->lock);
 	return ret;
 }
+
+static NOINLINE int selected_a(struct test_object *obj) { return obj->counter; }
+static NOINLINE int selected_b(struct test_object *obj) { return obj->counter; }
+static NOINLINE int mixed_context(struct test_object *obj) { return obj->counter; }
+static NOINLINE int escaped_callback(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_recursive(struct test_object *obj) { return obj->counter; }
+
+void register_callback(int (*fn)(struct test_object *));
+
+int selector_case(struct test_object *obj, int choose)
+{
+	int ret;
+	int (*fn)(struct test_object *) = choose ? selected_a : selected_b;
+
+	test_lock(&obj->lock);
+	ret = fn(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
+
+int mixed_locked_case(struct test_object *obj)
+{
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = mixed_context(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
+
+int mixed_unlocked_case(struct test_object *obj)
+{
+	return mixed_context(obj);
+}
+
+int escaped_case(struct test_object *obj)
+{
+	int ret;
+
+	register_callback(escaped_callback);
+	test_lock(&obj->lock);
+	ret = escaped_callback(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
+
+static NOINLINE void recursive_update(struct test_object *obj, int count)
+{
+	obj->counter++;
+	if (count > 0)
+		recursive_update(obj, count - 1);
+}
+
+int recursive_case(struct test_object *obj, int count)
+{
+	int ret;
+
+	test_lock(&obj->lock);
+	recursive_update(obj, count);
+	ret = after_recursive(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
