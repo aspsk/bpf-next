@@ -16,4 +16,6 @@ pointers, bounded callback selectors, separate global objects and conditional
 acquisitions. Negative cases cover premature unlock, overwritten lock storage,
 opaque calls, pointer aliases, pointer reload/replacement, escaped callbacks,
 mixed caller contexts, global aliases and invalidated pending acquisitions.
+An unlock with an unrepresentable selected argument must invalidate ownership
+because it can release the lock that was held.
 The runner also checks that rejection reasons distinguish these cases.

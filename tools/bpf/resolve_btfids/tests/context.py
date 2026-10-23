@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
         print("PASS ownership preserved:", name)
     for name in ("after_unlock", "after_corruption", "after_opaque", "after_alias",
                  "after_reload", "after_replacement", "mixed_context", "escaped_callback",
-                 "after_global_alias", "after_pending_corruption"):
+                 "after_global_alias", "after_pending_corruption", "after_unknown_release"):
         if entries.get(name):
             raise AssertionError("unsafe ownership guarantee: " + name)
         print("PASS ownership withheld:", name)
