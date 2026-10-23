@@ -118,6 +118,9 @@ static const struct btf_type *context_unqualified(const struct btf *btf, __u32 *
 	return NULL;
 }
 
+static bool context_member(struct context_printer *p, struct context_location *loc,
+			   unsigned int depth, bool pointer_field);
+
 static bool context_location(struct context_printer *p, const struct btf_type *proto,
 			     const char **expr, struct context_location *loc,
 			     unsigned int depth)
@@ -195,6 +198,24 @@ static bool context_location(struct context_printer *p, const struct btf_type *p
 		*expr = end + 1;
 		return true;
 	}
+	if (!strncmp(s, "load(", 5)) {
+		const struct btf_type *t;
+		__u32 id;
+
+		*expr = s + 5;
+		if (!context_location(p, proto, expr, loc, depth + 1) || **expr != ')' ||
+		    !context_member(p, loc, depth + 1, true))
+			return false;
+		id = loc->type;
+		t = context_unqualified(p->btf, &id);
+		if (!t || !btf_is_ptr(t))
+			return false;
+		loc->type = t->type;
+		loc->offset = 0;
+		loc->pointer = true;
+		++*expr;
+		return true;
+	}
 	return false;
 }
 
@@ -202,7 +223,7 @@ static bool context_location(struct context_printer *p, const struct btf_type *p
  * one of several overlapping union members just because it has a useful type.
  */
 static bool context_member(struct context_printer *p, struct context_location *loc,
-			   unsigned int depth)
+			   unsigned int depth, bool pointer_field)
 {
 	const struct btf_type *t;
 	__u32 id = loc->type;
@@ -211,7 +232,7 @@ static bool context_member(struct context_printer *p, struct context_location *l
 
 	if (depth > 24 || loc->offset < 0 || !(t = context_unqualified(p->btf, &id)))
 		return false;
-	if (!loc->offset && p->capabilities[id])
+	if (!loc->offset && (pointer_field ? btf_is_ptr(t) : p->capabilities[id]))
 		return true;
 	if (btf_is_array(t)) {
 		const struct btf_array *a = btf_array(t);
@@ -231,7 +252,7 @@ static bool context_member(struct context_printer *p, struct context_location *l
 		loc->type = a->type;
 		loc->offset %= size;
 		loc->pointer = false;
-		return context_member(p, loc, depth + 1);
+		return context_member(p, loc, depth + 1, pointer_field);
 	}
 	if (!btf_is_composite(t))
 		return false;
@@ -261,7 +282,7 @@ static bool context_member(struct context_printer *p, struct context_location *l
 		}
 		next.type = m->type;
 		next.offset -= bits / 8;
-		if (!context_member(p, &next, depth + 1))
+		if (!context_member(p, &next, depth + 1, pointer_field))
 			return false;
 		found = next;
 	}
@@ -289,7 +310,7 @@ static void print_context_lock(struct context_printer *p, const struct btf_type 
 				return;
 			}
 		}
-	if (context_location(p, proto, &s, &loc, 0) && !*s && context_member(p, &loc, 0) &&
+	if (context_location(p, proto, &s, &loc, 0) && !*s && context_member(p, &loc, 0, false) &&
 	    (type = context_type(p, loc.type, "")))
 		printf("%s [%s]", loc.name, type);
 	else
