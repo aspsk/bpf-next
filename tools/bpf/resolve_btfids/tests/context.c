@@ -89,3 +89,43 @@ int loop_case(struct test_object *obj, int count)
 	test_unlock(&obj->lock);
 	return ret;
 }
+
+struct test_holder { struct test_object *volatile current; };
+
+static NOINLINE int after_capture(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_reload(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_replacement(struct test_object *obj) { return obj->counter; }
+
+int capture_case(struct test_holder *holder)
+{
+	struct test_object *obj = holder->current;
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = after_capture(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
+
+int reload_case(struct test_holder *holder)
+{
+	struct test_object *obj = holder->current;
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = after_reload(holder->current);
+	test_unlock(&obj->lock);
+	return ret;
+}
+
+int replacement_case(struct test_holder *holder, struct test_object *other)
+{
+	struct test_object *obj = holder->current;
+	int ret;
+
+	test_lock(&obj->lock);
+	holder->current = other;
+	ret = after_replacement(holder->current);
+	test_unlock(&obj->lock);
+	return ret;
+}
