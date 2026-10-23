@@ -30,7 +30,7 @@ enum condition { ALWAYS, ZERO, NONZERO };
 struct expression {
 	struct expression *next;
 	unsigned int hash, id, len;
-	bool has_local, has_load, has_arg, is_token;
+	bool has_local, has_load, has_arg, has_snapshot, is_token;
 	char text[];
 };
 
@@ -72,6 +72,8 @@ struct site {
 	bool write;
 	const struct expression *address;
 	unsigned int width;
+	bool capture;
+	unsigned int snapshot;
 };
 
 enum value_kind { VALUE_UNKNOWN, VALUE_INTEGER, VALUE_CALL, VALUE_TEST, VALUE_PHI };
@@ -114,6 +116,8 @@ struct function {
 	bool clobber_unknown;
 	struct clobber *clobbers;
 	unsigned int nr_clobbers;
+	const struct expression **snapshots;
+	unsigned int nr_snapshots;
 	bool dirty, body_dirty, entry_dirty, notify_callers, notify_body;
 	struct function *definition;
 	struct facts declared, effects, may, entry;
@@ -252,6 +256,7 @@ static const struct expression *intern_expression(struct context *c, const char 
 	e->has_local = strstr(s, "local(") != NULL;
 	e->has_load = strstr(s, "load(") != NULL;
 	e->has_arg = strstr(s, "arg(") != NULL;
+	e->has_snapshot = strstr(s, "snapshot(") != NULL;
 	e->is_token = !strncmp(s, "token(", 6);
 	memcpy(e->text, s, len + 1);
 	slot = hash & (c->expression_slots - 1);
@@ -537,7 +542,7 @@ static bool native_expression(struct context *c, const struct expression *expr, 
 	const char *p;
 	const char *s = expr->text;
 
-	if (expr->has_local || (expr->has_load && !allow_load))
+	if (expr->has_local || expr->has_snapshot || (expr->has_load && !allow_load))
 		return false; /* Mutable indirections need memory-version identity. */
 	if (expr->is_token) {
 		struct context_token *token = context_token(c, expr);
@@ -692,6 +697,38 @@ static const struct expression *relative(struct context *c, const struct express
 		return n > 0 && n < MAX_EXPR ? intern_expression(c, out) : NULL;
 	}
 	return NULL;
+}
+
+static const struct expression *expand_snapshots(struct context *c, const struct function *f,
+					       const struct expression *input)
+{
+	char text[MAX_EXPR];
+	const char *s, *next;
+	size_t used = 0;
+
+	if (!input || !input->has_snapshot)
+		return input;
+	s = input->text;
+	while ((next = strstr(s, "snapshot("))) {
+		char *end;
+		unsigned long id = strtoul(next + 9, &end, 10);
+		const struct expression *path;
+		size_t prefix = next - s;
+
+		if (end == next + 9 || *end != ')' || id >= f->nr_snapshots ||
+		    !(path = f->snapshots[id]) || path->has_snapshot ||
+		    used + prefix + path->len >= sizeof(text))
+			return NULL;
+		memcpy(text + used, s, prefix);
+		used += prefix;
+		memcpy(text + used, path->text, path->len);
+		used += path->len;
+		s = end + 1;
+	}
+	if (used + strlen(s) >= sizeof(text))
+		return NULL;
+	strcpy(text + used, s);
+	return intern_expression(c, text);
 }
 
 static bool read_contracts(struct context *c, struct function *f, unsigned int array)
@@ -851,6 +888,20 @@ static int read_document(struct context *c, const char *data, size_t len)
 		f->raw_complete = cj_bool(d, cj_get(d, i, "complete"));
 		f->memory_covered = cj_number(d, cj_get(d, root, "version"), 0) >= 3 &&
 			cj_bool(d, cj_get(d, i, "memory_covered"));
+		{
+			unsigned int list = cj_get(d, i, "snapshots"), entry, n = 0;
+
+			f->nr_snapshots = list ? d->tokens[list].children : 0;
+			f->snapshots = resize(NULL, f->nr_snapshots, sizeof(*f->snapshots));
+			cj_each(d, list, entry) {
+				char *path = cj_string(d, entry);
+
+				if (!path)
+					return -EINVAL;
+				f->snapshots[n++] = intern_expression(c, path);
+				free(path);
+			}
+		}
 		if (!read_contracts(c, f, cj_get(d, i, "contracts")))
 			return -EINVAL;
 		f->known_contract = f->declared.n && cj_bool(d, cj_get(d, i, "contract_complete"));
@@ -890,6 +941,8 @@ static int read_document(struct context *c, const char *data, size_t len)
 				site->id = cj_number(d, cj_get(d, s, "id"), UINT_MAX);
 				site->reference = cj_number(d, cj_get(d, s, "callee"), -1);
 				site->write = cj_equal(d, cj_get(d, s, "kind"), "write");
+				site->capture = cj_equal(d, cj_get(d, s, "kind"), "capture");
+				site->snapshot = cj_number(d, cj_get(d, s, "snapshot"), UINT_MAX);
 				if (site->write) {
 					char *address = string_field(d, s, "address");
 
@@ -1103,8 +1156,8 @@ static void derive_clobbers(struct context *c)
 				struct site *s = &f->blocks[j].sites[k];
 
 				if (s->write)
-					add_clobber(f, (struct clobber){ s->address, s->width, false });
-				else if (!s->callee)
+					add_clobber(f, (struct clobber){ expand_snapshots(c, f, s->address), s->width, false });
+				else if (!s->capture && !s->callee)
 					f->clobber_unknown = true;
 			}
 	}
@@ -1120,7 +1173,7 @@ static void derive_clobbers(struct context *c)
 					struct site *s = &f->blocks[j].sites[k];
 					struct function *g = s->callee;
 
-					if (s->write)
+					if (s->write || s->capture)
 						continue;
 					if (!g || g->clobber_unknown) {
 						f->clobber_unknown = changed = true;
@@ -1130,6 +1183,7 @@ static void derive_clobbers(struct context *c)
 						struct clobber effect = g->clobbers[h];
 
 						effect.address = substitute(c, effect.address, s);
+						effect.address = expand_snapshots(c, f, effect.address);
 						changed |= add_clobber(f, effect);
 					}
 				}
@@ -1424,6 +1478,7 @@ static void propagate_may(struct context *c, struct function *caller, struct sit
 		struct fact f = callee->may.v[site->propagated_may++];
 
 		f.lock = substitute(c, f.lock, site);
+		f.lock = expand_snapshots(c, caller, f.lock);
 		if (!f.lock)
 			site->unrepresentable_may = true;
 		else {
@@ -1465,6 +1520,32 @@ static void process_call(struct analysis *a, struct site *site, struct state *s)
 		a->f->visited_sites[a->f->nr_visited_sites++] = site;
 	} else {
 		intersect_ownership(&site->held, &s->held);
+	}
+	if (site->capture) {
+		char marker[40];
+		unsigned int p = 0;
+
+		if (site->snapshot >= a->f->nr_snapshots) {
+			destroy_state(s);
+			a->complete = a->exits_known = false;
+			return;
+		}
+		snprintf(marker, sizeof(marker), "snapshot(%u)", site->snapshot);
+		/* A loop can execute this SSA definition again with a new object. */
+		while (p < s->held.n) {
+			const struct expression *lock = s->held.v[p].lock;
+
+			if (strstr(lock->text, marker))
+				forget_ownership(s, lock);
+			else
+				++p;
+		}
+		for (p = 0; p < s->nr_pending;)
+			if (strstr(s->pending[p].fact.lock->text, marker))
+				s->pending[p] = s->pending[--s->nr_pending];
+			else
+				++p;
+		return;
 	}
 	if (site->write) {
 		a->complete = a->exits_known = false;
@@ -1518,6 +1599,9 @@ static void process_call(struct analysis *a, struct site *site, struct state *s)
 			struct fact may = f;
 
 			may.op = MAY_ACQUIRE; may.cond = ALWAYS;
+			may.lock = expand_snapshots(a->ctx, a->f, may.lock);
+			if (!may.lock)
+				a->complete = false;
 			insert(&a->f->may, may);
 		}
 		/* A path through a pointer read identifies a possible acquisition,
@@ -2280,9 +2364,13 @@ static long long lock_width(struct context *c, struct function *f, const struct 
 {
 	const struct btf_type *proto = f->native_proto ? btf__type_by_id(c->btf, f->native_proto) : NULL;
 	struct location loc;
-	const char *p = expr->text;
+	const char *p;
 	unsigned int id;
 
+	expr = expand_snapshots(c, f, expr);
+	if (!expr)
+		return 0;
+	p = expr->text;
 	if (!expression_location(c, proto, &p, &loc, 0) || *p)
 		return 0;
 	id = capability_at(c, loc.type, loc.offset, 0);
@@ -2448,6 +2536,10 @@ static bool reentrant_expression(struct context *c, struct function *f,
 
 	if (token)
 		return token->valid && token->reentrant;
+	expr = expand_snapshots(c, f, expr);
+	if (!expr)
+		return false;
+	p = expr->text;
 	proto = f->native_proto ? btf__type_by_id(c->btf, f->native_proto) : NULL;
 	if (!expression_location(c, proto, &p, &loc, 0) || *p)
 		return false;
@@ -2545,7 +2637,7 @@ static void destroy_context(struct context *c)
 			free_value(f->blocks[j].ret);
 			free(f->blocks[j].sites);
 		}
-		free(f->blocks); free(f->incoming); free(f->visited_sites); free(f->clobbers);
+		free(f->blocks); free(f->incoming); free(f->visited_sites); free(f->clobbers); free(f->snapshots);
 	}
 	while (d) {
 		struct document *next = d->next;

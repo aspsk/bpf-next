@@ -34,6 +34,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 using namespace llvm;
 namespace json = llvm::json;
@@ -272,6 +273,8 @@ class DescribeModule {
 	StringSet<> Tokens;
 	DenseMap<const Function *, std::string> PointerReturns;
 	SmallPtrSet<const Function *, 8> ActivePointerReturns;
+	DenseMap<const Value *, unsigned> Snapshots;
+	std::vector<std::string> SnapshotPaths;
 	unsigned ValueBudget = 0;
 
 	/* Summarize local, read-only getters before inlining. All returns must
@@ -301,7 +304,7 @@ class DescribeModule {
 				}
 				if (const auto *R = dyn_cast<ReturnInst>(&I)) {
 					std::string E = R->getReturnValue() && R->getReturnValue()->getType()->isPointerTy() ?
-						expression(R->getReturnValue()) : "";
+						expression(R->getReturnValue(), 0, nullptr, false) : "";
 
 					if (E.empty() || E.find("local(") != std::string::npos ||
 					    (!Result.empty() && Result != E))
@@ -313,7 +316,7 @@ class DescribeModule {
 	}
 
 	std::string expression(const Value *V, unsigned Depth = 0,
-			       const BasicBlock *Pred = nullptr)
+			       const BasicBlock *Pred = nullptr, bool Capture = true)
 	{
 		if (Depth > 24)
 			return "";
@@ -327,13 +330,15 @@ class DescribeModule {
 			APInt Offset(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
 			if (!G->accumulateConstantOffset(DL, Offset) || !Offset.isSignedIntN(64))
 				return "";
-			return add(expression(G->getPointerOperand(), Depth + 1), Offset.getSExtValue());
+			return add(expression(G->getPointerOperand(), Depth + 1, Pred, Capture), Offset.getSExtValue());
 		}
 		if (const auto *L = dyn_cast<LoadInst>(V)) {
 			if (const auto *G = dyn_cast<GlobalVariable>(L->getPointerOperand()->stripPointerCasts()))
 				if (Tokens.contains(G->getName()))
 					return "token(" + G->getName().str() + ")";
-			std::string E = expression(L->getPointerOperand(), Depth + 1);
+			if (Capture && L->getType()->isPointerTy())
+				return snapshot(L, expression(L, Depth + 1, Pred, false));
+			std::string E = expression(L->getPointerOperand(), Depth + 1, Pred, Capture);
 			return E.empty() ? "" : "load(" + E + ")";
 		}
 		if (const auto *C = dyn_cast<CallBase>(V)) {
@@ -342,6 +347,8 @@ class DescribeModule {
 
 			if (Summary.empty())
 				return "";
+			if (Capture && Summary.find("load(") != std::string::npos)
+				return snapshot(C, expression(C, Depth + 1, Pred, false));
 			while (Rest.contains("arg(")) {
 				size_t Pos = Rest.find("arg("), Close = Rest.find(')', Pos + 4);
 				unsigned Arg;
@@ -349,7 +356,7 @@ class DescribeModule {
 				if (Close == StringRef::npos ||
 				    Rest.slice(Pos + 4, Close).getAsInteger(10, Arg) || Arg >= C->arg_size())
 					return "";
-				std::string E = expression(C->getArgOperand(Arg), Depth + 1);
+				std::string E = expression(C->getArgOperand(Arg), Depth + 1, Pred, Capture);
 
 				if (E.empty())
 					return "";
@@ -363,10 +370,10 @@ class DescribeModule {
 		}
 		if (const auto *P = dyn_cast<PHINode>(V)) {
 			if (Pred)
-				return expression(P->getIncomingValueForBlock(Pred), Depth + 1);
+				return expression(P->getIncomingValueForBlock(Pred), Depth + 1, nullptr, Capture);
 			std::string E;
 			for (const Value *I : P->incoming_values()) {
-				std::string Next = expression(I, Depth + 1);
+				std::string Next = expression(I, Depth + 1, nullptr, Capture);
 				if (Next.empty() || (!E.empty() && Next != E))
 					return "";
 				E = Next;
@@ -375,8 +382,19 @@ class DescribeModule {
 		}
 		if (const auto *C = dyn_cast<Operator>(V))
 			if (C->getOpcode() == Instruction::BitCast || C->getOpcode() == Instruction::AddrSpaceCast)
-				return expression(C->getOperand(0), Depth + 1);
+				return expression(C->getOperand(0), Depth + 1, Pred, Capture);
 		return "";
+	}
+
+	std::string snapshot(const Value *V, std::string Path)
+	{
+		if (Path.empty())
+			return "";
+		auto [I, Added] = Snapshots.try_emplace(V, SnapshotPaths.size());
+
+		if (Added)
+			SnapshotPaths.push_back(std::move(Path));
+		return "snapshot(" + std::to_string(I->second) + ")";
 	}
 
 	json::Object value(const Value *V, const BasicBlock *Pred = nullptr, unsigned Depth = 0)
@@ -432,7 +450,7 @@ public:
 
 	json::Object function(Function &F, const json::Object *AST, bool Covered)
 	{
-		Calls.clear(); Blocks.clear(); Locals.clear();
+		Calls.clear(); Blocks.clear(); Locals.clear(); Snapshots.clear(); SnapshotPaths.clear();
 		bool ContractComplete = Covered;
 		json::Array Contracts = contracts(AST, ContractComplete);
 		bool Complete = Covered && !F.isDeclaration() && ContractComplete;
@@ -455,6 +473,14 @@ public:
 			for (const Instruction &I : B) {
 				const auto *C = dyn_cast<CallBase>(&I);
 				if (!C) {
+					if (const auto *L = dyn_cast<LoadInst>(&I))
+						if (L->getType()->isPointerTy()) {
+							expression(L);
+							if (Snapshots.count(L))
+								Sites.push_back(json::Object{{"id", -1}, {"callee", -1},
+									{"kind", "capture"}, {"snapshot", Snapshots.lookup(L)},
+									{"arguments", json::Array()}});
+						}
 					if (isa<StoreInst>(I) || isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) {
 						const Value *Address;
 						Type *Stored;
@@ -506,6 +532,13 @@ public:
 				Sites.push_back(json::Object{{"id", Calls.lookup(C)},
 					{"callee", Callee ? static_cast<int64_t>(Functions.lookup(Callee)) : -1},
 					{"arguments", std::move(Args)}});
+				if (C->getType()->isPointerTy()) {
+					expression(C);
+					if (Snapshots.count(C))
+						Sites.push_back(json::Object{{"id", -1}, {"callee", -1},
+							{"kind", "capture"}, {"snapshot", Snapshots.lookup(C)},
+							{"arguments", json::Array()}});
+				}
 				if (C->isInlineAsm() || isa<InvokeInst>(C) || isa<CallBrInst>(C))
 					Complete = false;
 			}
@@ -530,12 +563,16 @@ public:
 			Block["edges"] = std::move(Edges);
 			CFG.push_back(std::move(Block));
 		}
+		json::Array SnapshotRecords;
+		for (const std::string &Path : SnapshotPaths)
+			SnapshotRecords.push_back(Path);
 		return json::Object{{"id", Functions.lookup(&F)}, {"symbol", F.getName().str()},
 			{"local", F.hasLocalLinkage()}, {"weak", F.isWeakForLinker()},
 			{"defined", !F.isDeclaration()}, {"escaped", F.hasAddressTaken()},
 			{"covered", Covered}, {"complete", Complete}, {"nargs", F.arg_size()},
 			{"contract_complete", ContractComplete},
 			{"memory_covered", MemoryCovered},
+			{"snapshots", std::move(SnapshotRecords)},
 			{"contracts", std::move(Contracts)}, {"blocks", std::move(CFG)}};
 	}
 };
