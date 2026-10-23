@@ -13,19 +13,6 @@
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
 
-struct landlock_object;
-
-/**
- * struct landlock_object_underops - Operations on an underlying object
- */
-struct landlock_object_underops {
-	/**
-	 * @release: Releases the underlying object (e.g. iput() for an inode).
-	 */
-	void (*release)(struct landlock_object *const object)
-		__releases(object->lock);
-};
-
 /**
  * struct landlock_object - Security blob tied to a kernel object
  *
@@ -74,6 +61,17 @@ struct landlock_object {
 		 */
 		const struct landlock_object_underops *underops;
 	};
+};
+
+/**
+ * struct landlock_object_underops - Operations on an underlying object
+ */
+struct landlock_object_underops {
+	/**
+	 * @release: Releases the underlying object (e.g. iput() for an inode).
+	 */
+	void (*release)(struct landlock_object *const object)
+		__releases(object->lock);
 };
 
 struct landlock_object *
