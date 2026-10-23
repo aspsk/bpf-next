@@ -91,6 +91,7 @@ extern bool relaxed_maps;
 extern bool use_loader;
 extern bool wait_output;
 extern struct btf *base_btf;
+int do_btf_context_analysis(int argc, char **argv);
 extern struct hashmap *refs_table;
 extern bool sign_progs;
 extern const char *private_key_path;
