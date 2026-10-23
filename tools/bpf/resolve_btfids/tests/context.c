@@ -339,3 +339,68 @@ int foreign_snapshot_case(struct test_holder *first, struct test_holder *second)
 	acquire_from_holder(second);
 	return after_foreign_snapshot(obj);
 }
+
+static NOINLINE int after_stack_memory(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_memory_barrier(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_register_read(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_memory_corruption(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_unrecognized_asm(struct test_object *obj) { return obj->counter; }
+
+static NOINLINE void stack_memory(void)
+{
+	char storage[64];
+
+	__builtin_memset(storage, 0, sizeof(storage));
+	asm volatile("" : : "r"(storage) : "memory");
+}
+
+int stack_memory_case(struct test_object *obj)
+{
+	test_lock(&obj->lock);
+	stack_memory();
+	return after_stack_memory(obj);
+}
+
+int memory_barrier_case(struct test_object *obj)
+{
+	test_lock(&obj->lock);
+#if defined(__aarch64__)
+	asm volatile("dmb ishld" : : : "memory");
+#elif defined(__x86_64__)
+	asm volatile("lfence" : : : "memory");
+#endif
+	return after_memory_barrier(obj);
+}
+
+static NOINLINE unsigned long read_thread_register(void)
+{
+#if defined(__aarch64__)
+	unsigned long value;
+
+	asm volatile("mrs %0, sp_el0" : "=r"(value));
+	return value;
+#else
+	return 0;
+#endif
+}
+
+int register_read_case(struct test_object *obj)
+{
+	test_lock(&obj->lock);
+	obj->counter += read_thread_register();
+	return after_register_read(obj);
+}
+
+int memory_corruption_case(struct test_object *obj)
+{
+	test_lock(&obj->lock);
+	__builtin_memset(&obj->lock, 0, sizeof(obj->lock));
+	return after_memory_corruption(obj);
+}
+
+int unrecognized_asm_case(struct test_object *obj)
+{
+	test_lock(&obj->lock);
+	asm volatile("nop" : : : "memory");
+	return after_unrecognized_asm(obj);
+}

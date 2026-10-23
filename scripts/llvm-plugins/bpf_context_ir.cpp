@@ -27,6 +27,7 @@
 #endif
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
@@ -102,6 +103,35 @@ static bool localRegisterAsm(StringRef Text)
 			C == ')' || C == '<' || C == '>' || C == '|' || C == '&' ||
 			C == '^' || C == '~' || C == '+' || C == '-';
 	});
+}
+
+/* These exact instructions neither write lock storage nor call code. A
+ * compiler memory clobber orders accesses; it is not an ownership change.
+ */
+static bool preservesOwnershipAsm(const CallBase &Call)
+{
+	const auto *Asm = dyn_cast<InlineAsm>(Call.getCalledOperand());
+	if (!Asm || !isa<CallInst>(Call))
+		return false;
+	StringRef Text = StringRef(Asm->getAsmString()).trim();
+	if (Text.empty())
+		return true;
+	Triple Target(Call.getModule()->getTargetTriple());
+	if (Target.isAArch64()) {
+		if (!Call.arg_size() && Asm->getConstraintString() == "=r" &&
+		    (Text == "mrs $0, sp_el0" || Text == "mrs $0, tpidr_el1"))
+			return true;
+		if (Call.arg_empty() && Call.getType()->isVoidTy() &&
+		    Asm->getConstraintString() == "~{memory}" &&
+		    (Text == "dmb ish" || Text == "dmb ishld" || Text == "dmb ishst" ||
+		     Text == "dsb ish" || Text == "dsb ishld" || Text == "dsb ishst"))
+			return true;
+	}
+	if (Target.isX86() && Call.arg_empty() && Call.getType()->isVoidTy() &&
+	    (Text == "lfence" || Text == "sfence" || Text == "mfence") &&
+	    Asm->getConstraintString() == "~{memory},~{dirflag},~{fpsr},~{flags}")
+		return true;
+	return false;
 }
 
 /* Assembly references close only the affected functions' C caller sets.
@@ -630,13 +660,21 @@ public:
 				}
 				if (isa<DbgInfoIntrinsic>(C))
 					continue;
-				/* An empty template emits no instructions, even with a memory
-				 * clobber. It cannot acquire/release a context or call a helper.
-				 */
-				if (isa<CallInst>(C))
-					if (const auto *A = dyn_cast<InlineAsm>(C->getCalledOperand()))
-						if (StringRef(A->getAsmString()).trim().empty())
-							continue;
+				if (preservesOwnershipAsm(*C))
+					continue;
+				if (const auto *Memory = dyn_cast<MemIntrinsic>(C)) {
+					const auto *Length = dyn_cast<ConstantInt>(Memory->getLength());
+					uint64_t Width = Length && Length->getValue().getActiveBits() <= 32 ?
+						Length->getZExtValue() : 0;
+
+					if (Length && Length->isZero())
+						continue;
+					Sites.push_back(json::Object{{"id", Calls.lookup(C)}, {"callee", -1},
+						{"kind", "write"}, {"address", expression(Memory->getRawDest())},
+						{"width", Width}, {"arguments", json::Array()}});
+					Complete = false;
+					continue;
+				}
 				if (const auto *Intr = dyn_cast<IntrinsicInst>(C)) {
 					/* These intrinsics cannot acquire or release a native lock. */
 					switch (Intr->getIntrinsicID()) {
