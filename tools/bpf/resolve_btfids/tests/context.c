@@ -13,6 +13,7 @@ struct test_object {
 
 void test_lock(struct test_lock *lock) ACQUIRE(lock);
 void test_unlock(struct test_lock *lock) RELEASE(lock);
+int test_trylock(struct test_lock *lock) __attribute__((try_acquire_capability(1, lock)));
 void opaque(struct test_object *obj);
 
 static NOINLINE int after_store(struct test_object *obj) { return obj->counter; }
@@ -215,4 +216,28 @@ int global_alias_case(void)
 	test_lock(&global_a.lock);
 	global_alias.lock.state = 0;
 	return after_global_alias();
+}
+
+static NOINLINE int after_pending(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_pending_corruption(struct test_object *obj) { return obj->counter; }
+
+int pending_case(struct test_object *obj)
+{
+	int locked = test_trylock(&obj->lock);
+	int ret = 0;
+
+	update_counter(obj);
+	if (locked) {
+		ret = after_pending(obj);
+		test_unlock(&obj->lock);
+	}
+	return ret;
+}
+
+int pending_corruption_case(struct test_object *obj)
+{
+	int locked = test_trylock(&obj->lock);
+
+	obj->lock.state = 0;
+	return locked ? after_pending_corruption(obj) : 0;
 }
