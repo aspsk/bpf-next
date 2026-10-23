@@ -4,6 +4,13 @@
 #define ACQUIRE(x) __attribute__((acquire_capability(x)))
 #define RELEASE(x) __attribute__((release_capability(x)))
 
+#ifdef TEST_SPIN_CONTEXT
+#define test_lock spinlock
+#define TEST_CAPABILITY "spinlock"
+#else
+#define TEST_CAPABILITY "mutex"
+#endif
+
 #ifdef TEST_REGISTER_NUMBER_ASM
 asm(".irp num,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30\n"
     ".equ .L__gpr_num_x\\num, \\num\n"
@@ -16,7 +23,7 @@ asm(".irp num,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,2
 asm(".irp num,0\n.equ .Lunknown_\\num, \\num\n.endr\n");
 #endif
 
-struct __attribute__((capability("mutex"))) test_lock { int state; };
+struct __attribute__((capability(TEST_CAPABILITY))) test_lock { int state; };
 struct test_object {
 	struct test_lock lock;
 	volatile int counter;
