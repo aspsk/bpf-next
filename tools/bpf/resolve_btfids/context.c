@@ -48,6 +48,12 @@ struct facts {
 	bool indexed;
 };
 
+struct clobber {
+	const struct expression *address;
+	unsigned int width;
+	bool release;
+};
+
 struct substitution {
 	const struct expression *input, *result;
 };
@@ -105,6 +111,9 @@ struct function {
 	bool local, weak, defined, live, escaped, covered, raw_complete, complete;
 	bool known_contract, exit_complete;
 	bool memory_covered;
+	bool clobber_unknown;
+	struct clobber *clobbers;
+	unsigned int nr_clobbers;
 	bool dirty, body_dirty, entry_dirty, notify_callers, notify_body;
 	struct function *definition;
 	struct facts declared, effects, may, entry;
@@ -1043,6 +1052,101 @@ static void resolve_functions(struct context *c)
 	}
 }
 
+static bool add_clobber(struct function *f, struct clobber effect)
+{
+	unsigned int i;
+
+	if (f->clobber_unknown)
+		return false;
+	if (!effect.address || (!effect.release && !effect.width) ||
+	    (effect.address->has_local && effect.address->has_load)) {
+		f->clobber_unknown = true;
+		return true;
+	}
+	/* This frame's own stack storage cannot be a caller's live lock. */
+	if (effect.address->has_local)
+		return false;
+	for (i = 0; i < f->nr_clobbers; ++i)
+		if (f->clobbers[i].address == effect.address &&
+		    f->clobbers[i].width == effect.width && f->clobbers[i].release == effect.release)
+			return false;
+	if (f->nr_clobbers == 128) {
+		f->clobber_unknown = true;
+		return true;
+	}
+	f->clobbers = resize(f->clobbers, f->nr_clobbers + 1, sizeof(*f->clobbers));
+	f->clobbers[f->nr_clobbers++] = effect;
+	return true;
+}
+
+/* A may-clobber fixed point, independent of exit/acquisition completeness.
+ * Cycles are allowed: unknown effects and possible clobbers only accumulate.
+ * Trusted interface contracts describe ownership changes across the call.
+ */
+static void derive_clobbers(struct context *c)
+{
+	unsigned int i, j, k, h, round, known = 0;
+	bool changed = false;
+
+	for (i = 0; i < c->nr_functions; ++i) {
+		struct function *f = &c->functions[i];
+
+		f->clobber_unknown = !f->known_contract && (!f->defined || !f->memory_covered);
+		if (f->known_contract) {
+			for (j = 0; j < f->declared.n; ++j)
+				if (f->declared.v[j].op == RELEASE)
+					add_clobber(f, (struct clobber){ f->declared.v[j].lock, 0, true });
+			continue;
+		}
+		for (j = 0; j < f->nr_blocks; ++j)
+			for (k = 0; k < f->blocks[j].nr_sites; ++k) {
+				struct site *s = &f->blocks[j].sites[k];
+
+				if (s->write)
+					add_clobber(f, (struct clobber){ s->address, s->width, false });
+				else if (!s->callee)
+					f->clobber_unknown = true;
+			}
+	}
+	for (round = 0; round < MAX_ROUNDS; ++round) {
+		changed = false;
+		for (i = 0; i < c->nr_functions; ++i) {
+			struct function *f = &c->functions[i];
+
+			if (f->known_contract || f->clobber_unknown)
+				continue;
+			for (j = 0; j < f->nr_blocks && !f->clobber_unknown; ++j)
+				for (k = 0; k < f->blocks[j].nr_sites && !f->clobber_unknown; ++k) {
+					struct site *s = &f->blocks[j].sites[k];
+					struct function *g = s->callee;
+
+					if (s->write)
+						continue;
+					if (!g || g->clobber_unknown) {
+						f->clobber_unknown = changed = true;
+						break;
+					}
+					for (h = 0; h < g->nr_clobbers && !f->clobber_unknown; ++h) {
+						struct clobber effect = g->clobbers[h];
+
+						effect.address = substitute(c, effect.address, s);
+						changed |= add_clobber(f, effect);
+					}
+				}
+		}
+		if (!changed)
+			break;
+	}
+	for (i = 0; i < c->nr_functions; ++i) {
+		if (changed)
+			c->functions[i].clobber_unknown = true;
+		known += !c->functions[i].clobber_unknown;
+	}
+	if (c->verbose)
+		fprintf(stderr, "context-analysis: ownership preservation: %u tracked summaries, %u unknown; %u rounds\n",
+			known, c->nr_functions - known, round + 1);
+}
+
 struct pending {
 	struct fact fact;
 	unsigned int site;
@@ -1116,6 +1220,49 @@ static void forget_ownership(struct state *s, const struct expression *lock)
 		}
 }
 
+static bool clobber_aliases(struct context *c, struct function *f,
+			    const struct expression *lock, struct clobber effect);
+
+static void invalidate_clobber(struct context *c, struct function *f, struct state *s,
+			       struct clobber effect)
+{
+	unsigned int i = 0;
+
+	while (i < s->held.n) {
+		const struct expression *lock = s->held.v[i].lock;
+
+		if (clobber_aliases(c, f, lock, effect))
+			forget_ownership(s, lock);
+		else
+			++i;
+	}
+	i = 0;
+	while (i < s->nr_pending) {
+		if (clobber_aliases(c, f, s->pending[i].fact.lock, effect))
+			s->pending[i] = s->pending[--s->nr_pending];
+		else
+			++i;
+	}
+}
+
+static void preserve_call(struct context *c, struct function *f, struct state *s,
+			  struct site *site)
+{
+	unsigned int i;
+	struct function *g = site->callee;
+
+	if (!g || g->clobber_unknown) {
+		destroy_state(s);
+		return;
+	}
+	for (i = 0; i < g->nr_clobbers; ++i) {
+		struct clobber effect = g->clobbers[i];
+
+		effect.address = substitute(c, effect.address, site);
+		invalidate_clobber(c, f, s, effect);
+	}
+}
+
 static void initialize_ownership(struct state *s)
 {
 	unsigned int i;
@@ -1168,7 +1315,8 @@ static void apply_effect(struct context *c, struct function *f, struct state *s,
 			const struct expression *lock = s->held.v[i].lock;
 			struct context_token *other = context_token(c, lock);
 
-			if (lock == effect.lock || (other && other->valid)) {
+			if (lock == effect.lock || (other && other->valid) ||
+			    !clobber_aliases(c, f, lock, (struct clobber){ effect.lock, 0, true })) {
 				++i;
 				continue;
 			}
@@ -1318,13 +1466,20 @@ static void process_call(struct analysis *a, struct site *site, struct state *s)
 	} else {
 		intersect_ownership(&site->held, &s->held);
 	}
+	if (site->write) {
+		a->complete = a->exits_known = false;
+		a->f->reason = "raw write prevents complete exit effects";
+		invalidate_clobber(a->ctx, a->f, s,
+			(struct clobber){ site->address, site->width, false });
+		return;
+	}
 	if (!callee || !callee->complete) {
 		a->complete = false;
 		a->f->reason = !callee ? "unresolved/indirect call" : "incomplete callee";
 	}
 	if (!callee || !callee->exit_complete) {
 		a->exits_known = false;
-		destroy_state(s);
+		preserve_call(a->ctx, a->f, s, site);
 	}
 	if (!callee)
 		return;
@@ -2092,6 +2247,79 @@ static bool typed_expression(struct context *c, const struct btf_type *proto,
 		!*p && capability_at(c, loc.type, loc.offset, 0);
 }
 
+static bool address_base(const struct expression *expr, char *base, long long *offset)
+{
+	char text[MAX_EXPR];
+	char *s = text;
+
+	if (!expr)
+		return false;
+	strcpy(text, expr->text);
+	*offset = 0;
+	while (!strncmp(s, "add(", 4)) {
+		char *comma = strrchr(s, ','), *end;
+		long long n;
+
+		if (!comma)
+			return false;
+		errno = 0;
+		n = strtoll(comma + 1, &end, 10);
+		if (errno || end == comma + 1 || strcmp(end, ")") ||
+		    (n > 0 && *offset > LLONG_MAX - n) ||
+		    (n < 0 && *offset < LLONG_MIN - n))
+			return false;
+		*offset += n;
+		*comma = 0;
+		s += 4;
+	}
+	strcpy(base, s);
+	return true;
+}
+
+static long long lock_width(struct context *c, struct function *f, const struct expression *expr)
+{
+	const struct btf_type *proto = f->native_proto ? btf__type_by_id(c->btf, f->native_proto) : NULL;
+	struct location loc;
+	const char *p = expr->text;
+	unsigned int id;
+
+	if (!expression_location(c, proto, &p, &loc, 0) || *p)
+		return 0;
+	id = capability_at(c, loc.type, loc.offset, 0);
+	return id ? btf__resolve_size(c->btf, id) : 0;
+}
+
+static bool clobber_aliases(struct context *c, struct function *f,
+			    const struct expression *lock, struct clobber effect)
+{
+	struct context_token *left, *right;
+	char a[MAX_EXPR], b[MAX_EXPR];
+	long long x, y, size, width;
+
+	if (!effect.address)
+		return true;
+	left = context_token(c, lock);
+	right = context_token(c, effect.address);
+	if (effect.release && ((left && left->valid) || (right && right->valid)))
+		return lock == effect.address;
+	/* Raw stores may implement a symbolic context's low-level transition. */
+	if (left || right)
+		return true;
+	if (!address_base(lock, a, &x) || !address_base(effect.address, b, &y))
+		return true;
+	if (strcmp(a, b)) {
+		/* Distinct pointer arguments may alias; fresh stack objects cannot. */
+		return strncmp(a, "local(", 6) && strncmp(b, "local(", 6);
+	}
+	width = effect.release ? lock_width(c, f, effect.address) : effect.width;
+	size = lock_width(c, f, lock);
+	if (width > 0 && y <= LLONG_MAX - width && y + width <= x)
+		return false;
+	if (size > 0 && x <= LLONG_MAX - size && x + size <= y)
+		return false;
+	return true;
+}
+
 static int emit_types(struct context *c)
 {
 	struct document *doc;
@@ -2317,7 +2545,7 @@ static void destroy_context(struct context *c)
 			free_value(f->blocks[j].ret);
 			free(f->blocks[j].sites);
 		}
-		free(f->blocks); free(f->incoming); free(f->visited_sites);
+		free(f->blocks); free(f->incoming); free(f->visited_sites); free(f->clobbers);
 	}
 	while (d) {
 		struct document *next = d->next;
@@ -2443,6 +2671,7 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 			f->native_proto = t->type;
 	}
 
+	derive_clobbers(&c);
 	for (i = 0; i < c.nr_functions; ++i)
 		c.functions[i].dirty = c.functions[i].body_dirty = c.functions[i].entry_dirty = true;
 	for (round = 0; round < MAX_ROUNDS; ++round) {
