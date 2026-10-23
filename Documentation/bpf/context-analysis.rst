@@ -232,3 +232,9 @@ conservative translation-unit escape fallback. The fixed ARM64 sysreg
 register-number macros are recognized as local non-call templates for escape
 analysis; their executed body effects remain opaque. These restrictions reduce
 coverage without converting missing evidence into a no-lock assertion.
+
+Recursive possible-acquisition propagation is bounded to 128 facts per
+function, including at most eight pointer-derived paths, and a link-wide
+budget of 262144 derived expressions. Budget exhaustion withholds complete
+summaries; retained positive facts are not an exhaustive acquisition list.
+The runtime-tag deduplication index grows with the number of emitted tags.
