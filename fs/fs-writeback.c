@@ -335,7 +335,7 @@ static void inode_cgwb_move_to_attached(struct inode *inode,
 static struct bdi_writeback *
 locked_inode_to_wb_and_lock_list(struct inode *inode)
 	__releases(&inode->i_lock)
-	__acquires(&wb->list_lock)
+	__acquires(&inode_to_wb(inode)->list_lock)
 {
 	while (true) {
 		struct bdi_writeback *wb = inode_to_wb(inode);
@@ -371,7 +371,7 @@ locked_inode_to_wb_and_lock_list(struct inode *inode)
  * on entry.
  */
 static struct bdi_writeback *inode_to_wb_and_lock_list(struct inode *inode)
-	__acquires(&wb->list_lock)
+	__acquires(&inode_to_wb(inode)->list_lock)
 {
 	spin_lock(&inode->i_lock);
 	return locked_inode_to_wb_and_lock_list(inode);
