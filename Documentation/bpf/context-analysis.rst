@@ -196,6 +196,14 @@ loaded into the kernel. Without a closed caller set, no derived entry ownership
 is emitted. In particular, externally callable functions cannot acquire an
 entry guarantee merely because their observed C callers hold a lock.
 
+The analysis copy expands indirect calls whose complete target set is a
+bounded selection or PHI of function constants with matching prototypes.
+All alternatives contribute callers and effects. Comparisons of function
+addresses alone do not open the caller set; passing, storing or returning an
+address still does. Unknown function pointers and escaped callbacks remain
+incomplete. This does not resolve mutable operations tables or external entry
+paths, and does not establish closure for exported global functions.
+
 The compiler follows simple local pointer getters whose bodies do not write
 memory or call opaque functions and whose returns describe the same pointer
 path. This preserves paths such as ``d_inode(dentry)`` before inlining.

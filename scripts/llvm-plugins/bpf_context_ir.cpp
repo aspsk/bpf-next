@@ -15,6 +15,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
@@ -27,6 +28,7 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 
@@ -148,6 +150,109 @@ struct AssemblyReferences {
 			llvm::any_of(F.users(), [](const User *U) { return isa<BlockAddress>(U); });
 	}
 };
+
+static bool callTargets(const Value *V, SmallPtrSetImpl<const Value *> &Active,
+			SmallVectorImpl<Function *> &Targets, unsigned Depth = 0)
+{
+	V = V->stripPointerCasts();
+	if (const auto *F = dyn_cast<Function>(V)) {
+		if (!llvm::is_contained(Targets, F))
+			Targets.push_back(const_cast<Function *>(F));
+		return Targets.size() <= 8;
+	}
+	if (Depth > 24 || !Active.insert(V).second)
+		return false;
+	scope_exit Erase([&] { Active.erase(V); });
+	if (const auto *S = dyn_cast<SelectInst>(V))
+		return callTargets(S->getTrueValue(), Active, Targets, Depth + 1) &&
+			callTargets(S->getFalseValue(), Active, Targets, Depth + 1);
+	if (const auto *P = dyn_cast<PHINode>(V)) {
+		for (const Value *I : P->incoming_values())
+			if (!callTargets(I, Active, Targets, Depth + 1))
+				return false;
+		return true;
+	}
+	return false;
+}
+
+/* Expand a fully bounded selector in the analysis copy only. The executable
+ * module, target addresses and native function identities are unchanged.
+ */
+static void resolveCallSelectors(Module &M)
+{
+	SmallVector<CallInst *, 16> Calls;
+
+	for (Function &F : M)
+		for (BasicBlock &B : F)
+			for (Instruction &I : B)
+				if (auto *C = dyn_cast<CallInst>(&I))
+					if (!C->getCalledFunction() && !C->isInlineAsm() && !C->isMustTailCall())
+						Calls.push_back(C);
+	for (CallInst *C : Calls) {
+		SmallPtrSet<const Value *, 16> Active;
+		SmallVector<Function *, 4> Targets;
+		Value *Operand = C->getCalledOperand();
+
+		if (!callTargets(Operand, Active, Targets) || Targets.empty() ||
+		    llvm::any_of(Targets, [&](Function *F) { return F->getFunctionType() != C->getFunctionType(); }))
+			continue;
+		BasicBlock *Check = C->getParent();
+		Function *Caller = Check->getParent();
+		BasicBlock *Tail = Check->splitBasicBlock(C, "context.call.join");
+		PHINode *Result = C->getType()->isVoidTy() ? nullptr :
+			PHINode::Create(C->getType(), Targets.size(), "context.call.result", C->getIterator());
+
+		Check->getTerminator()->eraseFromParent();
+		for (unsigned I = 0; I < Targets.size(); ++I) {
+			BasicBlock *Body = BasicBlock::Create(M.getContext(), "context.call.target", Caller, Tail);
+			auto *Direct = cast<CallInst>(C->clone());
+
+			Direct->setCalledFunction(Targets[I]);
+			Direct->setTailCallKind(CallInst::TCK_None);
+			IRBuilder<> BodyBuilder(Body);
+			BodyBuilder.Insert(Direct);
+			BodyBuilder.CreateBr(Tail);
+			if (Result)
+				Result->addIncoming(Direct, Body);
+			IRBuilder<> Branch(Check);
+			if (I + 1 == Targets.size()) {
+				Branch.CreateBr(Body);
+			} else {
+				BasicBlock *Next = BasicBlock::Create(M.getContext(), "context.call.check", Caller, Tail);
+
+				Branch.CreateCondBr(Branch.CreateICmpEQ(Operand, Targets[I]), Body, Next);
+				Check = Next;
+			}
+		}
+		if (Result)
+			C->replaceAllUsesWith(Result);
+		C->eraseFromParent();
+		if (auto *I = dyn_cast<Instruction>(Operand))
+			RecursivelyDeleteTriviallyDeadInstructions(I);
+	}
+}
+
+static bool addressEscapes(const Function &F, const Value *V, SmallPtrSetImpl<const Value *> &Seen)
+{
+	if (!Seen.insert(V).second)
+		return false;
+	for (const User *U : V->users()) {
+		if (const auto *C = dyn_cast<CallBase>(U)) {
+			if (C->getCalledFunction() != &F ||
+			    llvm::any_of(C->args(), [&](const Use &A) { return A.get() == V; }))
+				return true;
+		} else if (isa<SelectInst>(U) || isa<PHINode>(U) || isa<ConstantExpr>(U)) {
+			if (const auto *E = dyn_cast<ConstantExpr>(U))
+				if (!E->isCast())
+					return true;
+			if (addressEscapes(F, U, Seen))
+				return true;
+		} else if (!isa<ICmpInst>(U)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 /* AST lvalues denote addresses; parameter roots denote incoming pointer values. */
 static std::string astExpr(const json::Object &O, unsigned Depth = 0, bool Address = false)
@@ -450,6 +555,7 @@ public:
 
 	json::Object function(Function &F, const json::Object *AST, bool Covered)
 	{
+		SmallPtrSet<const Value *, 16> AddressUses;
 		Calls.clear(); Blocks.clear(); Locals.clear(); Snapshots.clear(); SnapshotPaths.clear();
 		bool ContractComplete = Covered;
 		json::Array Contracts = contracts(AST, ContractComplete);
@@ -568,7 +674,7 @@ public:
 			SnapshotRecords.push_back(Path);
 		return json::Object{{"id", Functions.lookup(&F)}, {"symbol", F.getName().str()},
 			{"local", F.hasLocalLinkage()}, {"weak", F.isWeakForLinker()},
-			{"defined", !F.isDeclaration()}, {"escaped", F.hasAddressTaken()},
+			{"defined", !F.isDeclaration()}, {"escaped", addressEscapes(F, &F, AddressUses)},
 			{"covered", Covered}, {"complete", Complete}, {"nargs", F.arg_size()},
 			{"contract_complete", ContractComplete},
 			{"memory_covered", MemoryCovered},
@@ -624,6 +730,7 @@ public:
 			if (!Allocas.empty())
 				PromoteMemToReg(Allocas, DT);
 		}
+		resolveCallSelectors(*Copy);
 		DescribeModule Describe(*Copy, AST.getArray("tokens"));
 		json::Array Functions;
 		AssemblyReferences Assembly(*Copy);
