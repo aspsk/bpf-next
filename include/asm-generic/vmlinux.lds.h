@@ -894,7 +894,9 @@
 /* The candidate section resets the VMA, so place it after .modinfo. */
 #define MODINFO								\
 		.modinfo : { *(.modinfo) . = ALIGN(8); }	\
-		.BTF_fmodret_candidates 0 (INFO) : { KEEP(*(.BTF_fmodret_candidates)) }
+		.BTF_fmodret_candidates 0 (INFO) : { KEEP(*(.BTF_fmodret_candidates)) } \
+		.bpf_scan.lock 0 (INFO) : { KEEP(*(.bpf_scan.lock)) } \
+		.bpf_context 0 (INFO) : { KEEP(*(.bpf_context)) }
 
 #ifdef CONFIG_GENERIC_BUG
 #define BUG_TABLE							\

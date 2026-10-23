@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Run bpf_scan_ir on optimized LLVM IR.
+# Collect BPF metadata from the Clang AST and optimized LLVM IR.
 
 llvm-plugin-$(CONFIG_CLANG_PLUGIN_BPF_SCAN_IR) += bpf_scan_ir.so
+llvm-plugin-$(CONFIG_CLANG_PLUGIN_BPF_CONTEXT_IR) += bpf_context_ir.so
+clang-plugin-$(CONFIG_CLANG_PLUGIN_BPF_SCAN_AST) += bpf_scan_ast.so
 
-LLVM_PLUGIN := $(llvm-plugin-y)
-LLVM_PLUGINS_CFLAGS := $(strip $(addprefix -fpass-plugin=$(objtree)/scripts/llvm-plugins/, $(LLVM_PLUGIN))) -DLLVM_PLUGINS
+LLVM_PLUGIN := $(llvm-plugin-y) $(clang-plugin-y)
+LLVM_PLUGINS_CFLAGS := $(strip \
+	$(addprefix -fpass-plugin=$(objtree)/scripts/llvm-plugins/, $(llvm-plugin-y)) \
+	$(addprefix -fplugin=$(objtree)/scripts/llvm-plugins/, $(clang-plugin-y))) -DLLVM_PLUGINS
 export LLVM_PLUGIN LLVM_PLUGINS_CFLAGS
 
 KBUILD_CFLAGS += $(LLVM_PLUGINS_CFLAGS)
