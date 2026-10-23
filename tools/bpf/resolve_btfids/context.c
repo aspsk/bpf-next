@@ -2680,6 +2680,9 @@ static int emit_functions(struct context *c)
 				if ((err = emit_fact(c, id, f->entry.v[j], "derived")))
 					return err;
 				++c->entries;
+			} else if (c->verbose) {
+				fprintf(stderr, "context-analysis: entry-rejected %s: native capability path unavailable: %s\n",
+					f->name, f->entry.v[j].lock->text);
 			}
 			t = btf__type_by_id(c->btf, id);
 			proto = btf__type_by_id(c->btf, t->type);
@@ -2765,6 +2768,7 @@ static void destroy_context(struct context *c)
 static void report_entries(struct context *c)
 {
 	unsigned int i, j, closed = 0, escaped = 0, live = 0, with_held_call = 0, proven = 0;
+	unsigned int external = 0, limited = 0, incomplete = 0;
 
 	if (!c->verbose)
 		return;
@@ -2772,15 +2776,30 @@ static void report_entries(struct context *c)
 		struct function *f = &c->functions[i];
 		unsigned int held_calls = 0;
 
-		if (!f->defined || !f->local)
+		const char *reason = NULL;
+
+		if (!f->defined)
 			continue;
+		limited += f->may_budget;
+		incomplete += f->may_incomplete;
+		if (!f->local) {
+			++external;
+			if (c->verbose > 1 && f->live)
+				fprintf(stderr, "context-analysis: entry-rejected %s: external caller set is not closed\n", f->name);
+			continue;
+		}
 		if (f->escaped) {
 			++escaped;
+			if (c->verbose > 1 && f->live)
+				fprintf(stderr, "context-analysis: entry-rejected %s: address or assembly escape\n", f->name);
 			continue;
 		}
 		++closed;
-		if (!f->live || !f->native_proto)
+		if (!f->live || !f->native_proto) {
+			if (c->verbose > 1 && (f->live || f->entry.n))
+				fprintf(stderr, "context-analysis: entry-rejected %s: no surviving unambiguous native prototype\n", f->name);
 			continue;
+		}
 		++live;
 		for (j = 0; j < f->nr_incoming; ++j)
 			held_calls += f->incoming[j]->visited && f->incoming[j]->held.n;
@@ -2789,10 +2808,28 @@ static void report_entries(struct context *c)
 		if (held_calls)
 			fprintf(stderr, "context-analysis: entry candidate %s: %u/%u call sites carry ownership, %u common facts\n",
 				f->name, held_calls, f->nr_incoming, f->entry.n);
+		if (!f->entry.n) {
+			reason = !f->nr_incoming ? "no observed callers" :
+				!held_calls ? "no caller retains proven ownership" :
+				held_calls < f->nr_incoming ? "some callers have no proven ownership" :
+				"no common lock expressible in the callee context";
+			if (c->verbose > 1) {
+				fprintf(stderr, "context-analysis: entry-rejected %s: %s\n", f->name, reason);
+				if (held_calls)
+					for (j = 0; j < f->nr_incoming; ++j) {
+						struct site *s = f->incoming[j];
+
+						fprintf(stderr, "context-analysis: entry-input %s: caller=%s call=%u visited=%s held=%u\n",
+							f->name, s->caller->name, s->id, s->visited ? "yes" : "no", s->held.n);
+					}
+			}
+		}
 	}
 	fprintf(stderr, "context-analysis: entry analysis: %u escaped locals, %u closed locals, "
 		"%u native closed locals, %u with an owned call site, %u with common entry ownership\n",
 		escaped, closed, live, with_held_call, proven);
+	fprintf(stderr, "context-analysis: entry exclusions: %u external definitions; %u definitions reached acquisition budgets, %u definitions affected by those budgets\n",
+		external, limited, incomplete);
 }
 
 static double elapsed_seconds(const struct timespec *start)
