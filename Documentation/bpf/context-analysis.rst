@@ -171,10 +171,25 @@ loaded into the kernel. Without a closed caller set, no derived entry ownership
 is emitted. In particular, externally callable functions cannot acquire an
 entry guarantee merely because their observed C callers hold a lock.
 
-The initial solver does not certify mutable ``load`` expressions or propagate
-callee-local stack identities across calls. Their declared source trees remain
-in build data. Any fact that cannot resolve to a native capability type is
-omitted and prevents a complete runtime summary. Assembly references make the
+The compiler follows simple local pointer getters whose bodies do not write
+memory or call opaque functions and whose returns describe the same pointer
+path. This preserves paths such as ``d_inode(dentry)`` before inlining.
+
+``may_acquire`` facts can contain typed ``load`` expressions. For example,
+``add(load(add(arg(0),48)),152)`` describes a lock reached by reading a pointer
+field at offset 48, then taking the member at offset 152 in the pointed-to
+object. BTF validates both the pointer field and the final capability type;
+bpftool prints the corresponding member path. The offsets depend on the build.
+Each load denotes a value read during the invocation, not a promise that a
+later read yields the same object. Such facts identify possible acquisitions;
+they do not establish held ownership, prove disjointness from another loaded
+path, or certify a complete summary. Stable memory-version identities are
+still required for those proofs.
+
+The solver does not certify mutable ``load`` expressions in exit or entry
+ownership facts, or propagate callee-local stack identities across calls.
+Any fact that cannot resolve to a native capability type is omitted and
+prevents a complete runtime summary. Assembly references make the
 referenced functions' caller sets incomplete;
 block addresses and function addresses passed to assembly also escape. Empty
 inline-assembly templates, including compiler memory barriers, preserve lock

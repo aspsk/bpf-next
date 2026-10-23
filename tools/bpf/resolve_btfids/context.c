@@ -519,12 +519,12 @@ static bool unique_symbol(struct context *c, const char *name)
 	return end == start + 1;
 }
 
-static bool native_expression(struct context *c, const struct expression *expr)
+static bool native_expression(struct context *c, const struct expression *expr, bool allow_load)
 {
 	const char *p;
 	const char *s = expr->text;
 
-	if (expr->has_local || expr->has_load)
+	if (expr->has_local || (expr->has_load && !allow_load))
 		return false; /* Mutable indirections need memory-version identity. */
 	if (expr->is_token) {
 		struct context_token *token = context_token(c, expr);
@@ -595,7 +595,7 @@ static const struct expression *substitute(struct context *c,
 	unsigned int pos;
 	const struct expression *result;
 
-	if (input->has_local || input->has_load)
+	if (input->has_local)
 		return NULL;
 	if (!input->has_arg)
 		return input;
@@ -1350,6 +1350,15 @@ static void process_call(struct analysis *a, struct site *site, struct state *s)
 			may.op = MAY_ACQUIRE; may.cond = ALWAYS;
 			insert(&a->f->may, may);
 		}
+		/* A path through a pointer read identifies a possible acquisition,
+		 * not a stable ownership identity across this call or later reads.
+		 */
+		if (expr->has_load && f.op != MAY_ACQUIRE) {
+			a->complete = a->exits_known = false;
+			a->f->reason = "pointer-derived lock needs a stable ownership identity";
+			destroy_state(s);
+			continue;
+		}
 		if (f.op == ACQUIRE || f.op == RELEASE) {
 			unsigned int j;
 
@@ -1861,7 +1870,7 @@ static int emit_fact(struct context *c, unsigned int type, struct fact f, const 
 	static const char * const conds[] = { "always", "ret_eq(0)", "ret_ne(0)" };
 	char tag[MAX_EXPR + 128];
 
-	if (!native_expression(c, f.lock))
+	if (!native_expression(c, f.lock, f.op == MAY_ACQUIRE))
 		return 0;
 	snprintf(tag, sizeof(tag), BPF_CONTEXT_TAG_PREFIX "%s:%s:%s:%s:%s",
 		 source, ops[f.op], modes[f.mode], f.lock->text, conds[f.cond]);
@@ -1944,6 +1953,43 @@ static unsigned int capability_at(struct context *c, unsigned int id, long long 
 
 struct location { unsigned int type; long long offset; };
 
+/* Find the pointer stored at this address, rejecting overlapping members. */
+static unsigned int pointer_at(struct context *c, unsigned int id, long long offset,
+			       unsigned int depth)
+{
+	const struct btf_type *t;
+	unsigned int i, found = 0, matches = 0;
+
+	if (depth > 24 || offset < 0 || !(id = unqualified(c, id)))
+		return 0;
+	t = btf__type_by_id(c->btf, id);
+	if (!offset && btf_is_ptr(t))
+		return id;
+	if (btf_is_array(t)) {
+		const struct btf_array *a = btf_array(t);
+		long long size = btf__resolve_size(c->btf, a->type);
+
+		return size > 0 && offset / size < a->nelems ?
+			pointer_at(c, a->type, offset % size, depth + 1) : 0;
+	}
+	if (!btf_is_composite(t))
+		return 0;
+	for (i = 0; i < btf_vlen(t); ++i) {
+		const struct btf_member *m = &btf_members(t)[i];
+		long long bits = btf_member_bit_offset(t, i), size;
+
+		if (bits % 8 || btf_member_bitfield_size(t, i))
+			continue;
+		size = btf__resolve_size(c->btf, m->type);
+		if (size <= 0 || offset < bits / 8 || offset - bits / 8 >= size)
+			continue;
+		if (++matches > 1)
+			return 0;
+		found = pointer_at(c, m->type, offset - bits / 8, depth + 1);
+	}
+	return found;
+}
+
 static bool expression_location(struct context *c, const struct btf_type *proto,
 				const char **expr, struct location *loc, unsigned int depth)
 {
@@ -2001,11 +2047,25 @@ static bool expression_location(struct context *c, const struct btf_type *proto,
 		*expr = end + 1;
 		return true;
 	}
+	if (!strncmp(s, "load(", 5)) {
+		unsigned int id;
+
+		*expr = s + 5;
+		if (!expression_location(c, proto, expr, loc, depth + 1) || **expr != ')')
+			return false;
+		id = pointer_at(c, loc->type, loc->offset, 0);
+		if (!id)
+			return false;
+		loc->type = btf__type_by_id(c->btf, id)->type;
+		loc->offset = 0;
+		++*expr;
+		return true;
+	}
 	return false;
 }
 
 static bool typed_expression(struct context *c, const struct btf_type *proto,
-			     const struct expression *expr)
+			     const struct expression *expr, bool allow_load)
 {
 	struct location loc;
 	const char *p = expr->text;
@@ -2013,7 +2073,7 @@ static bool typed_expression(struct context *c, const struct btf_type *proto,
 
 	if (token)
 		return token->valid && token->type;
-	return native_expression(c, expr) && expression_location(c, proto, &p, &loc, 0) &&
+	return native_expression(c, expr, allow_load) && expression_location(c, proto, &p, &loc, 0) &&
 		!*p && capability_at(c, loc.type, loc.offset, 0);
 }
 
@@ -2161,7 +2221,7 @@ static int emit_functions(struct context *c)
 		struct function *f = &c->functions[i];
 		unsigned int id;
 		const struct btf_type *t, *proto;
-		bool representable = true;
+		bool representable = true, stable = true;
 
 		if (!f->defined || !f->live || f->definition != f)
 			continue;
@@ -2178,7 +2238,7 @@ static int emit_functions(struct context *c)
 		++c->matched;
 		for (j = 0; j < f->effects.n; ++j) {
 			bool declared = contains(&f->declared, &f->effects.v[j]);
-			if (typed_expression(c, proto, f->effects.v[j].lock)) {
+			if (typed_expression(c, proto, f->effects.v[j].lock, false)) {
 				if ((err = emit_fact(c, id, f->effects.v[j], declared ? "declared" : "derived")))
 					return err;
 			} else representable = false;
@@ -2187,15 +2247,17 @@ static int emit_functions(struct context *c)
 			proto = btf__type_by_id(c->btf, t->type);
 		}
 		for (j = 0; j < f->may.n; ++j) {
-			if (typed_expression(c, proto, f->may.v[j].lock)) {
+			if (typed_expression(c, proto, f->may.v[j].lock, true)) {
 				if ((err = emit_fact(c, id, f->may.v[j], "derived")))
 					return err;
 			} else representable = false;
+			if (f->may.v[j].lock->has_load)
+				stable = false;
 			t = btf__type_by_id(c->btf, id);
 			proto = btf__type_by_id(c->btf, t->type);
 		}
 		for (j = 0; j < f->entry.n; ++j) {
-			if (typed_expression(c, proto, f->entry.v[j].lock)) {
+			if (typed_expression(c, proto, f->entry.v[j].lock, false)) {
 				if ((err = emit_fact(c, id, f->entry.v[j], "derived")))
 					return err;
 				++c->entries;
@@ -2203,7 +2265,7 @@ static int emit_functions(struct context *c)
 			t = btf__type_by_id(c->btf, id);
 			proto = btf__type_by_id(c->btf, t->type);
 		}
-		if (f->complete && representable) {
+		if (f->complete && representable && stable) {
 			++c->complete;
 			if ((err = add_tag(c, id, BPF_CONTEXT_TAG_PREFIX "derived:lock_summary_complete")))
 				return err;
@@ -2212,6 +2274,7 @@ static int emit_functions(struct context *c)
 			if (c->verbose)
 				fprintf(stderr, "context-analysis: %s: incomplete: %s\n", f->name,
 					!representable ? "lock identity cannot be represented in native BTF" :
+					!stable ? "pointer-derived lock needs a stable ownership identity" :
 					f->reason ?: "unresolved transitive effects");
 		}
 	}
