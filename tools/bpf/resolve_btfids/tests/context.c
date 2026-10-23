@@ -411,3 +411,53 @@ int unrecognized_asm_case(struct test_object *obj)
 	asm volatile("nop" : : : "memory");
 	return after_unrecognized_asm(obj);
 }
+
+NOINLINE int global_locked(struct test_object *obj) { return obj->counter; }
+NOINLINE int global_mixed(struct test_object *obj) { return obj->counter; }
+NOINLINE int global_unknown_caller(struct test_object *obj) { return obj->counter; }
+NOINLINE int global_data_escape(struct test_object *obj) { return obj->counter; }
+
+int global_locked_case(struct test_object *obj)
+{
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = global_locked(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
+
+int global_mixed_locked_case(struct test_object *obj)
+{
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = global_mixed(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
+
+int global_mixed_unlocked_case(struct test_object *obj)
+{
+	return global_mixed(obj);
+}
+
+int global_unknown_case(struct test_object *obj)
+{
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = global_unknown_caller(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
+
+int global_escape_case(struct test_object *obj)
+{
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = global_data_escape(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}

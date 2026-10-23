@@ -119,6 +119,7 @@ struct function {
 	char *name;
 	unsigned int id, nargs, nr_blocks, nr_sites, native_proto;
 	bool local, weak, defined, live, escaped, covered, raw_complete, complete;
+	bool entry_closed;
 	bool known_contract, exit_complete;
 	bool memory_covered;
 	bool may_incomplete, may_budget;
@@ -154,6 +155,11 @@ struct emitted_tag {
 	struct emitted_tag *next;
 };
 
+struct entry_reference {
+	char *target, *caller;
+	bool call;
+};
+
 struct context_token {
 	const struct expression *expr;
 	char *name, *capability;
@@ -166,6 +172,10 @@ struct context {
 	unsigned int nr_functions;
 	struct document *documents;
 	struct name_id *names, *btf_names, *elf_names;
+	struct entry_reference *entry_references;
+	unsigned int nr_entry_references, entry_reference_capacity;
+	bool native_calls_covered, native_reference_contract;
+	bool kernel_image;
 	unsigned int nr_btf_names, nr_elf_names;
 	struct btf *btf;
 	bool *capabilities, *spin_capabilities, *reentrant;
@@ -982,6 +992,140 @@ static int read_document(struct context *c, const char *data, size_t len)
 	return retain_types(d, root);
 }
 
+static int compare_addresses(const void *a, const void *b)
+{
+	const struct name_id *x = a, *y = b;
+
+	if (x->section != y->section)
+		return x->section < y->section ? -1 : 1;
+	return x->address < y->address ? -1 : x->address != y->address;
+}
+
+static const struct name_id *address_function(struct name_id *v, unsigned int n,
+					     unsigned int section, unsigned long long address)
+{
+	unsigned int lo = 0, hi = n;
+
+	while (lo < hi) {
+		unsigned int m = lo + (hi - lo) / 2;
+
+		if (v[m].section < section || (v[m].section == section && v[m].address <= address))
+			lo = m + 1;
+		else
+			hi = m;
+	}
+	if (!lo || v[lo - 1].section != section || address - v[lo - 1].address >= v[lo - 1].size)
+		return NULL;
+	return &v[lo - 1];
+}
+
+/* Retained allocated relocations expose direct callers and address uses,
+ * including references from assembler objects which have no IR document.
+ */
+static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
+{
+	struct name_id *functions = resize(NULL, c->nr_elf_names, sizeof(*functions));
+	unsigned int i, n = 0;
+	GElf_Ehdr ehdr;
+	Elf_Scn *scn = NULL;
+
+	if (!gelf_getehdr(elf, &ehdr)) {
+		free(functions);
+		return -EINVAL;
+	}
+	if ((ehdr.e_type != ET_EXEC && !(ehdr.e_type == ET_DYN && c->kernel_image)) ||
+	    (ehdr.e_machine != EM_AARCH64 && ehdr.e_machine != EM_X86_64)) {
+		free(functions);
+		return 0;
+	}
+	for (i = 0; i < c->nr_elf_names; ++i)
+		if ((c->elf_names[i].id & 255) == STT_FUNC)
+			functions[n++] = c->elf_names[i];
+	qsort(functions, n, sizeof(*functions), compare_addresses);
+	while ((scn = elf_nextscn(elf, scn))) {
+		GElf_Shdr sh, owner_sh, symbols_sh;
+		Elf_Data *relocs, *symbols, *bytes;
+		const char *section;
+
+		if (!gelf_getshdr(scn, &sh) || sh.sh_type != SHT_RELA || !sh.sh_entsize)
+			continue;
+		if (!gelf_getshdr(elf_getscn(elf, sh.sh_info), &owner_sh) ||
+		    !(owner_sh.sh_flags & SHF_ALLOC))
+			continue;
+		section = elf_strptr(elf, strings, owner_sh.sh_name);
+		if (!section || !strcmp(section, "__patchable_function_entries") ||
+		    !strcmp(section, "__mcount_loc") || !strcmp(section, ".eh_frame") ||
+		    !strcmp(section, ".eh_frame_hdr") || !strncmp(section, ".orc_unwind", 11))
+			continue;
+		if ((owner_sh.sh_flags & SHF_EXECINSTR) && c->native_reference_contract)
+			c->native_calls_covered = true;
+		if (!gelf_getshdr(elf_getscn(elf, sh.sh_link), &symbols_sh))
+			continue;
+		relocs = elf_getdata(scn, NULL);
+		symbols = elf_getdata(elf_getscn(elf, sh.sh_link), NULL);
+		bytes = elf_getdata(elf_getscn(elf, sh.sh_info), NULL);
+		for (i = 0; i < sh.sh_size / sh.sh_entsize; ++i) {
+			GElf_Rela rel;
+			GElf_Sym sym;
+			const struct name_id *owner, *target;
+			const char *name;
+			unsigned int type;
+			unsigned long long offset;
+			bool call = false;
+
+			if (!gelf_getrela(relocs, i, &rel) ||
+			    !gelf_getsym(symbols, GELF_R_SYM(rel.r_info), &sym))
+				continue;
+			type = GELF_R_TYPE(rel.r_info);
+			offset = rel.r_offset - owner_sh.sh_addr;
+			if (owner_sh.sh_flags & SHF_EXECINSTR) {
+				if (ehdr.e_machine == EM_AARCH64)
+					call = type == R_AARCH64_CALL26 || type == R_AARCH64_JUMP26;
+				else if ((type == R_X86_64_PLT32 || type == R_X86_64_PC32) &&
+					 bytes && offset && offset < bytes->d_size) {
+					const unsigned char *data = bytes->d_buf;
+					unsigned char opcode = data[offset - 1];
+
+					call = opcode == 0xe8 || opcode == 0xe9;
+				}
+			}
+			if (GELF_ST_TYPE(sym.st_info) == STT_FUNC) {
+				name = elf_strptr(elf, symbols_sh.sh_link, sym.st_name);
+			} else if (GELF_ST_TYPE(sym.st_info) == STT_SECTION) {
+				unsigned long long address = sym.st_value + rel.r_addend;
+
+				if (ehdr.e_machine == EM_X86_64 && call)
+					address += 4;
+				target = address_function(functions, n, sym.st_shndx, address);
+				if (!target || target->address != address)
+					continue;
+				name = target->name;
+			} else {
+				continue;
+			}
+			if (!name || !*name)
+				continue;
+			owner = call ? address_function(functions, n, sh.sh_info,
+						       rel.r_offset) : NULL;
+			if (c->nr_entry_references == c->entry_reference_capacity) {
+				if (c->entry_reference_capacity > UINT_MAX / 2) {
+					free(functions);
+					return -E2BIG;
+				}
+				c->entry_reference_capacity = c->entry_reference_capacity ?
+					c->entry_reference_capacity * 2 : 1024;
+				c->entry_references = resize(c->entry_references,
+							     c->entry_reference_capacity,
+							     sizeof(*c->entry_references));
+			}
+			c->entry_references[c->nr_entry_references++] = (struct entry_reference){
+				copy_string(name), copy_string(owner ? owner->name : ""), call };
+		}
+	}
+	free(functions);
+	return 0;
+}
+
 static int collect_elf(struct context *c, const char *path)
 {
 	Elf_Scn *scn = NULL;
@@ -1032,6 +1176,12 @@ static int collect_elf(struct context *c, const char *path)
 				unsigned int kind;
 
 				if (!gelf_getsym(data, i, &sym)) { err = -EINVAL; break; }
+				name = elf_strptr(elf, sh.sh_link, sym.st_name);
+				if (name && !strcmp(name, "_stext") && sym.st_shndx != SHN_UNDEF)
+					c->kernel_image = true;
+				if (name && !strcmp(name, "__bpf_context_native_calls") &&
+				    sym.st_shndx == SHN_ABS && sym.st_value == 1)
+					c->native_reference_contract = true;
 				kind = GELF_ST_TYPE(sym.st_info);
 				if (sym.st_shndx == SHN_UNDEF || (kind != STT_FUNC && kind != STT_OBJECT))
 					continue;
@@ -1047,6 +1197,8 @@ static int collect_elf(struct context *c, const char *path)
 		if (err)
 			break;
 	}
+	if (!err)
+		err = collect_entry_references(c, elf, strings);
 out:
 	elf_end(elf);
 	close(fd);
@@ -1097,6 +1249,7 @@ static void resolve_functions(struct context *c)
 			merge(&f->definition->declared, &f->declared);
 			f->definition->known_contract |= f->known_contract;
 			f->definition->exit_complete |= f->known_contract;
+			f->definition->escaped |= f->escaped;
 		}
 		merge(&f->effects, &f->declared);
 		for (j = 0; j < f->nr_blocks; ++j)
@@ -1120,6 +1273,57 @@ static void resolve_functions(struct context *c)
 					}
 				}
 			}
+	}
+}
+
+static int compare_entry_references(const void *a, const void *b)
+{
+	const struct entry_reference *x = a, *y = b;
+	int order = strcmp(x->target, y->target);
+
+	if (order)
+		return order;
+	order = strcmp(x->caller, y->caller);
+	return order ?: (int)x->call - (int)y->call;
+}
+
+static void close_entry_callers(struct context *c)
+{
+	unsigned int i;
+
+	for (i = 0; i < c->nr_functions; ++i) {
+		struct function *f = &c->functions[i];
+
+		f->entry_closed = f->defined && !f->escaped &&
+			(f->local || c->native_calls_covered);
+	}
+	qsort(c->entry_references, c->nr_entry_references,
+	      sizeof(*c->entry_references), compare_entry_references);
+	for (i = 0; i < c->nr_entry_references;) {
+		struct entry_reference *ref = &c->entry_references[i];
+		unsigned int end, start = name_range(c->names, c->nr_functions, ref->target, &end);
+		unsigned int next = i + 1, j;
+
+		while (next < c->nr_entry_references &&
+		       !compare_entry_references(ref, &c->entry_references[next]))
+			++next;
+		for (j = start; j < end; ++j) {
+			struct function *f = &c->functions[c->names[j].id];
+			unsigned int h, calls = 0;
+
+			if (f->local || !f->entry_closed)
+				continue;
+			for (h = 0; h < f->nr_incoming; ++h) {
+				struct function *caller = f->incoming[h]->caller;
+
+				calls += caller->live && caller->definition == caller &&
+					unique_symbol(c, caller->name) &&
+					!strcmp(ref->caller, caller->name);
+			}
+			if (!ref->call || !*ref->caller || calls < next - i)
+				f->entry_closed = false;
+		}
+		i = next;
 	}
 }
 
@@ -2128,7 +2332,7 @@ static bool analyze_function(struct context *c, struct function *f)
 		struct site *site = previous[i].site;
 		struct function *callee = site->callee;
 
-		if (callee && callee->local && !callee->escaped && callee->defined &&
+		if (callee && callee->entry_closed &&
 		    (site->visited != previous[i].visited ||
 		     !equal_order(&site->held, &previous[i].held)))
 			callee->entry_dirty = true;
@@ -2189,7 +2393,7 @@ static bool derive_entries(struct context *c)
 		bool seen = false;
 
 		/* C-only caller sets cannot close external/assembly entry paths. */
-		if (!f->entry_dirty || !f->local || f->escaped || !f->defined)
+		if (!f->entry_dirty || !f->entry_closed)
 			continue;
 		f->entry_dirty = false;
 		for (j = 0; j < f->nr_incoming; ++j) {
@@ -2873,6 +3077,11 @@ static void destroy_context(struct context *c)
 	free(c->tokens); free(c->reentrant);
 	free(c->spin_capabilities);
 	free(c->functions); free(c->names); free(c->elf_names); free(c->btf_names); free(c->capabilities);
+	for (i = 0; i < c->nr_entry_references; ++i) {
+		free(c->entry_references[i].target);
+		free(c->entry_references[i].caller);
+	}
+	free(c->entry_references);
 }
 
 static void report_entries(struct context *c)
@@ -2892,7 +3101,7 @@ static void report_entries(struct context *c)
 			continue;
 		limited += f->may_budget;
 		incomplete += f->may_incomplete;
-		if (!f->local) {
+		if (!f->local && !f->entry_closed) {
 			++external;
 			if (c->verbose > 1 && f->live)
 				fprintf(stderr, "context-analysis: entry-rejected %s: external caller set is not closed\n", f->name);
@@ -2935,8 +3144,8 @@ static void report_entries(struct context *c)
 			}
 		}
 	}
-	fprintf(stderr, "context-analysis: entry analysis: %u escaped locals, %u closed locals, "
-		"%u native closed locals, %u with an owned call site, %u with common entry ownership\n",
+	fprintf(stderr, "context-analysis: entry analysis: %u escaped locals, %u closed functions, "
+		"%u native closed functions, %u with an owned call site, %u with common entry ownership\n",
 		escaped, closed, live, with_held_call, proven);
 	fprintf(stderr, "context-analysis: entry exclusions: %u external definitions; %u definitions reached acquisition budgets, %u definitions affected by those budgets\n",
 		external, limited, incomplete);
@@ -2967,6 +3176,7 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 		goto out;
 	c.deriving = true;
 	resolve_functions(&c);
+	close_entry_callers(&c);
 	if (verbose)
 		fprintf(stderr, "context-analysis: resolved calls at %.3fs\n", elapsed_seconds(&start));
 	c.btf_names = resize(NULL, btf__type_cnt(btf), sizeof(*c.btf_names));

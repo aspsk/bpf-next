@@ -10,6 +10,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[4]
 clang = os.environ.get("CLANG", "clang-23")
+ld = os.environ.get("LD", "ld")
 tool = root / "tools/bpf/bpftool/bpftool"
 resolver = root / "tools/bpf/resolve_btfids/resolve_btfids"
 
@@ -24,9 +25,24 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
         "-c", str(Path(__file__).with_suffix(".c")), "-o", str(obj),
     ], check=True)
     subprocess.run(["pahole", "-J", "--btf_features=var,global_var,decl_tag,type_tag", str(obj)], check=True)
+    linked = bool(os.environ.get("CONTEXT_TEST_LINKED"))
+    no_relocations = bool(os.environ.get("CONTEXT_TEST_NO_RELOCS"))
+    no_coverage = bool(os.environ.get("CONTEXT_TEST_NO_COVERAGE"))
+    if linked:
+        assembly = Path(tmp) / "entry.o"
+        subprocess.run([clang, *shlex.split(os.environ.get("CONTEXT_TEST_CFLAGS", "")),
+                        "-c", str(Path(__file__).with_name("context-entry.S")),
+                        "-o", str(assembly)], check=True)
+        image = Path(tmp) / "context-linked"
+        subprocess.run([ld, *([] if no_relocations else ["--emit-relocs"]),
+                        *([] if no_coverage else ["--defsym=__bpf_context_native_calls=1"]),
+                        "--unresolved-symbols=ignore-all", "-e", "global_locked_case",
+                        str(obj), str(assembly), "-o", str(image)], check=True)
+        obj = image
     result = subprocess.run([str(resolver), "--context_analysis", "--verbose", "--verbose", str(obj)],
-                            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end="")
+    result.check_returncode()
     reasons = ("entry-rejected mixed_context: some callers have no proven ownership",
                    "entry-rejected escaped_callback: address or assembly escape",
                    "entry-rejected after_reload: no common lock expressible in the callee context")
@@ -45,6 +61,16 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
             raise AssertionError("unknown symbol-generating assembly closed caller sets")
         print("PASS unknown assembly retains open caller sets")
         raise SystemExit(0)
+    if linked and not no_relocations and not no_coverage:
+        if not any(f["lock"] == "arg(0)" for f in entries.get("global_locked", [])):
+            raise AssertionError("missing closed global entry proof")
+        print("PASS closed global caller coverage")
+    elif entries.get("global_locked"):
+        raise AssertionError("global caller coverage certified without native relocations")
+    for name in ("global_mixed", "global_unknown_caller", "global_data_escape"):
+        if entries.get(name):
+            raise AssertionError("unsafe global entry guarantee: " + name)
+        print("PASS global ownership withheld:", name)
     for name in ("after_store", "after_work", "after_loop", "after_capture",
                  "selected_a", "selected_b", "after_recursive", "after_pending",
                  "after_inner_release", "after_pending_inner", "after_stack_memory",
