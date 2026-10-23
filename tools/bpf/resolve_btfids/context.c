@@ -188,6 +188,7 @@ struct context {
 	bool deriving, expression_limited;
 	unsigned long long substitution_hits, substitution_misses;
 	unsigned long long analyses, ownership_visits;
+	const char *trace_filter;
 	int verbose;
 	unsigned int tags, matched, complete, incomplete, entries;
 };
@@ -1977,7 +1978,7 @@ static void process_call_effects(struct analysis *a, struct site *site, struct s
 static void process_call(struct analysis *a, struct site *site, struct state *s)
 {
 	struct facts before = {};
-	const char *filter = getenv("BPF_CONTEXT_TRACE");
+	const char *filter = a->ctx->trace_filter;
 	bool trace = a->ctx->verbose > 2 && (!filter || !strcmp(filter, a->f->name));
 	unsigned int i;
 
@@ -3161,7 +3162,10 @@ static double elapsed_seconds(const struct timespec *start)
 
 int context_btf_generate(const char *path, struct btf *btf, int verbose)
 {
-	struct context c = { .btf = btf, .verbose = verbose };
+	struct context c = {
+		.btf = btf, .verbose = verbose,
+		.trace_filter = getenv("BPF_CONTEXT_TRACE"),
+	};
 	unsigned int i, round;
 	bool changed = false;
 	struct timespec start;
