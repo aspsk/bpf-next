@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
         "-fpass-plugin=" + str(root / "scripts/llvm-plugins/bpf_context_ir.so"),
         "-c", str(Path(__file__).with_suffix(".c")), "-o", str(obj),
     ], check=True)
-    subprocess.run(["pahole", "-J", str(obj)], check=True)
+    subprocess.run(["pahole", "-J", "--btf_features=var,global_var,decl_tag,type_tag", str(obj)], check=True)
     subprocess.run([str(resolver), "--context_analysis", "--verbose", str(obj)], check=True)
     data = json.loads(subprocess.check_output([
         str(tool), "-j", "btf", "context-analysis", "file", str(obj) + ".BTF"
@@ -35,7 +35,11 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
             raise AssertionError("missing valid ownership: " + name)
         print("PASS ownership preserved:", name)
     for name in ("after_unlock", "after_corruption", "after_opaque", "after_alias",
-                 "after_reload", "after_replacement", "mixed_context", "escaped_callback"):
+                 "after_reload", "after_replacement", "mixed_context", "escaped_callback",
+                 "after_global_alias"):
         if entries.get(name):
             raise AssertionError("unsafe ownership guarantee: " + name)
         print("PASS ownership withheld:", name)
+    if not any(f["lock"] == "global(global_a)" for f in entries.get("after_global", [])):
+        raise AssertionError("missing ownership across a disjoint global write")
+    print("PASS ownership preserved: after_global")

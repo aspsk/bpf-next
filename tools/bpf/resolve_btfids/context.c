@@ -139,6 +139,8 @@ struct document {
 struct name_id {
 	const char *name;
 	unsigned int id;
+	unsigned long long address, size;
+	unsigned int section;
 };
 
 struct emitted_tag {
@@ -1033,7 +1035,8 @@ static int collect_elf(struct context *c, const char *path)
 					continue;
 				c->elf_names = resize(c->elf_names, c->nr_elf_names + 1, sizeof(*c->elf_names));
 				c->elf_names[c->nr_elf_names++] = (struct name_id){ copy_string(name),
-					kind | GELF_ST_BIND(sym.st_info) << 8 };
+					kind | GELF_ST_BIND(sym.st_info) << 8,
+					sym.st_value, sym.st_size, sym.st_shndx };
 			}
 		}
 		if (err)
@@ -2453,12 +2456,35 @@ static bool clobber_aliases(struct context *c, struct function *f,
 		return true;
 	if (!address_base(lock, a, &x) || !address_base(effect.address, b, &y))
 		return true;
+	width = effect.release ? lock_width(c, f, effect.address) : effect.width;
+	size = lock_width(c, f, lock);
 	if (strcmp(a, b)) {
+		if (!strncmp(a, "global(", 7) && !strncmp(b, "global(", 7) &&
+		    x >= 0 && y >= 0 && size > 0 && width > 0) {
+			unsigned int ae, be, ai, bi;
+			struct name_id *left, *right;
+			size_t alen = strlen(a), blen = strlen(b);
+
+			if (alen < 9 || blen < 9 || a[alen - 1] != ')' || b[blen - 1] != ')')
+				return true;
+			a[alen - 1] = b[blen - 1] = 0;
+			ai = name_range(c->elf_names, c->nr_elf_names, a + 7, &ae);
+			bi = name_range(c->elf_names, c->nr_elf_names, b + 7, &be);
+			if (ae != ai + 1 || be != bi + 1)
+				return true;
+			left = &c->elf_names[ai]; right = &c->elf_names[bi];
+			if ((left->id & 255) != STT_OBJECT || (right->id & 255) != STT_OBJECT ||
+			    left->section != right->section ||
+			    (unsigned long long)x > left->size || (unsigned long long)size > left->size - x ||
+			    (unsigned long long)y > right->size || (unsigned long long)width > right->size - y ||
+			    left->address > ULLONG_MAX - left->size || right->address > ULLONG_MAX - right->size)
+				return true;
+			return !(left->address + left->size <= right->address ||
+				 right->address + right->size <= left->address);
+		}
 		/* Distinct pointer arguments may alias; fresh stack objects cannot. */
 		return strncmp(a, "local(", 6) && strncmp(b, "local(", 6);
 	}
-	width = effect.release ? lock_width(c, f, effect.address) : effect.width;
-	size = lock_width(c, f, lock);
 	if (width > 0 && y <= LLONG_MAX - width && y + width <= x)
 		return false;
 	if (size > 0 && x <= LLONG_MAX - size && x + size <= y)

@@ -186,8 +186,11 @@ caller's valid lock.
 At each call or write, retain ownership only when its lock storage is provably
 disjoint from all possible invalidations. Byte ranges rooted in the same
 pointer can be separated using native BTF capability sizes. Different pointer
-arguments may alias and are not assumed disjoint. Raw stores conservatively
-invalidate symbolic contexts, whose implementation storage is not described
+arguments may alias and are not assumed disjoint. Linked ELF object ranges
+separate distinct globals only when both
+accesses stay within their objects and the section/range identities prove
+non-overlap. Symbol aliases and ambiguous names remain potentially aliasing.
+Raw stores conservatively invalidate symbolic contexts, whose implementation storage is not described
 by a physical lock path. Preserving an incoming lock does not certify a
 complete summary of locks acquired internally.
 
