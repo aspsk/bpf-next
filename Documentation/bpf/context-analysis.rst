@@ -184,7 +184,12 @@ preservation proof. Writes to fresh local stack storage cannot clobber a
 caller's valid lock.
 
 At each call or write, retain ownership only when its lock storage is provably
-disjoint from all possible invalidations. Byte ranges rooted in the same
+unaffected by all possible invalidations. Declared releases refer to lock
+instance addresses. Distinct offsets from the same pointer identify distinct
+instances, including an inner lock within an outer capability; equal addresses
+remain potentially aliased wrapper instances. Raw writes affect byte ranges,
+so a write inside an outer lock's storage still invalidates it without a
+trusted contract. Byte ranges rooted in the same
 pointer can be separated using native BTF capability sizes. Different pointer
 arguments may alias and are not assumed disjoint. Linked ELF object ranges
 separate distinct globals only when both accesses stay within their objects

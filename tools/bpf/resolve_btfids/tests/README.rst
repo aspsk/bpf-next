@@ -19,3 +19,6 @@ mixed caller contexts, global aliases and invalidated pending acquisitions.
 An unlock with an unrepresentable selected argument must invalidate ownership
 because it can release the lock that was held.
 The runner also checks that rejection reasons distinguish these cases.
+Nested-lock cases distinguish declared releases of an inner instance from
+raw writes inside the outer capability's storage. Releases at an aliased
+address must still invalidate ownership.
