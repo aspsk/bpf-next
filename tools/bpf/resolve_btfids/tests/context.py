@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 
@@ -16,6 +17,7 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
     obj = Path(tmp) / "context.o"
     subprocess.run([
         clang, "-O2", "-g", "-DWARN_CONTEXT_ANALYSIS",
+        *shlex.split(os.environ.get("CONTEXT_TEST_CFLAGS", "")),
         "-fexperimental-late-parse-attributes",
         "-fplugin=" + str(root / "scripts/llvm-plugins/bpf_scan_ast.so"),
         "-fpass-plugin=" + str(root / "scripts/llvm-plugins/bpf_context_ir.so"),
@@ -25,9 +27,12 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
     result = subprocess.run([str(resolver), "--context_analysis", "--verbose", "--verbose", str(obj)],
                             check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end="")
-    for reason in ("entry-rejected mixed_context: some callers have no proven ownership",
+    reasons = ("entry-rejected mixed_context: some callers have no proven ownership",
                    "entry-rejected escaped_callback: address or assembly escape",
-                   "entry-rejected after_reload: no common lock expressible in the callee context"):
+                   "entry-rejected after_reload: no common lock expressible in the callee context")
+    if "TEST_UNKNOWN_REPEAT_ASM" in os.environ.get("CONTEXT_TEST_CFLAGS", ""):
+        reasons = ("entry-rejected after_store: address or assembly escape",)
+    for reason in reasons:
         if reason not in result.stdout:
             raise AssertionError("missing diagnostic: " + reason)
     data = json.loads(subprocess.check_output([
@@ -35,6 +40,11 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
     ], text=True))
     entries = {x["name"]: [f for f in x["facts"] if f.get("fact") == "entry_held"]
                for x in data}
+    if "TEST_UNKNOWN_REPEAT_ASM" in os.environ.get("CONTEXT_TEST_CFLAGS", ""):
+        if any(entries.values()):
+            raise AssertionError("unknown symbol-generating assembly closed caller sets")
+        print("PASS unknown assembly retains open caller sets")
+        raise SystemExit(0)
     for name in ("after_store", "after_work", "after_loop", "after_capture",
                  "selected_a", "selected_b", "after_recursive", "after_pending",
                  "after_inner_release", "after_pending_inner"):
