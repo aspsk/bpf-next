@@ -886,7 +886,9 @@
 		KLP_SYMID
 
 #define MODINFO								\
-		.modinfo (INFO) : { KEEP(*(.modinfo)) }
+		.modinfo (INFO) : { KEEP(*(.modinfo)) } \
+		.bpf_scan.lock 0 (INFO) : { KEEP(*(.bpf_scan.lock)) } \
+		.bpf_context 0 (INFO) : { KEEP(*(.bpf_context)) }
 
 #ifdef CONFIG_GENERIC_BUG
 #define BUG_TABLE							\

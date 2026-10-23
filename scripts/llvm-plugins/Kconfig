@@ -12,4 +12,35 @@ menuconfig LLVM_PLUGINS
 
 if LLVM_PLUGINS
 
+config CLANG_PLUGIN_BPF_SCAN_AST
+	bool "Collect locking annotations from the Clang AST for BPF"
+	depends on WARN_CONTEXT_ANALYSIS
+	default y
+	help
+	  Run bpf_scan_ast before code generation to preserve locking annotations
+	  in the .bpf_scan.lock metadata section. Requires matching Clang and LLVM
+	  development headers. The plugin is loaded with -fplugin.
+
+	  Record lock contracts, symbolic lock expressions, capability types,
+	  guarded declarations and annotated source calls. Keep these facts in
+	  LLVM IR even if the original inline helper is subsequently removed.
+	  Collect annotations only in files selected for compiler context analysis.
+	  Mark other files as having annotations disabled. Tree-wide collection
+	  requires WARN_CONTEXT_ANALYSIS_ALL. Do not infer balanced locking or
+	  change which functions BPF programs may call or attach to.
+
+config CLANG_PLUGIN_BPF_CONTEXT_IR
+	bool "Derive BPF context analysis facts from LLVM IR"
+	depends on CLANG_PLUGIN_BPF_SCAN_AST
+	depends on DEBUG_INFO_BTF
+	depends on !LTO_CLANG
+	default y
+	help
+	  Import AST locking contracts before inlining and preserve executable
+	  calls and control flow for context analysis. The separate bpf_context_ir
+	  plugin exports build-only summaries for resolve_btfids to turn into
+	  native BTF declaration tags. No verifier behavior is changed.
+	  This initial transport supports non-LTO compilation. LTO needs explicit
+	  clone and merged-document handling before it can certify summaries.
+
 endif
