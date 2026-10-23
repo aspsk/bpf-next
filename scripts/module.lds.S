@@ -23,6 +23,8 @@ SECTIONS {
 
 	.BTF_fmodret_ids	0 : ALIGN(8) { KEEP(*(.BTF_fmodret_ids)) }
 	.BTF_fmodret_candidates 0 (INFO) : { KEEP(*(.BTF_fmodret_candidates)) }
+	.bpf_scan.lock		0 (INFO) : { KEEP(*(.bpf_scan.lock)) }
+	.bpf_context		0 (INFO) : { KEEP(*(.bpf_context)) }
 
 	.altinstructions	0 : ALIGN(8) { KEEP(*(.altinstructions)) }
 	__bug_table		0 : ALIGN(8) { KEEP(*(__bug_table)) }
