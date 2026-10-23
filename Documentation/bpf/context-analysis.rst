@@ -187,15 +187,20 @@ At each call or write, retain ownership only when its lock storage is provably
 disjoint from all possible invalidations. Byte ranges rooted in the same
 pointer can be separated using native BTF capability sizes. Different pointer
 arguments may alias and are not assumed disjoint. Linked ELF object ranges
-separate distinct globals only when both
-accesses stay within their objects and the section/range identities prove
-non-overlap. Symbol aliases and ambiguous names remain potentially aliasing.
-Raw stores conservatively invalidate symbolic contexts, whose implementation storage is not described
-by a physical lock path. Preserving an incoming lock does not certify a
-complete summary of locks acquired internally.
+separate distinct globals only when both accesses stay within their objects
+and the section/range identities prove non-overlap. Symbol aliases and
+ambiguous names remain potentially aliasing.
+Raw stores conservatively invalidate symbolic contexts, whose implementation
+storage is not described by a physical lock path. Preserving an incoming lock
+does not certify a complete summary of locks acquired internally.
 
 Build diagnostics retain reasons for missing proofs. No ``unknown`` fact is
-loaded into the kernel. Without a closed caller set, no derived entry ownership
+loaded into the kernel. Use ``--verbose --verbose`` to report each entry
+rejection and the incoming call sites where some ownership is available.
+The output distinguishes caller closure, missing ownership at callers,
+unrepresentable common locks, native identity failures and emission failures.
+Acquisition budgets and propagated incompleteness are counted separately.
+Without a closed caller set, no derived entry ownership
 is emitted. In particular, externally callable functions cannot acquire an
 entry guarantee merely because their observed C callers hold a lock.
 
