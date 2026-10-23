@@ -94,6 +94,7 @@
 #include <subcmd/run-command.h>
 
 #include "fmodret.h"
+#include "context.h"
 
 #define BTF_IDS_SECTION	".BTF_ids"
 #define BTF_LINK_MODULE_NAME_MAX	64
@@ -2118,6 +2119,7 @@ int main(int argc, const char **argv)
 	struct btf_links btf_links = {};
 	bool fatal_warnings = false;
 	bool fmodret_candidates = false;
+	bool context_analysis = false;
 	bool resolve_btfids = true;
 	char out_path[PATH_MAX];
 
@@ -2132,6 +2134,8 @@ int main(int argc, const char **argv)
 			    "turn warnings into errors"),
 		OPT_BOOLEAN(0, "fmodret_candidates", &fmodret_candidates,
 			    "generate IDs for fmod_ret candidates"),
+		OPT_BOOLEAN(0, "context_analysis", &context_analysis,
+			    "emit native BTF context analysis declaration tags"),
 		OPT_BOOLEAN(0, "distill_base", &obj.distill_base,
 			    "distill --btf_base and emit .BTF.base section data"),
 		OPT_BOOLEAN(0, "inline", &obj.extract_inline,
@@ -2195,6 +2199,9 @@ int main(int argc, const char **argv)
 		goto out;
 
 	if (btf2btf(&obj))
+		goto out;
+
+	if (context_analysis && context_btf_generate(obj.path, obj.btf, verbose))
 		goto out;
 
 	if (finalize_btf(&obj))
