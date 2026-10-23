@@ -32,6 +32,7 @@ export PAHOLE_FLAGS := $(pahole-flags-y)
 export BTF_INLINE := $(btf-inline)
 
 resolve-btfids-flags-y :=
+resolve-btfids-flags-$(CONFIG_CLANG_PLUGIN_BPF_CONTEXT_IR) += --context_analysis
 resolve-btfids-flags-$(CONFIG_WERROR) += --fatal_warnings
 resolve-btfids-flags-$(CONFIG_CLANG_PLUGIN_BPF_SCAN_IR) += --fmodret_candidates
 resolve-btfids-flags-$(CONFIG_GCC_PLUGIN_FMODRET_CANDIDATES) += --fmodret_candidates
