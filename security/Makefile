@@ -3,6 +3,8 @@
 # Makefile for the kernel security code
 #
 
+CONTEXT_ANALYSIS_security.o := y
+
 obj-$(CONFIG_KEYS)			+= keys/
 
 # always enable default capabilities
