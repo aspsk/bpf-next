@@ -1866,6 +1866,7 @@ static int do_help(int argc, char **argv)
 	fprintf(stderr,
 		"Usage: %1$s %2$s { show | list } [id BTF_ID]\n"
 		"       %1$s %2$s dump BTF_SRC [format FORMAT] [root_id ROOT_ID]\n"
+		"       %1$s %2$s context-analysis { file FILE | id BTF_ID } [func NAME]\n"
 		"       %1$s %2$s help\n"
 		"\n"
 		"       BTF_SRC := { id BTF_ID | prog PROG | map MAP [{key | value | kv | all}] |\n"
@@ -1886,6 +1887,7 @@ static const struct cmd cmds[] = {
 	{ "list",	do_show },
 	{ "help",	do_help },
 	{ "dump",	do_dump },
+	{ "context-analysis", do_btf_context_analysis },
 	{ 0 }
 };
 

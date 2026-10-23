@@ -916,6 +916,24 @@ _bpftool()
         btf)
             local MAP_TYPE='id pinned name'
             case $command in
+                context-analysis)
+                    case $prev in
+                        $command)
+                            COMPREPLY=( $( compgen -W 'file id' -- "$cur" ) )
+                            ;;
+                        file)
+                            _filedir
+                            ;;
+                        id)
+                            _bpftool_get_btf_ids
+                            ;;
+                        *)
+                            [[ " ${words[*]} " != *" func "* ]] && \
+                                COMPREPLY=( $( compgen -W 'func' -- "$cur" ) )
+                            ;;
+                    esac
+                    return 0
+                    ;;
                 dump)
                     case $prev in
                         $command)
@@ -1003,7 +1021,7 @@ _bpftool()
                     ;;
                 *)
                     [[ $prev == $object ]] && \
-                        COMPREPLY=( $( compgen -W 'dump help show list' \
+                        COMPREPLY=( $( compgen -W 'dump context-analysis help show list' \
                             -- "$cur" ) )
                     ;;
             esac

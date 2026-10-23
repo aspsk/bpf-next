@@ -18,13 +18,14 @@ SYNOPSIS
 
 *OPTIONS* := { |COMMON_OPTIONS| | [{ **-B** | **--base-btf**} *FILE*]...  }
 
-*COMMANDS* := { **dump** | **help** }
+*COMMANDS* := { **dump** | **context-analysis** | **help** }
 
 BTF COMMANDS
 =============
 
 | **bpftool** **btf** { **show** | **list** } [**id** *BTF_ID*]
 | **bpftool** **btf dump** *BTF_SRC* [**format** *FORMAT*] [**root_id** *ROOT_ID*]
+| **bpftool** **btf context-analysis** { **file** *FILE* | **id** *BTF_ID* } [**func** *NAME*]
 | **bpftool** **btf help**
 |
 | *BTF_SRC* := { **id** *BTF_ID* | **prog** *PROG* | **map** *MAP* [{**key** | **value** | **kv** | **all**}] | **file** *FILE* [**file** *FILE*]... }
@@ -74,6 +75,31 @@ bpftool btf dump *BTF_SRC* [format *FORMAT*] [root_id *ROOT_ID*]
     its dependent types. It cannot be used with any other types of filtering
     (such as the "key", "value", or "kv" arguments when dumping BTF for a map).
     It can be passed multiple times to dump multiple types.
+
+bpftool btf context-analysis { file *FILE* | id *BTF_ID* } [func *NAME*]
+    Decode version-1 context-analysis declaration tags and group them by their
+    native BTF function or capability type. Show declared contracts, derived
+    internal acquisitions, exit effects, entry ownership and complete locking
+    summaries. The optional **func** filter selects a function by name. Multiple
+    same-named native functions remain separate and retain their BTF type IDs.
+
+    Text output shows C function signatures with argument types and names.
+    Lock expressions use argument names and member paths with the lock's C
+    type, for example ``lock->wait_lock [raw_spinlock_t]`` beneath
+    ``void mutex_lock(struct mutex *lock)``. Parameter and global addresses,
+    member offsets and array elements are resolved using BTF layouts and
+    capability tags. Ambiguous or unsupported locations retain their symbolic
+    expressions. Symbolic contexts print as ``RCU [context token]``; their
+    capability records identify the token name and reentrancy.
+
+    **file** accepts ELF or raw BTF, including ``/sys/kernel/btf/vmlinux`` and
+    module BTF. Module sysfs paths automatically use vmlinux as their base;
+    other split BTF files can use **-B**. **id** accepts a loaded BTF object ID.
+    JSON output includes the original tag and decoded fields.
+
+    Absence of facts does not establish absence of locking. Only a complete
+    locking summary certifies that all effects in the current model are known.
+    This command is informational and does not perform verifier checks.
 
 bpftool btf help
     Print short help message.
