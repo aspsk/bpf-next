@@ -63,6 +63,9 @@ struct site {
 	struct substitution *substitutions;
 	unsigned int nr_substitutions, substitution_slots;
 	bool visited;
+	bool write;
+	const struct expression *address;
+	unsigned int width;
 };
 
 enum value_kind { VALUE_UNKNOWN, VALUE_INTEGER, VALUE_CALL, VALUE_TEST, VALUE_PHI };
@@ -101,6 +104,7 @@ struct function {
 	unsigned int id, nargs, nr_blocks, nr_sites, native_proto;
 	bool local, weak, defined, live, escaped, covered, raw_complete, complete;
 	bool known_contract, exit_complete;
+	bool memory_covered;
 	bool dirty, body_dirty, entry_dirty, notify_callers, notify_body;
 	struct function *definition;
 	struct facts declared, effects, may, entry;
@@ -805,7 +809,8 @@ static int read_document(struct context *c, const char *data, size_t len)
 	root = cj_parse_value(d, &pos, 0);
 	if (root < 0 || pos != len ||
 	    !cj_equal(d, cj_get(d, root, "format"), BPF_CONTEXT_FORMAT) ||
-	    cj_number(d, cj_get(d, root, "version"), -1) != BPF_CONTEXT_VERSION)
+	    (cj_number(d, cj_get(d, root, "version"), -1) != BPF_CONTEXT_VERSION &&
+	     cj_number(d, cj_get(d, root, "version"), -1) != 2))
 		return -EINVAL;
 	if (read_tokens(c, d, cj_get(d, root, "tokens")))
 		return -EINVAL;
@@ -835,6 +840,8 @@ static int read_document(struct context *c, const char *data, size_t len)
 		f->escaped = cj_bool(d, cj_get(d, i, "escaped")) || !symbolic_name(f->name);
 		f->covered = cj_bool(d, cj_get(d, i, "covered"));
 		f->raw_complete = cj_bool(d, cj_get(d, i, "complete"));
+		f->memory_covered = cj_number(d, cj_get(d, root, "version"), 0) >= 3 &&
+			cj_bool(d, cj_get(d, i, "memory_covered"));
 		if (!read_contracts(c, f, cj_get(d, i, "contracts")))
 			return -EINVAL;
 		f->known_contract = f->declared.n && cj_bool(d, cj_get(d, i, "contract_complete"));
@@ -873,6 +880,14 @@ static int read_document(struct context *c, const char *data, size_t len)
 
 				site->id = cj_number(d, cj_get(d, s, "id"), UINT_MAX);
 				site->reference = cj_number(d, cj_get(d, s, "callee"), -1);
+				site->write = cj_equal(d, cj_get(d, s, "kind"), "write");
+				if (site->write) {
+					char *address = string_field(d, s, "address");
+
+					site->address = intern_expression(c, address);
+					free(address);
+					site->width = cj_number(d, cj_get(d, s, "width"), 0);
+				}
 				site->nargs = args ? d->tokens[args].children : 0;
 				site->args = resize(NULL, site->nargs, sizeof(*site->args));
 				cj_each(d, args, arg) {

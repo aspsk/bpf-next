@@ -436,12 +436,13 @@ public:
 		bool ContractComplete = Covered;
 		json::Array Contracts = contracts(AST, ContractComplete);
 		bool Complete = Covered && !F.isDeclaration() && ContractComplete;
+		bool MemoryCovered = Covered && ContractComplete;
 		if (AST)
 			if (const auto *A = AST->getArray("contracts"))
 				for (const auto &V : *A)
 					if (const auto *C = V.getAsObject())
 						if (str(*C, "op") == "analysis_disabled")
-							Complete = false;
+							Complete = MemoryCovered = false;
 		for (const BasicBlock &B : F) {
 			Blocks[&B] = Blocks.size();
 			for (const Instruction &I : B)
@@ -455,8 +456,27 @@ public:
 				const auto *C = dyn_cast<CallBase>(&I);
 				if (!C) {
 					if (isa<StoreInst>(I) || isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) {
+						const Value *Address;
+						Type *Stored;
+
+						if (const auto *S = dyn_cast<StoreInst>(&I)) {
+							Address = S->getPointerOperand();
+							Stored = S->getValueOperand()->getType();
+						} else if (const auto *R = dyn_cast<AtomicRMWInst>(&I)) {
+							Address = R->getPointerOperand();
+							Stored = R->getValOperand()->getType();
+						} else {
+							const auto *X = cast<AtomicCmpXchgInst>(&I);
+
+							Address = X->getPointerOperand();
+							Stored = X->getCompareOperand()->getType();
+						}
+						TypeSize Width = DL.getTypeStoreSize(Stored);
+
 						Complete = false;
 						Sites.push_back(json::Object{{"id", -1}, {"callee", -1},
+							{"kind", "write"}, {"address", expression(Address)},
+							{"width", Width.isScalable() ? 0 : Width.getFixedValue()},
 							{"arguments", json::Array()}});
 					}
 					continue;
@@ -515,6 +535,7 @@ public:
 			{"defined", !F.isDeclaration()}, {"escaped", F.hasAddressTaken()},
 			{"covered", Covered}, {"complete", Complete}, {"nargs", F.arg_size()},
 			{"contract_complete", ContractComplete},
+			{"memory_covered", MemoryCovered},
 			{"contracts", std::move(Contracts)}, {"blocks", std::move(CFG)}};
 	}
 };
