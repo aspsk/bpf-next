@@ -10,7 +10,7 @@
 #include <linux/lockdep.h>
 #include <linux/cleanup.h>
 
-struct percpu_rw_semaphore {
+context_lock_struct(percpu_rw_semaphore) {
 	struct rcu_sync		rss;
 	unsigned int __percpu	*read_count;
 	struct rcuwait		writer;

@@ -3382,8 +3382,8 @@ static bool manage_workers(struct worker *worker)
  * raw_spin_lock_irq(pool->lock) which is released and regrabbed.
  */
 static void process_one_work(struct worker *worker, struct work_struct *work)
-__releases(&pool->lock)
-__acquires(&pool->lock)
+	__releases(&worker->pool->lock)
+	__acquires(&worker->pool->lock)
 {
 	struct pool_workqueue *pwq = get_work_pwq(work);
 	struct worker_pool *pool = worker->pool;
