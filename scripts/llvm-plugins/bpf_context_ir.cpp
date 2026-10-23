@@ -270,7 +270,47 @@ class DescribeModule {
 	DenseMap<const AllocaInst *, unsigned> Locals;
 	SmallPtrSet<const Value *, 32> ActiveValues;
 	StringSet<> Tokens;
+	DenseMap<const Function *, std::string> PointerReturns;
+	SmallPtrSet<const Function *, 8> ActivePointerReturns;
 	unsigned ValueBudget = 0;
+
+	/* Summarize local, read-only getters before inlining. All returns must
+	 * describe the same pointer path; never import effects from an opaque call.
+	 */
+	std::string pointerReturn(const Function *F)
+	{
+		if (!F || !F->hasLocalLinkage() || F->isDeclaration())
+			return "";
+		if (auto I = PointerReturns.find(F); I != PointerReturns.end())
+			return I->second;
+		if (ActivePointerReturns.size() >= 24 || !ActivePointerReturns.insert(F).second)
+			return "";
+		scope_exit Erase([&] { ActivePointerReturns.erase(F); });
+		std::string Result;
+		unsigned Count = 0;
+		for (const BasicBlock &B : *F)
+			for (const Instruction &I : B) {
+				if (++Count > 128 || I.mayWriteToMemory())
+					return PointerReturns[F] = "";
+				if (const auto *C = dyn_cast<CallBase>(&I)) {
+					if (isa<DbgInfoIntrinsic>(C))
+						continue;
+					if (!isa<CallInst>(C) || C->isInlineAsm() ||
+					    pointerReturn(C->getCalledFunction()).empty())
+						return PointerReturns[F] = "";
+				}
+				if (const auto *R = dyn_cast<ReturnInst>(&I)) {
+					std::string E = R->getReturnValue() && R->getReturnValue()->getType()->isPointerTy() ?
+						expression(R->getReturnValue()) : "";
+
+					if (E.empty() || E.find("local(") != std::string::npos ||
+					    (!Result.empty() && Result != E))
+						return PointerReturns[F] = "";
+					Result = std::move(E);
+				}
+			}
+		return PointerReturns[F] = Result;
+	}
 
 	std::string expression(const Value *V, unsigned Depth = 0,
 			       const BasicBlock *Pred = nullptr)
@@ -295,6 +335,31 @@ class DescribeModule {
 					return "token(" + G->getName().str() + ")";
 			std::string E = expression(L->getPointerOperand(), Depth + 1);
 			return E.empty() ? "" : "load(" + E + ")";
+		}
+		if (const auto *C = dyn_cast<CallBase>(V)) {
+			std::string Summary = pointerReturn(C->getCalledFunction()), Result;
+			StringRef Rest(Summary);
+
+			if (Summary.empty())
+				return "";
+			while (Rest.contains("arg(")) {
+				size_t Pos = Rest.find("arg("), Close = Rest.find(')', Pos + 4);
+				unsigned Arg;
+
+				if (Close == StringRef::npos ||
+				    Rest.slice(Pos + 4, Close).getAsInteger(10, Arg) || Arg >= C->arg_size())
+					return "";
+				std::string E = expression(C->getArgOperand(Arg), Depth + 1);
+
+				if (E.empty())
+					return "";
+				Result += Rest.take_front(Pos).str() + E;
+				Rest = Rest.drop_front(Close + 1);
+				if (Result.size() > 1024)
+					return "";
+			}
+			Result += Rest.str();
+			return Result.size() <= 1024 ? Result : "";
 		}
 		if (const auto *P = dyn_cast<PHINode>(V)) {
 			if (Pred)
