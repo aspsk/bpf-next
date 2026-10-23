@@ -22,6 +22,7 @@
 #define MAX_PATHS 2048
 #define MAX_ROUNDS 128
 #define MAX_EXPR 1024
+#define MAX_EXPRESSIONS 262144
 
 enum operation { ACQUIRE, RELEASE, REQUIRE, EXCLUDE, MAY_ACQUIRE, ENTRY_HELD };
 enum mode { EXCLUSIVE, SHARED, GENERIC };
@@ -113,6 +114,8 @@ struct function {
 	bool local, weak, defined, live, escaped, covered, raw_complete, complete;
 	bool known_contract, exit_complete;
 	bool memory_covered;
+	bool may_incomplete, may_budget;
+	unsigned int loaded_may;
 	bool clobber_unknown;
 	struct clobber *clobbers;
 	unsigned int nr_clobbers;
@@ -139,7 +142,7 @@ struct name_id {
 };
 
 struct emitted_tag {
-	unsigned int type;
+	unsigned int type, hash;
 	char *name;
 	struct emitted_tag *next;
 };
@@ -161,9 +164,11 @@ struct context {
 	bool *capabilities, *reentrant;
 	struct context_token *tokens;
 	unsigned int nr_tokens;
-	struct emitted_tag *emitted[4096];
+	struct emitted_tag **emitted;
+	unsigned int emitted_slots;
 	struct expression **expressions;
 	unsigned int nr_expressions, expression_slots;
+	bool deriving, expression_limited;
 	unsigned long long substitution_hits, substitution_misses;
 	unsigned long long analyses, ownership_visits;
 	int verbose;
@@ -219,6 +224,10 @@ static const struct expression *intern_expression(struct context *c, const char 
 		for (e = c->expressions[slot]; e; e = e->next)
 			if (e->hash == hash && e->len == len && !memcmp(e->text, s, len))
 				return e;
+	}
+	if (c->deriving && c->nr_expressions >= MAX_EXPRESSIONS) {
+		c->expression_limited = true;
+		return NULL;
 	}
 	if (c->nr_expressions == UINT_MAX) {
 		fprintf(stderr, "context-analysis: too many lock expressions\n");
@@ -1467,12 +1476,31 @@ struct analysis {
 	unsigned char *visited;
 };
 
+static void insert_may(struct function *f, struct fact fact)
+{
+	if (!fact.lock || contains(&f->may, &fact))
+		return;
+	if (f->may_budget || f->may.n >= 128 || (fact.lock->has_load && f->loaded_may >= 8)) {
+		f->may_budget = f->may_incomplete = true;
+		return;
+	}
+	if (insert(&f->may, fact) && fact.lock->has_load)
+		++f->loaded_may;
+}
+
 static void propagate_may(struct context *c, struct function *caller, struct site *site)
 {
 	struct function *callee = site->callee;
 
 	if (!callee)
 		return;
+	if (callee->may_incomplete && !caller->may_incomplete) {
+		caller->may_incomplete = caller->body_dirty = true;
+	}
+	if (caller->may_budget) {
+		site->propagated_may = callee->may.n;
+		return;
+	}
 	/* May summaries only grow; failed substitutions are sticky too. */
 	while (site->propagated_may < callee->may.n) {
 		struct fact f = callee->may.v[site->propagated_may++];
@@ -1484,7 +1512,12 @@ static void propagate_may(struct context *c, struct function *caller, struct sit
 		else {
 			f.op = MAY_ACQUIRE;
 			f.cond = ALWAYS;
-			insert(&caller->may, f);
+			insert_may(caller, f);
+		}
+		if (caller->may_budget) {
+			site->propagated_may = callee->may.n;
+			caller->body_dirty = true;
+			break;
 		}
 	}
 }
@@ -1602,7 +1635,7 @@ static void process_call(struct analysis *a, struct site *site, struct state *s)
 			may.lock = expand_snapshots(a->ctx, a->f, may.lock);
 			if (!may.lock)
 				a->complete = false;
-			insert(&a->f->may, may);
+			insert_may(a->f, may);
 		}
 		/* A path through a pointer read identifies a possible acquisition,
 		 * not a stable ownership identity across this call or later reads.
@@ -1998,6 +2031,10 @@ static bool analyze_function(struct context *c, struct function *f)
 	a.complete &= a.exits_known;
 	if (!a.exhaustive)
 		derive_site_ownership(c, f);
+	if (f->may_incomplete) {
+		a.complete = false;
+		f->reason = "possible-acquisition propagation is incomplete or budget-limited";
+	}
 	for (i = 0; i < nr_previous; ++i) {
 		struct site *site = previous[i].site;
 		struct function *callee = site->callee;
@@ -2096,14 +2133,35 @@ static bool derive_entries(struct context *c)
 
 static int add_tag(struct context *c, unsigned int type, const char *tag)
 {
-	unsigned int hash = type, i;
+	unsigned int hash = type * 2654435761U, i, slot;
 	struct emitted_tag *entry;
 	int err;
 
 	for (i = 0; tag[i]; ++i)
-		hash = hash * 31 + (unsigned char)tag[i];
-	hash %= 4096;
-	for (entry = c->emitted[hash]; entry; entry = entry->next)
+		hash = (hash ^ (unsigned char)tag[i]) * 16777619U;
+	hash ^= hash >> 16;
+	if (!c->emitted_slots || c->tags >= c->emitted_slots * 2) {
+		unsigned int slots = c->emitted_slots ? c->emitted_slots * 2 : 4096;
+		struct emitted_tag **table = resize(NULL, slots, sizeof(*table));
+
+		memset(table, 0, slots * sizeof(*table));
+		for (i = 0; i < c->emitted_slots; ++i) {
+			entry = c->emitted[i];
+			while (entry) {
+				struct emitted_tag *next = entry->next;
+
+				slot = entry->hash & (slots - 1);
+				entry->next = table[slot];
+				table[slot] = entry;
+				entry = next;
+			}
+		}
+		free(c->emitted);
+		c->emitted = table;
+		c->emitted_slots = slots;
+	}
+	slot = hash & (c->emitted_slots - 1);
+	for (entry = c->emitted[slot]; entry; entry = entry->next)
 		if (entry->type == type && !strcmp(entry->name, tag))
 			return 0;
 	err = btf__add_decl_tag(c->btf, tag, type, -1);
@@ -2111,8 +2169,8 @@ static int add_tag(struct context *c, unsigned int type, const char *tag)
 	if (err < 0)
 		return err;
 	entry = resize(NULL, 1, sizeof(*entry));
-	*entry = (struct emitted_tag){ type, copy_string(tag), c->emitted[hash] };
-	c->emitted[hash] = entry;
+	*entry = (struct emitted_tag){ type, hash, copy_string(tag), c->emitted[slot] };
+	c->emitted[slot] = entry;
 	++c->tags;
 	return 0;
 }
@@ -2649,7 +2707,7 @@ static void destroy_context(struct context *c)
 		free((char *)c->elf_names[i].name);
 	for (i = 0; i < c->nr_btf_names; ++i)
 		free((char *)c->btf_names[i].name);
-	for (i = 0; i < 4096; ++i) {
+	for (i = 0; i < c->emitted_slots; ++i) {
 		struct emitted_tag *entry = c->emitted[i];
 
 		while (entry) {
@@ -2658,6 +2716,7 @@ static void destroy_context(struct context *c)
 			free(entry->name); free(entry); entry = next;
 		}
 	}
+	free(c->emitted);
 	for (i = 0; i < c->expression_slots; ++i) {
 		struct expression *e = c->expressions[i];
 
@@ -2733,6 +2792,7 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 			c.nr_functions, elapsed_seconds(&start));
 	if (err || !c.nr_functions)
 		goto out;
+	c.deriving = true;
 	resolve_functions(&c);
 	if (verbose)
 		fprintf(stderr, "context-analysis: resolved calls at %.3fs\n", elapsed_seconds(&start));
@@ -2811,6 +2871,12 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 			c.functions[i].reason = "fixed-point budget exhausted";
 		}
 	report_entries(&c);
+	if (c.expression_limited) {
+		for (i = 0; i < c.nr_functions; ++i)
+			c.functions[i].complete = false;
+		if (verbose)
+			fprintf(stderr, "context-analysis: derived expression budget exhausted; complete summaries withheld\n");
+	}
 	err = err ?: emit_functions(&c);
 	if (verbose)
 		fprintf(stderr, "context-analysis: %u function descriptions, %u native matches, "
