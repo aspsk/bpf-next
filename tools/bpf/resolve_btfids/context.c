@@ -1627,7 +1627,10 @@ static void process_call(struct analysis *a, struct site *site, struct state *s)
 			a->complete = false;
 			if (f.op != MAY_ACQUIRE)
 				a->exits_known = false;
-			a->f->reason = "unrepresentable lock argument";
+			if (f.op == RELEASE)
+				destroy_state(s);
+			a->f->reason = f.op == RELEASE ? "unrepresentable release invalidates ownership" :
+				"unrepresentable lock argument";
 			continue;
 		}
 		f.lock = expr;
