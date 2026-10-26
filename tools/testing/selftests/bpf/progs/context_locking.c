@@ -71,12 +71,15 @@ int BPF_PROG(deadlock_ptrace_spilled, struct task_struct *child, unsigned int mo
 	return get_exe_file_static(saved);
 }
 
-/* PF_KTHREAD, from include/linux/sched.h: the kfunc returns before locking. */
+/* A guard excludes only the recorded witness, not every possible acquisition.
+ * Keep rejecting until acquisition exclusions have their own complete proof.
+ */
 #define PF_KTHREAD 0x00200000
 
 SEC("lsm/ptrace_access_check")
-__success
-int BPF_PROG(ptrace_kernel_thread, struct task_struct *child, unsigned int mode)
+__failure
+__msg("kfunc bpf_get_task_exe_file may deadlock: proven acquisition overlaps an entry-held lock")
+int BPF_PROG(ptrace_kernel_thread_rejected, struct task_struct *child, unsigned int mode)
 {
 	struct file *f;
 
@@ -86,6 +89,13 @@ int BPF_PROG(ptrace_kernel_thread, struct task_struct *child, unsigned int mode)
 	f = bpf_get_task_exe_file(child);
 	if (f)
 		bpf_put_file(f);
+	return 0;
+}
+
+SEC("lsm/ptrace_access_check")
+__success
+int BPF_PROG(ptrace_without_acquisition, struct task_struct *child, unsigned int mode)
+{
 	return 0;
 }
 

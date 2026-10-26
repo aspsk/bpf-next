@@ -24,7 +24,7 @@
 #define MAX_EXPR 1024
 #define MAX_EXPRESSIONS 262144
 
-enum operation { ACQUIRE, RELEASE, REQUIRE, EXCLUDE, MAY_ACQUIRE, ENTRY_HELD };
+enum operation { ACQUIRE, RELEASE, REQUIRE, EXCLUDE, MAY_ACQUIRE, ENTRY_HELD, ENTRY_MAY_HOLD };
 enum mode { EXCLUSIVE, SHARED, GENERIC };
 enum condition { ALWAYS, ZERO, NONZERO };
 
@@ -77,6 +77,7 @@ struct site {
 	bool unrepresentable_may;
 	bool interface_covered, witness_prefix_safe;
 	struct facts held;
+	struct facts may_held;
 	struct substitution *substitutions;
 	unsigned int nr_substitutions, substitution_slots;
 	bool visited;
@@ -148,7 +149,9 @@ struct function {
 	unsigned int nr_snapshots;
 	bool dirty, body_dirty, entry_dirty, notify_callers, notify_body;
 	struct function *definition;
-	struct facts declared, effects, may, entry;
+	struct facts declared, effects, may, entry, entry_may;
+	unsigned int propagated_entry_may;
+	bool entry_may_limited;
 	struct block *blocks;
 	struct site **incoming, **visited_sites;
 	unsigned int nr_visited_sites;
@@ -229,7 +232,7 @@ struct context {
 	unsigned long long analyses, ownership_visits;
 	const char *trace_filter;
 	int verbose;
-	unsigned int tags, matched, complete, incomplete, entries, witness_tags, witness_functions;
+	unsigned int tags, matched, complete, incomplete, entries, may_entries, witness_tags, witness_functions;
 };
 
 static void *resize(void *p, size_t count, size_t size)
@@ -2867,6 +2870,115 @@ static bool derive_entries(struct context *c)
 	return changed;
 }
 
+/* Existential evidence never seeds the universal ownership solver. Preserve
+ * each incoming lock separately: locks observed on different calls need not
+ * coexist. A known locked call is useful even when other callers are unknown.
+ */
+static bool add_entry_may(struct context *c, struct function *f, struct site *site,
+			  const struct facts *held)
+{
+	unsigned int i, old = f->entry_may.n;
+
+	for (i = 0; i < held->n; ++i) {
+		struct fact fact = held->v[i];
+
+		fact.lock = relative(c, fact.lock, site, 0);
+		if (!fact.lock || fact.lock->has_load || fact.lock->has_local)
+			continue;
+		fact.op = ENTRY_HELD;
+		if (contains(&f->entry_may, &fact))
+			continue;
+		if (f->entry_may.n == 64) {
+			f->entry_may_limited = true;
+			break;
+		}
+		insert(&f->entry_may, fact);
+	}
+	return old != f->entry_may.n;
+}
+
+/* An existential input can be forwarded through an unconditional prefix.
+ * Do not send it down an unknown conditional edge: its input conditions may
+ * exclude that edge. No mutually exclusive entry locks are combined.
+ */
+static void propagate_entry_may(struct context *c, struct function *f)
+{
+	unsigned char *seen = resize(NULL, f->nr_blocks, 1);
+	const char *reason = f->reason;
+
+	while (f->propagated_entry_may < f->entry_may.n) {
+		struct fact seed = f->entry_may.v[f->propagated_entry_may++];
+		struct state state = entry_state(f);
+		struct analysis a = { .ctx = c, .f = f };
+		unsigned int block = 0, visits = 0;
+
+		insert(&state.held, seed);
+		initialize_ownership(&state);
+		memset(seen, 0, f->nr_blocks);
+		while (block < f->nr_blocks && !seen[block] && ++visits <= MAX_PATHS) {
+			struct block *b = &f->blocks[block];
+			unsigned int i;
+
+			seen[block] = 1;
+			for (i = 0; i < b->nr_sites && state.held.n; ++i) {
+				struct site *site = &b->sites[i], copy = *site;
+
+				merge(&site->may_held, &state.held);
+				/* Reuse effect transfer without altering the original
+				 * site's universal facts or its visit bookkeeping.
+				 */
+				copy.held = (struct facts){};
+				merge(&copy.held, &state.held);
+				copy.visited = true;
+				state.ownership_only = true;
+				process_call_effects(&a, &copy, &state);
+				site->substitutions = copy.substitutions;
+				site->nr_substitutions = copy.nr_substitutions;
+				site->substitution_slots = copy.substitution_slots;
+				clear(&copy.held);
+			}
+			if (!state.held.n || b->nr_edges != 1)
+				break;
+			block = b->edges[0].block;
+		}
+		destroy_state(&state);
+	}
+	f->reason = reason;
+	free(seen);
+}
+
+static void derive_entry_may(struct context *c)
+{
+	unsigned int round, i, j;
+	bool changed;
+
+	for (round = 0; round < MAX_ROUNDS; ++round) {
+		changed = false;
+		for (i = 0; i < c->nr_functions; ++i) {
+			struct function *f = &c->functions[i];
+
+			if (!f->defined)
+				continue;
+			for (j = 0; j < f->nr_incoming; ++j) {
+				struct site *site = f->incoming[j];
+
+				if (site->visited)
+					changed |= add_entry_may(c, f, site, &site->held);
+				changed |= add_entry_may(c, f, site, &site->may_held);
+			}
+			if (f->propagated_entry_may < f->entry_may.n) {
+				propagate_entry_may(c, f);
+				changed = true;
+			}
+		}
+		if (!changed)
+			break;
+	}
+	if (c->verbose)
+		fprintf(stderr, "context-analysis: existential entry propagation: %u rounds%s\n",
+			round + 1, round == MAX_ROUNDS ? " (budget reached; retained facts remain positive)" : "");
+}
+
 static int add_tag(struct context *c, unsigned int type, const char *tag)
 {
 	unsigned int hash = type * 2654435761U, i, slot;
@@ -2913,7 +3025,7 @@ static int add_tag(struct context *c, unsigned int type, const char *tag)
 
 static int emit_fact(struct context *c, unsigned int type, struct fact f, const char *source)
 {
-	static const char * const ops[] = { "acquires", "releases", "requires", "excludes", "may_acquire", "entry_held" };
+	static const char * const ops[] = { "acquires", "releases", "requires", "excludes", "may_acquire", "entry_held", "entry_may_hold" };
 	static const char * const modes[] = { "exclusive", "shared", "generic" };
 	static const char * const conds[] = { "always", "ret_eq(0)", "ret_ne(0)" };
 	char tag[MAX_EXPR + 128];
@@ -3854,6 +3966,21 @@ static int emit_functions(struct context *c)
 			t = btf__type_by_id(c->btf, id);
 			proto = btf__type_by_id(c->btf, t->type);
 		}
+		for (j = 0; j < f->entry_may.n; ++j) {
+			struct fact fact = f->entry_may.v[j];
+
+			/* A universal guarantee already implies this weaker fact. */
+			if (contains(&f->entry, &fact))
+				continue;
+			fact.op = ENTRY_MAY_HOLD;
+			if (typed_expression(c, proto, fact.lock, false)) {
+				if ((err = emit_fact(c, id, fact, "derived")))
+					return err;
+				++c->may_entries;
+			}
+			t = btf__type_by_id(c->btf, id);
+			proto = btf__type_by_id(c->btf, t->type);
+		}
 		if (f->complete && representable && stable) {
 			++c->complete;
 			if ((err = add_tag(c, id, BPF_CONTEXT_TAG_PREFIX "derived:lock_summary_complete")))
@@ -3883,12 +4010,14 @@ static void destroy_context(struct context *c)
 		free(f->witnesses);
 		free(f->signature);
 		free(f->name); clear(&f->declared); clear(&f->effects); clear(&f->may); clear(&f->entry);
+		clear(&f->entry_may);
 		for (j = 0; j < f->nr_blocks; ++j) {
 			for (k = 0; k < f->blocks[j].nr_sites; ++k) {
 				struct site *s = &f->blocks[j].sites[k];
 
 				free(s->dispatch_key); free(s->signature); free(s->dispatch_targets);
 				free(s->args); free(s->substitutions); clear(&s->held);
+				clear(&s->may_held);
 			}
 			for (k = 0; k < f->blocks[j].nr_edges; ++k)
 				free_value(f->blocks[j].edges[k].test);
@@ -3969,6 +4098,9 @@ static void report_entries(struct context *c)
 
 		if (!f->defined)
 			continue;
+		if (c->verbose > 1 && f->entry_may.n && f->live)
+			fprintf(stderr, "context-analysis: entry-may candidate %s: %u positive facts%s\n",
+				f->name, f->entry_may.n, f->entry_may_limited ? " (fact budget reached)" : "");
 		limited += f->may_budget;
 		incomplete += f->may_incomplete;
 		if (!f->local && !f->entry_closed) {
@@ -4130,10 +4262,16 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 	}
 	if (changed)
 		for (i = 0; i < c.nr_functions; ++i) {
+			unsigned int b, s;
+
 			c.functions[i].complete = false;
 			clear(&c.functions[i].entry);
+			for (b = 0; b < c.functions[i].nr_blocks; ++b)
+				for (s = 0; s < c.functions[i].blocks[b].nr_sites; ++s)
+					clear(&c.functions[i].blocks[b].sites[s].held);
 			c.functions[i].reason = "fixed-point budget exhausted";
 		}
+	derive_entry_may(&c);
 	report_entries(&c);
 	if (c.expression_limited) {
 		for (i = 0; i < c.nr_functions; ++i)
@@ -4146,6 +4284,8 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 		fprintf(stderr, "context-analysis: %u function descriptions, %u native matches, "
 			"%u complete summaries, %u incomplete summaries, %u entry facts, %u tags; %u rounds\n",
 			c.nr_functions, c.matched, c.complete, c.incomplete, c.entries, c.tags, round + 1);
+	if (verbose)
+		fprintf(stderr, "context-analysis: %u additional entry_may_hold facts emitted\n", c.may_entries);
 	if (verbose)
 		fprintf(stderr, "context-analysis: %u acquisition witnesses in %u native functions; "
 			"unwitnessed may-acquire candidates remain unproved\n", c.witness_tags, c.witness_functions);

@@ -470,10 +470,6 @@ static_assert(MAX_BPF_STACK_SLOTS <= (1 << 12));
 			 MAX_CALL_FRAMES)
 
 struct bpf_verifier_state {
-	/* Persistent context path-condition node, shared through the verifier env. */
-	u32 context_condition;
-	/* Unknown native effects end the supported acquisition-proof prefix. */
-	bool context_call_seen;
 	/* call stack tracking */
 	struct bpf_func_state *frame[MAX_CALL_FRAMES];
 	struct bpf_verifier_state *parent;

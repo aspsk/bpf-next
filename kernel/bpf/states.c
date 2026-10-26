@@ -1035,10 +1035,6 @@ static bool states_equal(struct bpf_verifier_env *env,
 	u32 insn_idx;
 	int i;
 
-	if (old->context_condition != cur->context_condition ||
-	    old->context_call_seen != cur->context_call_seen)
-		return false;
-
 	if (old->curframe != cur->curframe)
 		return false;
 

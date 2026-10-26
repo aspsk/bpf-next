@@ -44,7 +44,7 @@ Function tags have this exact grammar::
 ``SOURCE`` is ``declared`` or ``derived``. Declared facts are trusted source
 contracts, not a claim that the collector proved their implementations.
 ``FACT`` is ``requires``, ``excludes``, ``acquires``, ``releases``,
-``may_acquire`` or ``entry_held``. ``MODE`` is ``exclusive``, ``shared`` or
+``may_acquire``, ``entry_held`` or ``entry_may_hold``. ``MODE`` is ``exclusive``, ``shared`` or
 ``generic``; generic means mode independent, never unknown.
 
 ``LOCK`` is a symbolic expression::
@@ -65,7 +65,12 @@ N. Conditional acquisition is an exit effect: the function returns holding the
 lock on the specified return branch. ``may_acquire`` is a conservative internal-acquisition candidate, including locks
 released before returning. Transitive propagation does not prove path feasibility; ``always`` imposes no
 return-value restriction and does not assert that every execution acquires it.
-``entry_held`` describes ownership inherited from every possible caller.
+``entry_held`` guarantees that every invocation enters with the lock held.
+It requires a closed caller set and ownership at every incoming call.
+``entry_may_hold`` records a positive locked entry context from at least one
+incoming call. Other unlocked callers, address escapes and incomplete caller
+coverage do not erase that evidence. Neither an unproved possible-acquisition
+set nor merely matching capability types can establish an entry fact.
 
 Positive acquisition paths use a separate function tag::
 
@@ -195,7 +200,17 @@ effects prevent an inferred complete exit summary.
 
 At control-flow joins and across callers, exclusive ownership can satisfy a
 shared requirement. Mixed shared/exclusive guarantees yield shared ownership.
-Entry facts express a positive ownership guarantee, without a numeric depth.
+Entry facts express positive ownership evidence, without a numeric depth.
+The universal and existential facts use separate propagation. The existential
+pass unions individually proven call-site facts without assuming that locks
+from different callers coexist. It forwards each input lock separately through
+an unconditional body prefix, checking preservation at every call and write.
+It stops at an unknown conditional edge because the entry context's input
+conditions could exclude that edge. Thus ``moo() { boo(); woo(); }`` can
+forward an existential entry lock to both calls, but arbitrary conditional
+forwarding needs additional path evidence. Universal body and exit summaries
+are never seeded with existential facts. Missing existential facts remain
+unknown; positive facts retained before a budget limit remain usable.
 For cyclic CFGs, a separate bounded must-ownership fixed point intersects all
 reachable predecessors and retains the minimum common nesting depth. It can
 prove call-site ownership without certifying complete exit effects for a loop.
@@ -325,8 +340,12 @@ are supported. The latter validates objtool's paired instruction/key records
 against native call relocations. Linker bounds identify jump-label, static-call
 and tracing tables even when they are merged into ordinary data sections.
 Only the exact native LSM null-trampoline templates count as definitions rather
-than additional assembly address uses. Other assembly references retain open
-caller sets.
+than additional assembly address uses. Objtool return-thunk, retpoline,
+call-instruction and IBT-sealing tables reference instruction locations and do
+not introduce callers. Other assembly references and ordinary function-pointer
+data retain open caller sets. Verbose unaccounted-reference diagnostics print
+the section name as well as its number; removing build-only sections can change
+ELF section numbers.
 
 The compiler follows simple local pointer getters whose bodies do not write
 memory or call opaque functions and whose returns describe the same pointer
@@ -383,32 +402,33 @@ type; it never substitutes a newly loaded pointer for the captured identity.
 Verifier checks
 ---------------
 
-For native entry attachments, the verifier reads unconditional ``entry_held``
-facts (and existing trusted ``requires`` contracts) from the attachment target.
-At a kfunc call, it consumes positive ``witness`` tags, substitutes the actual
-BPF arguments and compares the resulting lock instance and native capability
-type with the entry-held locks. A conflict requires incompatible ownership
-modes, an exact instance match and a supported acquisition guard consistent
-with the BPF path. Reentrant capabilities and shared/shared ownership do not
-conflict. Unproved acquisition candidates never drive rejection.
+For native entry attachments, the verifier reads ``entry_held`` and
+``entry_may_hold`` facts (and existing trusted ``requires`` contracts) from the
+attachment target. Either entry fact is enough to check for a deadlock.
+At a kfunc call it consumes positive ``witness`` tags, substitutes the actual
+BPF arguments and compares the lock instance and native capability type.
+A matching acquisition with conflicting ownership modes is rejected.
+Reentrant capabilities and shared/shared ownership do not conflict.
+Unproved acquisition candidates never drive rejection.
+
+A witness guard is sufficient to describe one acquisition path. It is not a
+complete description of every possible acquisition. Consequently, the verifier
+never uses a BPF branch contradicting that guard as permission to call the
+kfunc. Guards and call chains remain in BTF for diagnostics. Proving an
+acquisition exclusion would require separate complete evidence. This policy
+intentionally permits conservative rejections even when the recorded input
+conditions cannot coincide.
 
 Track native argument identity through register copies, stack spills and
-synchronous BPF subprogram calls, including global functions. Scalar field
-loads and constant masks retain enough provenance to compare supported
-zero/one-bit branch conditions with a kfunc's ``bits_eq`` guard. Unsupported
-correlated predicates withhold the conflict proof. Do not infer object equality
-from matching lock types or recursive pointer fields.
-
-This first checker supports argument-rooted physical lock paths and a bounded
-input prefix. A preceding native helper/kfunc call ends that prefix because its
-effects may invalidate the entry ownership or field observations. Speculative
-execution states and asynchronous callbacks cannot establish a conflict from
-the original attachment's entry facts. Unknown identities, globals, symbolic
-tokens and unsupported predicates require further modelling. Consequently,
-acceptance is not a certificate that the whole BPF program cannot deadlock.
+synchronous BPF subprogram calls, including global functions. Scalar-field
+conditions are not tracked for this policy. A preceding native helper or kfunc
+call does not disable the check. Speculative execution states and asynchronous
+callbacks cannot establish a conflict from the original attachment's entry
+facts. The current checker supports argument-rooted physical lock identities;
+unknown identities, globals and symbolic tokens require further modelling.
+Acceptance remains an incomplete deadlock check, not a safety certificate.
 
 For example, the ptrace LSM target inherits ``child->alloc_lock``. Passing that
 same ``child`` to ``bpf_get_task_exe_file`` matches its exclusive acquisition
-witness when ``PF_KTHREAD`` is clear, so the verifier rejects the call. A BPF
-path restricted to ``PF_KTHREAD`` being set excludes that witness: the kfunc
-returns before attempting the lock.
+witness and is rejected. A BPF path restricted to ``PF_KTHREAD`` being set is still rejected. Excluding the one recorded
+acquisition path does not prove that all acquisition paths have been excluded.

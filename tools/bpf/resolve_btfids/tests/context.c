@@ -500,3 +500,37 @@ int scalar_write_case(struct separate_holder *holder, volatile int *alias)
 	*alias = 0;
 	return after_scalar_write(obj);
 }
+
+static NOINLINE int may_leaf_a(struct test_object *obj) { return obj->counter; }
+static NOINLINE int may_leaf_b(struct test_object *obj) { return obj->counter; }
+static NOINLINE int may_middle(struct test_object *obj)
+{
+	return may_leaf_a(obj) + may_leaf_b(obj);
+}
+int may_locked(struct test_object *obj)
+{
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = may_middle(obj);
+	test_unlock(&obj->lock);
+	return ret;
+}
+int may_unlocked(struct test_object *obj) { return may_middle(obj); }
+
+/* An existential caller input cannot justify taking an unknown branch. */
+static NOINLINE int may_guarded_leaf(struct test_object *obj) { return obj->counter; }
+static NOINLINE int may_guarded(struct test_object *obj, int flag)
+{
+	return flag ? may_guarded_leaf(obj) : 0;
+}
+int may_guarded_locked(struct test_object *obj)
+{
+	int ret;
+
+	test_lock(&obj->lock);
+	ret = may_guarded(obj, 0);
+	test_unlock(&obj->lock);
+	return ret;
+}
+int may_guarded_unlocked(struct test_object *obj) { return may_guarded(obj, 1); }

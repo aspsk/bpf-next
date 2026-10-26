@@ -91,7 +91,8 @@ static inline bool btf_context_parse_tag(const char *name, struct btf_context_ta
 		return false;
 	if (strcmp(fields[1], "requires") && strcmp(fields[1], "excludes") &&
 	    strcmp(fields[1], "acquires") && strcmp(fields[1], "releases") &&
-	    strcmp(fields[1], "may_acquire") && strcmp(fields[1], "entry_held"))
+	    strcmp(fields[1], "may_acquire") && strcmp(fields[1], "entry_held") &&
+	    strcmp(fields[1], "entry_may_hold"))
 		return false;
 	if (strcmp(fields[2], "exclusive") && strcmp(fields[2], "shared") && strcmp(fields[2], "generic"))
 		return false;
