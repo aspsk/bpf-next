@@ -124,6 +124,7 @@ struct acquisition_witness {
 	unsigned long long mask, value;
 	unsigned int bits;
 	enum mode mode;
+	bool emitted;
 	char *via;
 };
 
@@ -3360,6 +3361,7 @@ static int emit_witnesses(struct context *c, struct function *f, unsigned int id
 		err = add_tag(c, id, tag);
 		if (err)
 			return err;
+		w->emitted = true;
 		++c->witness_tags;
 	}
 	if (c->witness_tags != before)
@@ -3406,14 +3408,31 @@ static int emit_functions(struct context *c)
 			proto = btf__type_by_id(c->btf, t->type);
 		}
 		for (j = 0; j < f->may.n; ++j) {
-			if (typed_expression(c, proto, f->may.v[j].lock, true)) {
-				if ((err = emit_fact(c, id, f->may.v[j], "derived")))
-					return err;
-			} else representable = false;
+			unsigned int k;
+
+			/* Candidates are analysis work, never runtime positive facts.
+			 * A complete runtime summary additionally needs every possible
+			 * acquisition covered by an unconditional emitted witness.
+			 */
+			if (!typed_expression(c, proto, f->may.v[j].lock, true))
+				representable = false;
 			if (f->may.v[j].lock->has_load)
 				stable = false;
-			t = btf__type_by_id(c->btf, id);
-			proto = btf__type_by_id(c->btf, t->type);
+			for (k = 0; k < f->nr_witnesses; ++k)
+				if (f->witnesses[k].emitted &&
+				    f->witnesses[k].lock == f->may.v[j].lock &&
+				    f->witnesses[k].mode == f->may.v[j].mode &&
+				    !f->witnesses[k].guard &&
+				    typed_expression(c, proto, f->witnesses[k].lock, false))
+					break;
+			if (k == f->nr_witnesses)
+				stable = false;
+			if (c->verbose > 1 && c->trace_filter && strstr(f->name, c->trace_filter))
+				fprintf(stderr, "context-analysis: candidate %s: may_acquire %s %s%s\n",
+					f->name, f->may.v[j].mode == EXCLUSIVE ? "exclusive" :
+					f->may.v[j].mode == SHARED ? "shared" : "generic",
+					f->may.v[j].lock->text,
+					k == f->nr_witnesses ? " (unproved)" : " (covered by an unconditional witness)");
 		}
 		for (j = 0; j < f->entry.n; ++j) {
 			if (typed_expression(c, proto, f->entry.v[j].lock, false)) {
@@ -3436,7 +3455,7 @@ static int emit_functions(struct context *c)
 			if (c->verbose)
 				fprintf(stderr, "context-analysis: %s: incomplete: %s\n", f->name,
 					!representable ? "lock identity cannot be represented in native BTF" :
-					!stable ? "pointer-derived lock needs a stable ownership identity" :
+					!stable ? "acquisition candidates are not covered by unconditional runtime witnesses" :
 					f->reason ?: "unresolved transitive effects");
 		}
 	}
