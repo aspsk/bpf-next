@@ -464,7 +464,7 @@ int global_escape_case(struct test_object *obj)
 
 /* A captured pointee is not the holder's by-value storage. */
 struct separate_holder { struct test_object *object; volatile int state; };
-struct embedded_holder { struct test_object *object; volatile int state; };
+struct embedded_holder { volatile int state; struct test_object *object; };
 union overlay_holder { struct embedded_holder holder; struct test_lock lock; };
 union overlay_holder overlay_instance;
 static NOINLINE int after_holder_write(struct test_object *obj) { return obj->counter; }
