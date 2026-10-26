@@ -564,6 +564,14 @@ class DescribeModule {
 				return json::Object{{"kind", "integer"}, {"value", I->getSExtValue()}};
 		if (const auto *C = dyn_cast<CallBase>(V))
 			return json::Object{{"kind", "call"}, {"call", Calls.lookup(C)}};
+		if (const auto *L = dyn_cast<LoadInst>(V))
+			if (L->getType()->isIntegerTy() && L->getType()->getIntegerBitWidth() <= 64)
+				return json::Object{{"kind", "scalar_load"}, {"address", expression(L->getPointerOperand())},
+					{"bits", L->getType()->getIntegerBitWidth()}};
+		if (const auto *B = dyn_cast<BinaryOperator>(V))
+			if (B->getOpcode() == Instruction::And)
+				return json::Object{{"kind", "and"}, {"left", value(B->getOperand(0), Pred, Depth + 1)},
+					{"right", value(B->getOperand(1), Pred, Depth + 1)}};
 		if (const auto *P = dyn_cast<PHINode>(V)) {
 			json::Array Incoming;
 			for (unsigned I = 0; I < P->getNumIncomingValues(); I++)
@@ -585,6 +593,24 @@ class DescribeModule {
 				{"left", value(L, Pred, Depth + 1)}, {"right", value(R, Pred, Depth + 1)}};
 		}
 		return json::Object{{"kind", "unknown"}};
+	}
+
+	/* A read is validated by the branch certificate before entering its
+	 * successor. Other reads cannot be silently assumed to be valid inputs.
+	 */
+	bool guardUsesLoad(const Value *V, const LoadInst *Load, unsigned Depth = 0)
+	{
+		if (V == Load)
+			return true;
+		if (!V || Depth > 16)
+			return false;
+		if (const auto *I = dyn_cast<Instruction>(V))
+			if (isa<ICmpInst>(I) || isa<CastInst>(I) ||
+			    (isa<BinaryOperator>(I) && I->getOpcode() == Instruction::And))
+				for (const Use &U : I->operands())
+					if (guardUsesLoad(U.get(), Load, Depth + 1))
+						return true;
+		return false;
 	}
 
 public:
@@ -621,8 +647,27 @@ public:
 		json::Array CFG;
 		for (const BasicBlock &B : F) {
 			json::Array Sites, Edges;
+			bool WitnessPrefixSafe = true, WitnessUnvalidatedRead = false;
 			for (const Instruction &I : B) {
 				const auto *C = dyn_cast<CallBase>(&I);
+				bool PrefixSafe = isa<LoadInst>(I) || isa<GetElementPtrInst>(I) ||
+					isa<CastInst>(I) || isa<ICmpInst>(I) || isa<CondBrInst>(I) || isa<UncondBrInst>(I) ||
+					isa<ReturnInst>(I) || isa<PHINode>(I) || isa<AllocaInst>(I) ||
+					(isa<BinaryOperator>(I) && I.getOpcode() == Instruction::And);
+
+				if (const auto *L = dyn_cast<LoadInst>(&I)) {
+					const auto *Br = dyn_cast<CondBrInst>(B.getTerminator());
+
+					WitnessUnvalidatedRead = true;
+					if (!L->getType()->isIntegerTy() || !Br || !guardUsesLoad(Br->getCondition(), L))
+						PrefixSafe = false;
+				}
+				/* This certificate is independent of ownership/effect coverage. */
+				if (!C && !PrefixSafe)
+					WitnessPrefixSafe = false;
+				if (const auto *Intr = dyn_cast_or_null<IntrinsicInst>(C))
+					if (Intr->getIntrinsicID() == Intrinsic::assume)
+						WitnessPrefixSafe = false;
 				if (!C) {
 					if (const auto *L = dyn_cast<LoadInst>(&I))
 						if (L->getType()->isPointerTy()) {
@@ -690,7 +735,7 @@ public:
 					Args.push_back(expression(A.get()));
 				Sites.push_back(json::Object{{"id", Calls.lookup(C)},
 					{"callee", Callee ? static_cast<int64_t>(Functions.lookup(Callee)) : -1},
-					{"arguments", std::move(Args)}});
+					{"witness_prefix_safe", WitnessPrefixSafe && !WitnessUnvalidatedRead}, {"arguments", std::move(Args)}});
 				if (C->getType()->isPointerTy()) {
 					expression(C);
 					if (Snapshots.count(C))
@@ -701,7 +746,8 @@ public:
 				if (C->isInlineAsm() || isa<InvokeInst>(C) || isa<CallBrInst>(C))
 					Complete = false;
 			}
-			json::Object Block{{"id", Blocks.lookup(&B)}, {"calls", std::move(Sites)}};
+			json::Object Block{{"id", Blocks.lookup(&B)}, {"calls", std::move(Sites)},
+				{"witness_tail_safe", WitnessPrefixSafe}};
 			const Instruction *Term = B.getTerminator();
 			if (const auto *R = dyn_cast<ReturnInst>(Term))
 				Block["return"] = value(R->getReturnValue());
@@ -730,7 +776,7 @@ public:
 			{"defined", !F.isDeclaration()}, {"escaped", addressEscapes(F, &F, AddressUses)},
 			{"covered", Covered}, {"complete", Complete}, {"nargs", F.arg_size()},
 			{"contract_complete", ContractComplete},
-			{"memory_covered", MemoryCovered},
+			{"memory_covered", MemoryCovered}, {"witness_covered", MemoryCovered},
 			{"snapshots", std::move(SnapshotRecords)},
 			{"contracts", std::move(Contracts)}, {"blocks", std::move(CFG)}};
 	}
