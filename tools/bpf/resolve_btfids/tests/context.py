@@ -74,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
     for name in ("after_store", "after_work", "after_loop", "after_capture",
                  "selected_a", "selected_b", "after_recursive", "after_pending",
                  "after_inner_release", "after_pending_inner", "after_stack_memory",
-                 "after_memory_barrier", "after_register_read"):
+                 "after_memory_barrier", "after_register_read", "after_holder_write", "after_holder_call"):
         facts = entries.get(name, [])
         if not any(f["lock"] == "arg(0)" and f["mode"] == "exclusive" for f in facts):
             raise AssertionError("missing valid ownership: " + name)
@@ -83,7 +83,7 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
                  "after_reload", "after_replacement", "mixed_context", "escaped_callback",
                  "after_global_alias", "after_pending_corruption", "after_unknown_release",
                  "after_inner_write", "after_alias_release", "after_foreign_snapshot",
-                 "after_memory_corruption", "after_unrecognized_asm"):
+                 "after_memory_corruption", "after_unrecognized_asm", "after_union_write", "after_scalar_write"):
         if entries.get(name):
             raise AssertionError("unsafe ownership guarantee: " + name)
         print("PASS ownership withheld:", name)

@@ -461,3 +461,42 @@ int global_escape_case(struct test_object *obj)
 	test_unlock(&obj->lock);
 	return ret;
 }
+
+/* A captured pointee is not the holder's by-value storage. */
+struct separate_holder { struct test_object *object; volatile int state; };
+struct embedded_holder { struct test_object *object; volatile int state; };
+union overlay_holder { struct embedded_holder holder; struct test_lock lock; };
+union overlay_holder overlay_instance;
+static NOINLINE int after_holder_write(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_holder_call(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_union_write(struct test_object *obj) { return obj->counter; }
+static NOINLINE int after_scalar_write(struct test_object *obj) { return obj->counter; }
+static NOINLINE void holder_update(struct separate_holder *holder) { holder->state++; }
+int holder_write_case(struct separate_holder *holder)
+{
+	struct test_object *obj = holder->object;
+	test_lock(&obj->lock);
+	holder->state++;
+	return after_holder_write(obj);
+}
+int holder_call_case(struct separate_holder *holder)
+{
+	struct test_object *obj = holder->object;
+	test_lock(&obj->lock);
+	holder_update(holder);
+	return after_holder_call(obj);
+}
+int union_write_case(struct embedded_holder *holder)
+{
+	struct test_object *obj = holder->object;
+	test_lock(&obj->lock);
+	holder->state++;
+	return after_union_write(obj);
+}
+int scalar_write_case(struct separate_holder *holder, volatile int *alias)
+{
+	struct test_object *obj = holder->object;
+	test_lock(&obj->lock);
+	*alias = 0;
+	return after_scalar_write(obj);
+}

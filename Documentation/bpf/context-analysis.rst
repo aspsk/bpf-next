@@ -286,3 +286,15 @@ function, including at most eight pointer-derived paths, and a link-wide
 budget of 262144 derived expressions. Budget exhaustion withholds complete
 summaries; retained positive facts are not an exhaustive acquisition list.
 The runtime-tag deduplication index grows with the number of emitted tags.
+
+Typed writes and captured ownership
+-----------------------------------
+
+A write into a known aggregate's ordinary storage preserves a captured lock
+when the native BTF layout proves that the written bytes contain no capability.
+This rule is limited to complete aggregate roots that are not embedded by value
+in another BTF aggregate. Pointer members do not embed their pointees. All union
+alternatives and complete capability extents count as lock storage. Unknown
+pointers, lengths, layouts, embedded roots and out-of-bounds ranges retain the
+conservative alias result. Expanding a capture here recovers its historical
+type; it never substitutes a newly loaded pointer for the captured identity.
