@@ -3171,7 +3171,7 @@ static bool witness_edge(struct acquisition_witness *guard, const struct edge *e
 		mask = right->number;
 	}
 	if (!load || load->kind != VALUE_LOAD || !load->bits || load->bits > 64 ||
-	    !load->address || load->address->has_load || load->address->has_snapshot ||
+	    !load->address || !load->address->has_arg || load->address->has_load || load->address->has_snapshot ||
 	    load->address->has_local)
 		return false;
 	if (left->kind == VALUE_AND && load->bits < 64 && (mask >> load->bits))
@@ -3302,7 +3302,7 @@ static void derive_witnesses(struct context *c, struct function *f, unsigned int
 
 /* Resolve a scalar field exactly; unions and partial/bitfield reads stay unknown. */
 static bool witness_scalar(struct context *c, unsigned int type, long long offset,
-			   unsigned int bits, unsigned int depth)
+			   unsigned int bits, unsigned long long value, unsigned int depth)
 {
 	const struct btf_type *t;
 	unsigned int i;
@@ -3311,7 +3311,8 @@ static bool witness_scalar(struct context *c, unsigned int type, long long offse
 		return false;
 	t = btf__type_by_id(c->btf, type);
 	if (btf_is_int(t) || btf_is_enum(t) || btf_is_enum64(t))
-		return !offset && bits == 8 * btf__resolve_size(c->btf, type);
+		return !offset && bits == 8 * btf__resolve_size(c->btf, type) &&
+			!(btf_is_int(t) && (btf_int_encoding(t) & BTF_INT_BOOL) && value > 1);
 	if (!btf_is_struct(t))
 		return false;
 	for (i = 0; i < btf_vlen(t); ++i) {
@@ -3320,7 +3321,7 @@ static bool witness_scalar(struct context *c, unsigned int type, long long offse
 
 		if (offset >= start && size > 0 && offset - start < size &&
 		    !(btf_member_bit_offset(t, i) % 8) && !btf_member_bitfield_size(t, i))
-			return witness_scalar(c, btf_members(t)[i].type, offset - start, bits, depth + 1);
+			return witness_scalar(c, btf_members(t)[i].type, offset - start, bits, value, depth + 1);
 	}
 	return false;
 }
@@ -3347,7 +3348,7 @@ static int emit_witnesses(struct context *c, struct function *f, unsigned int id
 
 			if (!native_expression(c, w->guard, false) ||
 			    !expression_location(c, proto, &p, &loc, 0) || *p ||
-			    !witness_scalar(c, loc.type, loc.offset, w->bits, 0))
+			    !witness_scalar(c, loc.type, loc.offset, w->bits, w->value, 0))
 				continue;
 			snprintf(guard, sizeof(guard), "bits_eq(%s,%u,%llu,%llu)",
 				 w->guard->text, w->bits, w->mask, w->value);

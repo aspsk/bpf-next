@@ -62,3 +62,20 @@ void set_guard(struct witness_task *task)
 		witness_unlock(&task->lock);
 	}
 }
+
+volatile const unsigned int fixed_flags = MASK;
+void global_guard(struct witness_task *task)
+{
+	if (!(fixed_flags & MASK)) {
+		witness_lock(&task->lock);
+		witness_unlock(&task->lock);
+	}
+}
+struct bool_task { _Bool flag; struct witness_lock lock; };
+void impossible_bool(struct bool_task *task)
+{
+	if (*(volatile unsigned char *)&task->flag & 4) {
+		witness_lock(&task->lock);
+		witness_unlock(&task->lock);
+	}
+}
