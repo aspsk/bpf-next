@@ -317,6 +317,87 @@ static void print_context_lock(struct context_printer *p, const struct btf_type 
 		printf("%s", expr);
 }
 
+
+/* Guards are scalar member addresses. Keep capability resolution unchanged. */
+static bool context_scalar_member(struct context_printer *p, struct context_location *loc,
+				  unsigned int depth)
+{
+	__u32 id = loc->type;
+	const struct btf_type *t = context_unqualified(p->btf, &id);
+	unsigned int i;
+
+	if (!t || depth > 24 || loc->offset < 0)
+		return false;
+	if (!loc->offset && (btf_is_int(t) || btf_is_enum(t) || btf_is_enum64(t)))
+		return true;
+	if (!btf_is_struct(t))
+		return false;
+	for (i = 0; i < btf_vlen(t); ++i) {
+		const struct btf_member *m = &btf_members(t)[i];
+		long long offset = btf_member_bit_offset(t, i) / 8;
+		long long size = btf__resolve_size(p->btf, m->type);
+		const char *name = btf__name_by_offset(p->btf, m->name_off);
+		char path[sizeof(loc->name)];
+		int n;
+
+		if (size <= 0 || loc->offset < offset || loc->offset - offset >= size ||
+		    btf_member_bit_offset(t, i) % 8 || btf_member_bitfield_size(t, i))
+			continue;
+		n = snprintf(path, sizeof(path), "%s%s%s", loc->name,
+			     *name ? (loc->pointer ? "->" : ".") : "", name);
+		if (n < 0 || (size_t)n >= sizeof(path))
+			return false;
+		strcpy(loc->name, path);
+		loc->type = m->type;
+		loc->offset -= offset;
+		loc->pointer = false;
+		return context_scalar_member(p, loc, depth + 1);
+	}
+	return false;
+}
+
+static void print_witness_condition(struct context_printer *p, const struct btf_type *proto,
+				    const char *condition)
+{
+	struct context_location loc = {};
+	char text[BTF_CONTEXT_TAG_MAX], *fields[3], *comma, *end;
+	const char *expr;
+	unsigned long long bits, mask, value;
+	unsigned int i;
+
+	if (!strcmp(condition, "always"))
+		return;
+	if (strncmp(condition, "bits_eq(", 8) || strlen(condition) >= sizeof(text))
+		goto raw;
+	strcpy(text, condition + 8);
+	text[strlen(text) - 1] = 0;
+	for (i = 3; i > 0; --i) {
+		comma = strrchr(text, ',');
+		if (!comma)
+			goto raw;
+		fields[i - 1] = comma + 1;
+		*comma = 0;
+	}
+	errno = 0;
+	bits = strtoull(fields[0], &end, 10);
+	if (errno || *end || !bits || bits > 64)
+		goto raw;
+	mask = strtoull(fields[1], &end, 10);
+	if (errno || *end)
+		goto raw;
+	value = strtoull(fields[2], &end, 10);
+	if (errno || *end)
+		goto raw;
+	expr = text;
+	if (!context_location(p, proto, &expr, &loc, 0) || *expr ||
+	    !context_scalar_member(p, &loc, 0))
+		goto raw;
+	printf(" when (%s & 0x%llx) == 0x%llx", loc.name, mask, value);
+	return;
+raw:
+	printf(" when %s", condition);
+}
+
 static void print_context_tag(struct context_printer *p, const struct btf_type *proto,
 			      const struct btf *btf, __u32 id)
 {
@@ -334,17 +415,31 @@ static void print_context_tag(struct context_printer *p, const struct btf_type *
 			jsonw_string_field(json_wtr, "source", tag.source);
 	}
 	switch (tag.kind) {
+	case BTF_CONTEXT_WITNESS:
 	case BTF_CONTEXT_EFFECT:
 		if (json_output) {
 			jsonw_string_field(json_wtr, "fact", tag.effect);
 			jsonw_string_field(json_wtr, "mode", tag.mode);
 			jsonw_string_field(json_wtr, "lock", tag.lock);
 			jsonw_string_field(json_wtr, "condition", tag.condition);
+			if (tag.kind == BTF_CONTEXT_WITNESS) {
+				jsonw_string_field(json_wtr, "evidence", "path");
+				jsonw_string_field(json_wtr, "via", tag.via);
+			} else if (!strcmp(tag.effect, "may_acquire")) {
+				jsonw_string_field(json_wtr, "evidence", "candidate");
+			}
 		} else {
 			printf("  %s %s %s ", tag.source, tag.effect, tag.mode);
 			print_context_lock(p, proto, tag.lock);
-			if (strcmp(tag.condition, "always"))
-				printf(" when %s", tag.condition);
+			if (tag.kind == BTF_CONTEXT_WITNESS) {
+				print_witness_condition(p, proto, tag.condition);
+				printf(" via %s", tag.via);
+			} else {
+				if (strcmp(tag.condition, "always"))
+					printf(" when %s", tag.condition);
+				if (!strcmp(tag.effect, "may_acquire"))
+					printf(" [unproven path]");
+			}
 			putchar('\n');
 		}
 		break;

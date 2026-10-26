@@ -12,6 +12,7 @@
 
 enum btf_context_kind {
 	BTF_CONTEXT_EFFECT,
+	BTF_CONTEXT_WITNESS,
 	BTF_CONTEXT_COMPLETE,
 	BTF_CONTEXT_CAPABILITY,
 	BTF_CONTEXT_REENTRANT,
@@ -21,7 +22,7 @@ enum btf_context_kind {
 
 struct btf_context_tag {
 	enum btf_context_kind kind;
-	const char *source, *effect, *mode, *lock, *condition, *capability, *token;
+	const char *source, *effect, *mode, *lock, *condition, *capability, *token, *via;
 	char storage[BTF_CONTEXT_TAG_MAX];
 };
 
@@ -69,6 +70,22 @@ static inline bool btf_context_parse_tag(const char *name, struct btf_context_ta
 		if (!*p || sep == p || (i < 4 && !sep) || (i == 4 && sep))
 			return false;
 		if (sep) { *sep = 0; p = sep + 1; }
+	}
+	if (!strcmp(fields[0], "witness")) {
+		size_t len = strlen(fields[3]);
+
+		if (strcmp(fields[1], "exclusive") && strcmp(fields[1], "shared") &&
+		    strcmp(fields[1], "generic"))
+			return false;
+		if (strcmp(fields[3], "always") &&
+		    (strncmp(fields[3], "bits_eq(", 8) || len < 12 || fields[3][len - 1] != ')'))
+			return false;
+		tag->kind = BTF_CONTEXT_WITNESS;
+		tag->source = "witnessed";
+		tag->effect = "may_acquire";
+		tag->mode = fields[1]; tag->lock = fields[2];
+		tag->condition = fields[3]; tag->via = fields[4];
+		return true;
 	}
 	if (strcmp(fields[0], "declared") && strcmp(fields[0], "derived"))
 		return false;
