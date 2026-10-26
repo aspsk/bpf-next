@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+LLVM_PLUGIN := $(llvm-plugin-y) $(clang-plugin-y)
+LLVM_PLUGINS_CFLAGS := $(strip \
+	$(addprefix -fpass-plugin=$(objtree)/scripts/llvm-plugins/, $(llvm-plugin-y)) \
+	$(addprefix -fplugin=$(objtree)/scripts/llvm-plugins/, $(clang-plugin-y))) -DLLVM_PLUGINS
+export LLVM_PLUGIN LLVM_PLUGINS_CFLAGS
+
+KBUILD_CFLAGS += $(LLVM_PLUGINS_CFLAGS)
