@@ -4001,6 +4001,8 @@ static inline bool pmd_ptlock_init(struct ptdesc *ptdesc) { return true; }
 #endif
 
 static inline spinlock_t *pmd_lock(struct mm_struct *mm, pmd_t *pmd)
+	__acquires(pmd_lockptr(mm, pmd))
+	__returns_ctx_lock(pmd_lockptr(mm, pmd))
 {
 	spinlock_t *ptl = pmd_lockptr(mm, pmd);
 	spin_lock(ptl);
