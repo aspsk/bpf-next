@@ -6,6 +6,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Config/llvm-config.h"
@@ -55,6 +56,14 @@ static bool symbolName(StringRef S)
 		return (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') ||
 			(C >= '0' && C <= '9') || C == '_' || C == '.' || C == '$';
 	});
+}
+
+static std::string signature(const FunctionType *Type)
+{
+	std::string Text;
+	raw_string_ostream OS(Text);
+	Type->print(OS);
+	return Text;
 }
 
 static std::string add(std::string Base, int64_t Offset)
@@ -111,9 +120,47 @@ static bool localRegisterAsm(StringRef Text)
 static bool preservesOwnershipAsm(const CallBase &Call)
 {
 	const auto *Asm = dyn_cast<InlineAsm>(Call.getCalledOperand());
-	if (!Asm || !isa<CallInst>(Call))
+	if (!Asm)
 		return false;
 	StringRef Text = StringRef(Asm->getAsmString()).trim();
+	if (const auto *Goto = dyn_cast<CallBrInst>(&Call)) {
+		std::string Compact;
+		for (unsigned char C : Text)
+			if (C != ' ' && C != '\t' && C != '\r' && C != '\n')
+				Compact.push_back(C);
+		StringRef Body(Compact);
+		StringRef Table = ".pushsection__jump_table,\"aw\".align3.long1b-.,${1:l}-..quad${0:c}-..popsection";
+
+		/* Only the native ARM64 nop/branch and its exact data-only jump
+		 * table are accepted. Both successors retain ownership.
+		 */
+		if (Triple(Call.getModule()->getTargetTriple()).isAArch64() &&
+		    Goto->getNumIndirectDests() == 1 && Call.arg_size() == 1 &&
+		    Call.getType()->isVoidTy() && Asm->getConstraintString() == "i,!i") {
+			if (Body.consume_front("1:nop") || Body.consume_front("1:b${1:l}"))
+				return Body == Table;
+		}
+		if (Triple(Call.getModule()->getTargetTriple()).getArch() == Triple::x86_64 &&
+		    Goto->getNumIndirectDests() == 1 && Call.arg_size() == 2 &&
+		    Call.getType()->isVoidTy() &&
+		    Asm->getConstraintString() == "i,i,!i,~{dirflag},~{fpsr},~{flags}") {
+			bool Hack = Body.consume_front("1:jmp${2:l}#objtoolNOPsthis");
+			if (!Hack && !Body.consume_front("1:jmp${2:l}") &&
+			    !Body.consume_front("1:.byte0x0f,0x1f,0x44,0x00,0x00"))
+				return false;
+			if (!Body.consume_front(".pushsection__jump_table,\"aw\".balign8"))
+				return false;
+			Body.consume_front("912:.pushsection.discard.annotate_data,\"M\",@progbits,8;.long912b-.,1;.popsection");
+			if (!Body.consume_front(".long1b-..long${2:l}-..quad${0:c}+${1:c}"))
+				return false;
+			if (Hack && !Body.consume_front("+2"))
+				return false;
+			return Body == "-..popsection";
+		}
+		return false;
+	}
+	if (!isa<CallInst>(Call))
+		return false;
 	if (Text.empty())
 		return true;
 	Triple Target(Call.getModule()->getTargetTriple());
@@ -131,6 +178,11 @@ static bool preservesOwnershipAsm(const CallBase &Call)
 	    (Text == "lfence" || Text == "sfence" || Text == "mfence") &&
 	    Asm->getConstraintString() == "~{memory},~{dirflag},~{fpsr},~{flags}")
 		return true;
+	if (Target.getArch() == Triple::x86_64 && Call.arg_size() == 1 &&
+	    Call.getType()->isIntegerTy(64) &&
+	    Text == "movq %gs:${1:a}, $0" &&
+	    Asm->getConstraintString() == "=r,i,~{dirflag},~{fpsr},~{flags}")
+		return true;
 	return false;
 }
 
@@ -144,6 +196,43 @@ struct AssemblyReferences {
 
 	void collect(StringRef Text)
 	{
+		std::string Clean = Text.str();
+		/* The exact LSM null trampoline defines a dispatch endpoint. It
+		 * does not introduce an unseen caller of that endpoint. Keep any
+		 * other reference to the symbol visible to escape analysis.
+		 */
+		for (size_t Search = 0, Start; (Start = Clean.find(".pushsection .static_call.text", Search)) != std::string::npos;) {
+			size_t End = Start, Depth = 0;
+			do {
+				size_t Push = Clean.find(".pushsection", End), Pop = Clean.find(".popsection", End);
+				if (Pop == std::string::npos) { End = Clean.size(); break; }
+				if (Push < Pop) { ++Depth; End = Push + 12; }
+				else { --Depth; End = Pop + 11; }
+			} while (Depth);
+			StringRef Raw = StringRef(Clean).slice(Start, End);
+			StringRef Name = Raw.split(".globl").second.trim().take_while([](unsigned char C) {
+				return llvm::isAlnum(C) || C == '_';
+			});
+			std::string Compact;
+			for (unsigned char C : Raw)
+				if (!llvm::isSpace(C)) Compact.push_back(C);
+			std::string Prefix = ".pushsection.static_call.text,\"ax\".align4.globl" + Name.str() + Name.str() + ":";
+			std::string Suffix = ".byte0x0f,0xb9,0xcc.type" + Name.str() + ",@function.size" + Name.str() + ",.-" + Name.str() + ".popsection";
+			StringRef Body(Compact);
+			bool Known = Name.starts_with("__SCT__lsm_static_call_") && Body.consume_front(Prefix);
+			if (Known) {
+				Body.consume_front("911:.pushsection.discard.annotate_insn,\"M\",@progbits,8;.long911b-.,1;.popsection");
+				if (Body.consume_front("ret;int3;nop;nop;nop"))
+					Known = Body == Suffix;
+				else if (Body.consume_front("jmp__x86_return_thunk")) {
+					Known = Body == Suffix;
+					if (Known) Symbols.insert("__x86_return_thunk");
+				} else Known = false;
+			}
+			if (Known) Clean.erase(Start, End - Start);
+			else Search = End;
+		}
+		Text = Clean;
 		std::string Directives;
 		for (unsigned char C : Text)
 			if (C != ' ' && C != '\t' && C != '\r' && C != '\n')
@@ -413,8 +502,254 @@ static json::Array contracts(const json::Object *F, bool &Complete)
 	return Out;
 }
 
+/* Recover the framework's actual callback registration and static-call keys.
+ * This describes executable call edges, never locking contracts by hook name.
+ */
+class NativeDispatch {
+	const DataLayout &DL;
+	struct Binding {
+		std::string Holder, Target, Table;
+		uint64_t Address, Offset, Size;
+	};
+	struct Key { std::string Name, Table; uint64_t Offset, Address, Size; int64_t Trampoline; bool Closed; };
+	std::vector<Binding> Bindings;
+	std::vector<Key> Keys;
+	SmallPtrSet<const GlobalVariable *, 8> RegistrationGlobals;
+
+	const GlobalVariable *baseGlobal(const Value *V, int64_t &Offset) const
+	{
+		const Value *Base = GetPointerBaseWithConstantOffset(V, Offset, DL);
+		return dyn_cast<GlobalVariable>(Base->stripPointerCasts());
+	}
+
+	void registration(const Constant *C, const GlobalVariable &GV, uint64_t Offset)
+	{
+		if (const auto *S = dyn_cast<ConstantStruct>(C)) {
+			auto *Type = S->getType();
+			const auto *Layout = DL.getStructLayout(Type);
+
+			if (Type->hasName() && Type->getName() == "struct.security_hook_list") {
+				const Function *Target = nullptr;
+				const GlobalVariable *Table = nullptr;
+				uint64_t Address = 0, Field = 0;
+				for (unsigned I = 0; I < S->getNumOperands(); ++I) {
+					const Value *V = S->getOperand(I)->stripPointerCasts();
+					if (const auto *U = dyn_cast<ConstantStruct>(V))
+						if (U->getNumOperands() == 1)
+							V = U->getOperand(0)->stripPointerCasts();
+					if (const auto *F = dyn_cast<Function>(V)) {
+						if (Target) return;
+						Target = F;
+						Address = Offset + Layout->getElementOffset(I);
+					} else if (V->getType()->isPointerTy()) {
+						int64_t N = 0;
+						if (const auto *G = baseGlobal(V, N))
+							if (G->getName() == "static_calls_table" && N >= 0) {
+								if (Table) return;
+								Table = G;
+								Field = N;
+							}
+					}
+				}
+				if (Target && Table && symbolName(Target->getName()) && symbolName(GV.getName())) {
+					Bindings.push_back({GV.getName().str(), Target->getName().str(), Table->getName().str(), Address, Field, DL.getTypeAllocSize(GV.getValueType())});
+					RegistrationGlobals.insert(&GV);
+				}
+				return;
+			}
+			for (unsigned I = 0; I < S->getNumOperands(); ++I)
+				registration(cast<Constant>(S->getOperand(I)), GV, Offset + Layout->getElementOffset(I));
+		} else if (const auto *A = dyn_cast<ConstantArray>(C)) {
+			uint64_t Size = DL.getTypeAllocSize(A->getType()->getElementType());
+			for (unsigned I = 0; I < A->getNumOperands(); ++I)
+				registration(cast<Constant>(A->getOperand(I)), GV, Offset + I * Size);
+		}
+	}
+
+	bool keyUses(const Value *V, SmallPtrSetImpl<const Value *> &Seen) const
+	{
+		if (!Seen.insert(V).second)
+			return true;
+		for (const User *U : V->users()) {
+			if (const auto *G = dyn_cast<GlobalVariable>(U)) {
+				if (G->getName() == "static_calls_table" || G->getName() == "llvm.compiler.used")
+					continue;
+				if (G->getSection() == ".discard.addressable" && G->hasInitializer() &&
+				    G->getInitializer()->stripPointerCasts() == V &&
+				    llvm::all_of(G->users(), [](const User *Use) {
+					if (const auto *A = dyn_cast<ConstantArray>(Use))
+						return llvm::all_of(A->users(), [](const User *P) {
+							const auto *Used = dyn_cast<GlobalVariable>(P);
+							return Used && Used->getName() == "llvm.compiler.used";
+						});
+					return false;
+				    }))
+					continue;
+				return false;
+			}
+			if (const auto *L = dyn_cast<LoadInst>(U)) {
+				if (L->getPointerOperand() != V)
+					return false;
+				for (const User *ValueUse : L->users()) {
+					if (const auto *Call = dyn_cast<CallBase>(ValueUse)) {
+						if (Call->getCalledOperand() == L && llvm::none_of(Call->args(),
+							[&](const Use &A) { return A.get() == L; }))
+							continue;
+					} else if (const auto *Cmp = dyn_cast<ICmpInst>(ValueUse)) {
+						if (Cmp->isEquality() && (isa<ConstantPointerNull>(Cmp->getOperand(0)) ||
+						    isa<ConstantPointerNull>(Cmp->getOperand(1))))
+							continue;
+					}
+					return false;
+				}
+				continue;
+			}
+			if (!isa<Constant>(U) || !keyUses(U, Seen))
+				return false;
+		}
+		return true;
+	}
+
+	void keys(const Constant *C, const GlobalVariable &Table, uint64_t Field, uint64_t Address,
+		  int64_t Trampoline = -1)
+	{
+		const Value *V = C->stripPointerCasts();
+		if (const auto *G = dyn_cast<GlobalVariable>(V)) {
+			SmallPtrSet<const Value *, 16> Seen;
+
+			if (G->getName().starts_with("__SCK__lsm_static_call_"))
+				Keys.push_back({G->getName().str(), Table.getName().str(), Field, Address,
+					DL.getTypeAllocSize(Table.getValueType()), Trampoline, keyUses(G, Seen)});
+			return;
+		}
+		if (const auto *S = dyn_cast<ConstantStruct>(C)) {
+			const auto *Layout = DL.getStructLayout(S->getType());
+			const GlobalVariable *Key = nullptr;
+			for (const Use &U : S->operands())
+				if (const auto *G = dyn_cast<GlobalVariable>(U->stripPointerCasts()))
+					if (G->getName().starts_with("__SCK__lsm_static_call_")) Key = G;
+			if (Key)
+				for (unsigned I = 0; I < S->getNumOperands(); ++I)
+					if (const auto *F = dyn_cast<Function>(S->getOperand(I)->stripPointerCasts()))
+						if (F->getName() == "__SCT__" + Key->getName().drop_front(7).str())
+							Trampoline = Address + Layout->getElementOffset(I);
+			for (unsigned I = 0; I < S->getNumOperands(); ++I)
+				keys(cast<Constant>(S->getOperand(I)), Table, Field, Address + Layout->getElementOffset(I), Trampoline);
+		} else if (const auto *A = dyn_cast<ConstantArray>(C)) {
+			uint64_t Size = DL.getTypeAllocSize(A->getType()->getElementType());
+			for (unsigned I = 0; I < A->getNumOperands(); ++I)
+				keys(cast<Constant>(A->getOperand(I)), Table, Field, Address + I * Size);
+		}
+	}
+
+	unsigned functionReferences(const Constant *C, const Function &F, unsigned Depth = 0) const
+	{
+		if (Depth > 24)
+			return 1000000;
+		if (C->stripPointerCasts() == &F)
+			return 1;
+		if (isa<GlobalValue>(C))
+			return 0;
+		unsigned Count = 0;
+		for (const Use &U : C->operands())
+			if (const auto *Child = dyn_cast<Constant>(U.get()))
+				Count += functionReferences(Child, F, Depth + 1);
+		return Count;
+	}
+
+public:
+	explicit NativeDispatch(Module &M) : DL(M.getDataLayout())
+	{
+		for (const GlobalVariable &GV : M.globals()) {
+			if (!GV.hasInitializer())
+				continue;
+			registration(GV.getInitializer(), GV, 0);
+			if (GV.getName() == "static_calls_table")
+				if (const auto *S = dyn_cast<ConstantStruct>(GV.getInitializer())) {
+					const auto *Layout = DL.getStructLayout(S->getType());
+					for (unsigned I = 0; I < S->getNumOperands(); ++I)
+						keys(cast<Constant>(S->getOperand(I)), GV, Layout->getElementOffset(I), Layout->getElementOffset(I));
+				}
+		}
+	}
+
+	std::string key(const CallBase &Call) const
+	{
+		const Value *V = Call.getCalledOperand()->stripPointerCasts();
+		if (const auto *L = dyn_cast<LoadInst>(V)) {
+			int64_t Offset = 0;
+			if (const auto *G = baseGlobal(L->getPointerOperand(), Offset))
+				if (!Offset && G->getName().starts_with("__SCK__lsm_static_call_"))
+					return G->getName().str();
+		}
+		if (const auto *F = dyn_cast<Function>(V)) {
+			StringRef Name = F->getName();
+			if (Name.consume_front("__SCT__lsm_static_call_"))
+				return "__SCK__lsm_static_call_" + Name.str();
+		}
+		return "";
+	}
+
+	bool registeredOnly(const Function &F, const Value *V, SmallPtrSetImpl<const Value *> &Seen) const
+	{
+		if (!Seen.insert(V).second)
+			return true;
+		for (const User *U : V->users()) {
+			if (const auto *C = dyn_cast<CallBase>(U)) {
+				if (C->getCalledOperand() == V && llvm::none_of(C->args(),
+					[&](const Use &Arg) { return Arg.get() == V; }))
+					continue;
+				return false;
+			}
+			if (const auto *G = dyn_cast<GlobalVariable>(U)) {
+				if (RegistrationGlobals.contains(G)) {
+					unsigned Count = 0;
+					for (const auto &B : Bindings)
+						Count += B.Holder == G->getName() && B.Target == F.getName();
+					if (Count && G->hasInitializer() && functionReferences(G->getInitializer(), F) == Count)
+						continue;
+				}
+				if (G->getName() == "llvm.used" || G->getName() == "llvm.compiler.used")
+					continue;
+				return false;
+			}
+			if (!isa<Constant>(U) || !registeredOnly(F, U, Seen))
+				return false;
+		}
+		return true;
+	}
+
+	void validateAssembly(const AssemblyReferences &Assembly)
+	{
+		for (auto &K : Keys) {
+			StringRef Name(K.Name);
+			Name.consume_front("__SCK__");
+			K.Closed &= !Assembly.Opaque && !Assembly.Symbols.contains(K.Name) &&
+				!Assembly.Symbols.contains("__SCT__" + Name.str());
+		}
+	}
+
+	json::Array bindings() const
+	{
+		json::Array Out;
+		for (const auto &B : Bindings)
+			Out.push_back(json::Object{{"holder", B.Holder}, {"target", B.Target},
+				{"address", B.Address}, {"table", B.Table}, {"offset", B.Offset}, {"size", B.Size}});
+		return Out;
+	}
+	json::Array keys() const
+	{
+		json::Array Out;
+		for (const auto &K : Keys)
+			Out.push_back(json::Object{{"name", K.Name}, {"table", K.Table}, {"offset", K.Offset},
+				{"address", K.Address}, {"size", K.Size}, {"trampoline_address", K.Trampoline}, {"closed", K.Closed}});
+		return Out;
+	}
+};
+
 class DescribeModule {
 	const DataLayout &DL;
+	const NativeDispatch &Dispatch;
 	DenseMap<const Function *, unsigned> Functions;
 	DenseMap<const CallBase *, unsigned> Calls;
 	DenseMap<const BasicBlock *, unsigned> Blocks;
@@ -614,7 +949,8 @@ class DescribeModule {
 	}
 
 public:
-	explicit DescribeModule(Module &M, const json::Array *TokenDecls) : DL(M.getDataLayout())
+	explicit DescribeModule(Module &M, const json::Array *TokenDecls, const NativeDispatch &Dispatch)
+		: DL(M.getDataLayout()), Dispatch(Dispatch)
 	{
 		if (TokenDecls)
 			for (const auto &V : *TokenDecls)
@@ -735,6 +1071,7 @@ public:
 					Args.push_back(expression(A.get()));
 				Sites.push_back(json::Object{{"id", Calls.lookup(C)},
 					{"callee", Callee ? static_cast<int64_t>(Functions.lookup(Callee)) : -1},
+					{"dispatch_key", Dispatch.key(*C)}, {"signature", signature(C->getFunctionType())},
 					{"witness_prefix_safe", WitnessPrefixSafe && !WitnessUnvalidatedRead}, {"arguments", std::move(Args)}});
 				if (C->getType()->isPointerTy()) {
 					expression(C);
@@ -774,6 +1111,7 @@ public:
 		return json::Object{{"id", Functions.lookup(&F)}, {"symbol", F.getName().str()},
 			{"local", F.hasLocalLinkage()}, {"weak", F.isWeakForLinker()},
 			{"defined", !F.isDeclaration()}, {"escaped", addressEscapes(F, &F, AddressUses)},
+			{"signature", signature(F.getFunctionType())},
 			{"covered", Covered}, {"complete", Complete}, {"nargs", F.arg_size()},
 			{"contract_complete", ContractComplete},
 			{"memory_covered", MemoryCovered}, {"witness_covered", MemoryCovered},
@@ -830,11 +1168,16 @@ public:
 				PromoteMemToReg(Allocas, DT);
 		}
 		resolveCallSelectors(*Copy);
-		DescribeModule Describe(*Copy, AST.getArray("tokens"));
+		NativeDispatch Dispatch(*Copy);
+		DescribeModule Describe(*Copy, AST.getArray("tokens"), Dispatch);
 		json::Array Functions;
 		AssemblyReferences Assembly(*Copy);
+		Dispatch.validateAssembly(Assembly);
 		for (Function &F : *Copy) {
 			auto Record = Describe.function(F, Decls[F.getName().str()], Covered);
+			SmallPtrSet<const Value *, 16> RegistrationUses;
+			if (Dispatch.registeredOnly(F, &F, RegistrationUses))
+				Record["escaped"] = false;
 			Record["asm_referenced"] = Assembly.references(F);
 			Record["asm_opaque"] = Assembly.Opaque;
 			if (Assembly.references(F))
@@ -848,7 +1191,8 @@ public:
 			Types = std::move(*T);
 		json::Object Out{{"format", BPF_CONTEXT_FORMAT}, {"version", BPF_CONTEXT_VERSION},
 			{"unit", M.getSourceFileName()}, {"functions", std::move(Functions)},
-			{"types", std::move(Types)}, {"tokens", std::move(Tokens)}};
+			{"types", std::move(Types)}, {"tokens", std::move(Tokens)},
+			{"dispatch_bindings", Dispatch.bindings()}, {"dispatch_keys", Dispatch.keys()}};
 		std::string Data;
 		raw_string_ostream OS(Data);
 		OS << json::Value(std::move(Out));

@@ -66,6 +66,9 @@ struct substitution {
 };
 
 struct site {
+	char *dispatch_key, *signature;
+	struct function **dispatch_targets;
+	unsigned int nr_dispatch_targets;
 	unsigned int id;
 	int reference;
 	struct function *callee, *caller;
@@ -130,7 +133,7 @@ struct acquisition_witness {
 
 struct function {
 	struct cj_doc *doc;
-	char *name;
+	char *name, *signature;
 	unsigned int id, nargs, nr_blocks, nr_sites, native_proto;
 	bool local, weak, defined, live, escaped, covered, raw_complete, complete;
 	bool entry_closed;
@@ -173,7 +176,22 @@ struct emitted_tag {
 
 struct entry_reference {
 	char *target, *caller;
-	bool call;
+	bool call, code, dispatch, dispatch_metadata;
+	unsigned int source_section;
+	unsigned long long source_address;
+};
+
+struct dispatch_binding {
+	char *holder, *target, *table;
+	unsigned long long address, offset, size;
+};
+
+struct dispatch_key {
+	char *name, *table;
+	unsigned long long offset, address, size;
+	long long trampoline_address;
+	unsigned int nr_sites;
+	bool closed, resolved;
 };
 
 struct context_token {
@@ -186,6 +204,9 @@ struct context_token {
 struct context {
 	struct function *functions;
 	unsigned int nr_functions;
+	struct dispatch_binding *dispatch_bindings;
+	struct dispatch_key *dispatch_keys;
+	unsigned int nr_dispatch_bindings, nr_dispatch_keys;
 	struct document *documents;
 	struct name_id *names, *btf_names, *elf_names;
 	struct entry_reference *entry_references;
@@ -913,10 +934,38 @@ static int read_document(struct context *c, const char *data, size_t len)
 	    !cj_equal(d, cj_get(d, root, "format"), BPF_CONTEXT_FORMAT) ||
 	    (cj_number(d, cj_get(d, root, "version"), -1) != BPF_CONTEXT_VERSION &&
 	     cj_number(d, cj_get(d, root, "version"), -1) != 2 &&
-	     cj_number(d, cj_get(d, root, "version"), -1) != 3))
+	     cj_number(d, cj_get(d, root, "version"), -1) != 3 &&
+	     cj_number(d, cj_get(d, root, "version"), -1) != 4))
 		return -EINVAL;
 	if (read_tokens(c, d, cj_get(d, root, "tokens")))
 		return -EINVAL;
+	array = cj_get(d, root, "dispatch_bindings");
+	cj_each(d, array, i) {
+		struct dispatch_binding b = {
+			.holder = string_field(d, i, "holder"), .target = string_field(d, i, "target"),
+			.table = string_field(d, i, "table"),
+			.address = cj_number(d, cj_get(d, i, "address"), 0),
+			.offset = cj_number(d, cj_get(d, i, "offset"), 0),
+			.size = cj_number(d, cj_get(d, i, "size"), 0),
+		};
+
+		c->dispatch_bindings = resize(c->dispatch_bindings, c->nr_dispatch_bindings + 1, sizeof(b));
+		c->dispatch_bindings[c->nr_dispatch_bindings++] = b;
+	}
+	array = cj_get(d, root, "dispatch_keys");
+	cj_each(d, array, i) {
+		struct dispatch_key k = {
+			.name = string_field(d, i, "name"), .table = string_field(d, i, "table"),
+			.offset = cj_number(d, cj_get(d, i, "offset"), 0),
+			.address = cj_number(d, cj_get(d, i, "address"), 0),
+			.size = cj_number(d, cj_get(d, i, "size"), 0),
+			.closed = cj_bool(d, cj_get(d, i, "closed")),
+			.trampoline_address = cj_number(d, cj_get(d, i, "trampoline_address"), -1),
+		};
+
+		c->dispatch_keys = resize(c->dispatch_keys, c->nr_dispatch_keys + 1, sizeof(k));
+		c->dispatch_keys[c->nr_dispatch_keys++] = k;
+	}
 	array = cj_get(d, root, "functions");
 	if (!array || d->tokens[array].kind != '[')
 		return -EINVAL;
@@ -935,6 +984,7 @@ static int read_document(struct context *c, const char *data, size_t len)
 		f->doc = d;
 		f->id = id;
 		f->name = string_field(d, i, "symbol");
+		f->signature = cj_get(d, i, "signature") ? string_field(d, i, "signature") : copy_string("");
 		f->nargs = cj_number(d, cj_get(d, i, "nargs"), 0);
 		f->local = cj_bool(d, cj_get(d, i, "local"));
 		f->weak = cj_bool(d, cj_get(d, i, "weak"));
@@ -999,6 +1049,8 @@ static int read_document(struct context *c, const char *data, size_t len)
 				unsigned int args = cj_get(d, s, "arguments"), arg, j = 0;
 
 				site->id = cj_number(d, cj_get(d, s, "id"), UINT_MAX);
+				site->dispatch_key = cj_get(d, s, "dispatch_key") ? string_field(d, s, "dispatch_key") : copy_string("");
+				site->signature = cj_get(d, s, "signature") ? string_field(d, s, "signature") : copy_string("");
 				site->witness_prefix_safe = cj_bool(d, cj_get(d, s, "witness_prefix_safe"));
 				site->reference = cj_number(d, cj_get(d, s, "callee"), -1);
 				site->write = cj_equal(d, cj_get(d, s, "kind"), "write");
@@ -1054,6 +1106,44 @@ static const struct name_id *address_function(struct name_id *v, unsigned int n,
 	return &v[lo - 1];
 }
 
+struct native_range {
+	unsigned long long start, end;
+	unsigned int section;
+	bool valid;
+};
+
+static bool metadata_bound(const char *name)
+{
+	return name && (!strcmp(name, "__start___jump_table") || !strcmp(name, "__stop___jump_table") ||
+		!strcmp(name, "__start_static_call_sites") || !strcmp(name, "__stop_static_call_sites") ||
+		!strcmp(name, "__start_mcount_loc") || !strcmp(name, "__stop_mcount_loc"));
+}
+
+static struct native_range native_range(struct context *c, const char *begin, const char *end)
+{
+	const struct name_id *a = NULL, *b = NULL;
+	unsigned int i;
+
+	for (i = 0; i < c->nr_elf_names; ++i) {
+		if (!strcmp(c->elf_names[i].name, begin)) {
+			if (a) return (struct native_range){};
+			a = &c->elf_names[i];
+		}
+		if (!strcmp(c->elf_names[i].name, end)) {
+			if (b) return (struct native_range){};
+			b = &c->elf_names[i];
+		}
+	}
+	if (!a || !b || a->section != b->section || a->address >= b->address)
+		return (struct native_range){};
+	return (struct native_range){ a->address, b->address, a->section, true };
+}
+
+static bool in_native_range(struct native_range range, unsigned int section, unsigned long long address)
+{
+	return range.valid && section == range.section && address >= range.start && address < range.end;
+}
+
 /* Retained allocated relocations expose direct callers and address uses,
  * including references from assembler objects which have no IR document.
  */
@@ -1063,6 +1153,9 @@ static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
 	unsigned int i, n = 0;
 	GElf_Ehdr ehdr;
 	Elf_Scn *scn = NULL;
+	struct native_range jumps = native_range(c, "__start___jump_table", "__stop___jump_table");
+	struct native_range statics = native_range(c, "__start_static_call_sites", "__stop_static_call_sites");
+	struct native_range mcount = native_range(c, "__start_mcount_loc", "__stop_mcount_loc");
 
 	if (!gelf_getehdr(elf, &ehdr)) {
 		free(functions);
@@ -1090,6 +1183,8 @@ static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
 		section = elf_strptr(elf, strings, owner_sh.sh_name);
 		if (!section || !strcmp(section, "__patchable_function_entries") ||
 		    !strcmp(section, "__mcount_loc") || !strcmp(section, ".eh_frame") ||
+		    !strcmp(section, ".discard.addressable") ||
+		    !strcmp(section, "__jump_table") ||
 		    !strcmp(section, ".eh_frame_hdr") || !strncmp(section, ".orc_unwind", 11))
 			continue;
 		if ((owner_sh.sh_flags & SHF_EXECINSTR) && c->native_reference_contract)
@@ -1106,13 +1201,33 @@ static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
 			const char *name;
 			unsigned int type;
 			unsigned long long offset;
-			bool call = false;
+			unsigned long long static_offset;
+			bool static_site;
+			bool call = false, dispatch = false;
+			bool dispatch_metadata = false;
+			unsigned int source_section = sh.sh_info;
+			unsigned long long source_address;
+			char dispatch_name[MAX_EXPR];
 
 			if (!gelf_getrela(relocs, i, &rel) ||
 			    !gelf_getsym(symbols, GELF_R_SYM(rel.r_info), &sym))
 				continue;
 			type = GELF_R_TYPE(rel.r_info);
+			source_address = rel.r_offset;
 			offset = rel.r_offset - owner_sh.sh_addr;
+			if (in_native_range(jumps, sh.sh_info, rel.r_offset) ||
+			    in_native_range(mcount, sh.sh_info, rel.r_offset))
+				continue;
+			static_site = !strcmp(section, ".static_call_sites") ||
+				in_native_range(statics, sh.sh_info, rel.r_offset);
+			static_offset = in_native_range(statics, sh.sh_info, rel.r_offset) ?
+				rel.r_offset - statics.start : offset;
+			/* Objtool records instruction addresses, not function entries.
+			 * The paired key relocation is validated below as a dispatch use.
+			 */
+			if (ehdr.e_machine == EM_X86_64 && static_site &&
+			    static_offset % 8 == 0 && type == R_X86_64_PC32)
+				continue;
 			if (owner_sh.sh_flags & SHF_EXECINSTR) {
 				if (ehdr.e_machine == EM_AARCH64)
 					call = type == R_AARCH64_CALL26 || type == R_AARCH64_JUMP26;
@@ -1124,8 +1239,18 @@ static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
 					call = opcode == 0xe8 || opcode == 0xe9;
 				}
 			}
-			if (GELF_ST_TYPE(sym.st_info) == STT_FUNC) {
+			if (GELF_ST_TYPE(sym.st_info) == STT_FUNC || GELF_ST_TYPE(sym.st_info) == STT_OBJECT) {
 				name = elf_strptr(elf, symbols_sh.sh_link, sym.st_name);
+				if (name && !strncmp(name, "__SCK__lsm_static_call_", sizeof("__SCK__lsm_static_call_") - 1))
+					dispatch = true;
+				else if (name && !strncmp(name, "__SCT__lsm_static_call_", sizeof("__SCT__lsm_static_call_") - 1)) {
+					if (snprintf(dispatch_name, sizeof(dispatch_name), "__SCK__%s", name + 7) >= MAX_EXPR)
+						continue;
+					name = dispatch_name;
+					dispatch = true;
+				} else if (GELF_ST_TYPE(sym.st_info) != STT_FUNC) {
+					continue;
+				}
 			} else if (GELF_ST_TYPE(sym.st_info) == STT_SECTION) {
 				unsigned long long address = sym.st_value + rel.r_addend;
 
@@ -1140,8 +1265,31 @@ static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
 			}
 			if (!name || !*name)
 				continue;
-			owner = call ? address_function(functions, n, sh.sh_info,
+			owner = (owner_sh.sh_flags & SHF_EXECINSTR) ? address_function(functions, n, sh.sh_info,
 						       rel.r_offset) : NULL;
+			if (dispatch && ehdr.e_machine == EM_X86_64 &&
+			    static_site && i &&
+			    static_offset % 8 == 4 && type == R_X86_64_PC32 &&
+			    rel.r_addend >= 0 && rel.r_addend <= 3) {
+				GElf_Rela site;
+				GElf_Sym code;
+				GElf_Shdr text;
+
+				if (gelf_getrela(relocs, i - 1, &site) &&
+				    site.r_offset + 4 == rel.r_offset &&
+				    GELF_R_TYPE(site.r_info) == R_X86_64_PC32 &&
+				    gelf_getsym(symbols, GELF_R_SYM(site.r_info), &code) &&
+				    code.st_shndx < SHN_LORESERVE &&
+				    gelf_getshdr(elf_getscn(elf, code.st_shndx), &text) &&
+				    (text.sh_flags & SHF_EXECINSTR)) {
+					unsigned long long address = code.st_value + site.r_addend;
+
+					owner = address_function(functions, n, code.st_shndx, address);
+					source_section = code.st_shndx;
+					source_address = address + 1; /* native rel32 operand */
+					dispatch_metadata = owner != NULL;
+				}
+			}
 			if (c->nr_entry_references == c->entry_reference_capacity) {
 				if (c->entry_reference_capacity > UINT_MAX / 2) {
 					free(functions);
@@ -1154,7 +1302,10 @@ static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
 							     sizeof(*c->entry_references));
 			}
 			c->entry_references[c->nr_entry_references++] = (struct entry_reference){
-				copy_string(name), copy_string(owner ? owner->name : ""), call };
+				.target = copy_string(name), .caller = copy_string(owner ? owner->name : ""),
+				.call = call, .code = !!(owner_sh.sh_flags & SHF_EXECINSTR) || dispatch_metadata,
+				.dispatch = dispatch, .dispatch_metadata = dispatch_metadata,
+				.source_section = source_section, .source_address = source_address };
 		}
 	}
 	free(functions);
@@ -1218,7 +1369,8 @@ static int collect_elf(struct context *c, const char *path)
 				    sym.st_shndx == SHN_ABS && sym.st_value == 1)
 					c->native_reference_contract = true;
 				kind = GELF_ST_TYPE(sym.st_info);
-				if (sym.st_shndx == SHN_UNDEF || (kind != STT_FUNC && kind != STT_OBJECT))
+				if (sym.st_shndx == SHN_UNDEF ||
+				    (kind != STT_FUNC && kind != STT_OBJECT && !metadata_bound(name)))
 					continue;
 				name = elf_strptr(elf, sh.sh_link, sym.st_name);
 				if (!name || !*name)
@@ -1292,6 +1444,8 @@ static void resolve_functions(struct context *c)
 				struct site *s = &f->blocks[j].sites[k];
 
 				s->caller = f;
+				if (*s->dispatch_key)
+					continue;
 				if (s->reference >= 0 && (unsigned int)s->reference < f->doc->nr_functions) {
 					struct function *ref = &c->functions[f->doc->functions[s->reference]];
 
@@ -1309,6 +1463,199 @@ static void resolve_functions(struct context *c)
 				}
 			}
 	}
+}
+
+static const struct name_id *dispatch_holder(struct context *c, const struct dispatch_binding *b)
+{
+	unsigned int end, start = name_range(c->elf_names, c->nr_elf_names, b->holder, &end);
+	const struct name_id *holder = NULL;
+
+	for (; start < end; ++start) {
+		const struct name_id *p = &c->elf_names[start];
+
+		if ((p->id & 255) != STT_OBJECT || p->size != b->size)
+			continue;
+		if (holder)
+			return NULL;
+		holder = p;
+	}
+	return holder && b->address < holder->size ? holder : NULL;
+}
+
+static bool registered_reference(struct context *c, const struct entry_reference *ref)
+{
+	unsigned int i;
+
+	for (i = 0; i < c->nr_dispatch_bindings; ++i) {
+		const struct dispatch_binding *b = &c->dispatch_bindings[i];
+		const struct name_id *holder;
+
+		if (strcmp(ref->target, b->target) || !(holder = dispatch_holder(c, b)))
+			continue;
+		if (holder->section == ref->source_section &&
+		    ref->source_address == holder->address + b->address) {
+			unsigned int k, matched = 0;
+
+			/* A registration can close an address escape only if every
+			 * corresponding dispatcher has been represented. Otherwise a
+			 * direct locked caller could hide an unmodelled unlocked one.
+			 */
+			for (k = 0; k < c->nr_dispatch_keys; ++k) {
+				const struct dispatch_key *key = &c->dispatch_keys[k];
+
+				if (strcmp(key->table, b->table) || key->offset != b->offset)
+					continue;
+				if (!key->resolved || !key->nr_sites)
+					return false;
+				++matched;
+			}
+			return matched != 0;
+		}
+	}
+	return false;
+}
+
+static bool dispatch_key_closed(struct context *c, const struct dispatch_key *key)
+{
+	unsigned int r, low = 0, high = c->nr_entry_references;
+
+	if (!key->closed)
+		return false;
+	while (low < high) {
+		unsigned int mid = low + (high - low) / 2;
+
+		if (strcmp(c->entry_references[mid].target, key->name) < 0)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+	for (r = low; r < c->nr_entry_references &&
+	     !strcmp(c->entry_references[r].target, key->name); ++r) {
+		const struct entry_reference *ref = &c->entry_references[r];
+		unsigned int end, start;
+		bool found = false;
+
+		if (!ref->dispatch || strcmp(ref->target, key->name))
+			continue;
+		if (!ref->code) {
+			struct dispatch_binding holder_key = { .holder = key->table,
+				.size = key->size, .address = key->address };
+			const struct name_id *holder = dispatch_holder(c, &holder_key);
+
+			if (!holder || holder->section != ref->source_section ||
+			    (holder->address + key->address != ref->source_address &&
+			     (key->trampoline_address < 0 || holder->address + key->trampoline_address != ref->source_address)))
+				return false;
+			continue;
+		}
+		if (ref->dispatch_metadata) {
+			unsigned int paired;
+
+			for (paired = low; paired < c->nr_entry_references &&
+			     !strcmp(c->entry_references[paired].target, key->name); ++paired) {
+				const struct entry_reference *p = &c->entry_references[paired];
+
+				if (!p->dispatch_metadata && p->call && p->source_section == ref->source_section &&
+				    p->source_address == ref->source_address)
+					break;
+			}
+			if (paired == c->nr_entry_references ||
+			    strcmp(c->entry_references[paired].target, key->name))
+				return false;
+		}
+		start = name_range(c->names, c->nr_functions, ref->caller, &end);
+		for (; start < end; ++start) {
+			struct function *f = &c->functions[c->names[start].id];
+			unsigned int b, s;
+
+			if (f->definition != f || !f->live || !unique_symbol(c, f->name))
+				continue;
+			for (b = 0; b < f->nr_blocks; ++b)
+				for (s = 0; s < f->blocks[b].nr_sites; ++s)
+					found |= !strcmp(f->blocks[b].sites[s].dispatch_key, key->name);
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+static void resolve_dispatches(struct context *c)
+{
+	unsigned int i, j, k, h, bound = 0;
+
+	for (i = 0; i < c->nr_dispatch_keys; ++i)
+		c->dispatch_keys[i].resolved = dispatch_key_closed(c, &c->dispatch_keys[i]);
+	for (i = 0; i < c->nr_functions; ++i) {
+		struct function *f = &c->functions[i];
+
+		for (j = 0; j < f->nr_blocks; ++j)
+			for (k = 0; k < f->blocks[j].nr_sites; ++k) {
+				struct site *s = &f->blocks[j].sites[k];
+				struct dispatch_key *key = NULL;
+				bool valid = true;
+
+				if (!*s->dispatch_key)
+					continue;
+				for (h = 0; h < c->nr_dispatch_keys; ++h)
+					if (!strcmp(s->dispatch_key, c->dispatch_keys[h].name)) {
+						if (key) {
+							key->resolved = c->dispatch_keys[h].resolved = false;
+							valid = false;
+							break;
+						}
+						key = &c->dispatch_keys[h];
+					}
+				if (!valid || !key || !key->resolved)
+					continue;
+				++key->nr_sites;
+				for (h = 0; h < c->nr_dispatch_bindings; ++h) {
+					const struct dispatch_binding *b = &c->dispatch_bindings[h];
+					struct function *target = NULL;
+					unsigned int end, start, n;
+
+					if (strcmp(key->table, b->table) || key->offset != b->offset ||
+					    !dispatch_holder(c, b))
+						continue;
+					start = name_range(c->names, c->nr_functions, b->target, &end);
+					for (; start < end; ++start) {
+						struct function *g = &c->functions[c->names[start].id];
+
+						if (g->definition)
+							target = g->definition;
+					}
+					if (!target || !unique_symbol(c, b->target) || target->nargs != s->nargs || !*s->signature ||
+					    strcmp(target->signature, s->signature)) {
+						valid = false;
+						break;
+					}
+					for (n = 0; n < s->nr_dispatch_targets; ++n)
+						if (s->dispatch_targets[n] == target)
+							break;
+					if (n == s->nr_dispatch_targets) {
+						s->dispatch_targets = resize(s->dispatch_targets, n + 1, sizeof(target));
+						s->dispatch_targets[s->nr_dispatch_targets++] = target;
+					}
+				}
+				if (!valid) {
+					key->resolved = false;
+					s->nr_dispatch_targets = 0;
+					continue;
+				}
+				if (!s->nr_dispatch_targets)
+					key->resolved = false;
+				s->interface_covered = f->memory_covered;
+				for (h = 0; h < s->nr_dispatch_targets; ++h) {
+					struct function *g = s->dispatch_targets[h];
+
+					g->incoming = resize(g->incoming, g->nr_incoming + 1, sizeof(s));
+					g->incoming[g->nr_incoming++] = s;
+				}
+				bound += !!s->nr_dispatch_targets;
+			}
+	}
+	if (c->verbose)
+		fprintf(stderr, "context-analysis: %u static dispatch sites resolved from native registrations\n", bound);
 }
 
 static int compare_entry_references(const void *a, const void *b)
@@ -1332,8 +1679,7 @@ static void close_entry_callers(struct context *c)
 		f->entry_closed = f->defined && !f->escaped &&
 			(f->local || c->native_calls_covered);
 	}
-	qsort(c->entry_references, c->nr_entry_references,
-	      sizeof(*c->entry_references), compare_entry_references);
+
 	for (i = 0; i < c->nr_entry_references;) {
 		struct entry_reference *ref = &c->entry_references[i];
 		unsigned int end, start = name_range(c->names, c->nr_functions, ref->target, &end);
@@ -1342,6 +1688,15 @@ static void close_entry_callers(struct context *c)
 		while (next < c->nr_entry_references &&
 		       !compare_entry_references(ref, &c->entry_references[next]))
 			++next;
+		if (ref->dispatch) { i = next; continue; }
+		if (!ref->call) {
+			unsigned int r;
+
+			for (r = i; r < next; ++r)
+				if (!registered_reference(c, &c->entry_references[r]))
+					break;
+			if (r == next) { i = next; continue; }
+		}
 		for (j = start; j < end; ++j) {
 			struct function *f = &c->functions[c->names[j].id];
 			unsigned int h, calls = 0;
@@ -1355,8 +1710,13 @@ static void close_entry_callers(struct context *c)
 					unique_symbol(c, caller->name) &&
 					!strcmp(ref->caller, caller->name);
 			}
-			if (!ref->call || !*ref->caller || calls < next - i)
+			if (!ref->call || !*ref->caller || calls < next - i) {
+				if (c->verbose > 2 && (!c->trace_filter || strstr(f->name, c->trace_filter)))
+					fprintf(stderr, "context-analysis: entry-unaccounted-reference %s: caller=%s section=%u address=%#llx call=%u represented=%u native=%u\n",
+						f->name, *ref->caller ? ref->caller : "<data>", ref->source_section,
+						ref->source_address, ref->call, calls, next - i);
 				f->entry_closed = false;
+			}
 		}
 		i = next;
 	}
@@ -1415,7 +1775,8 @@ static void derive_clobbers(struct context *c, bool spin)
 
 				if (s->write)
 					add_clobber(set, (struct clobber){ expand_snapshots(c, f, s->address), s->width, false });
-				else if (!s->capture && !s->callee)
+				else if (!s->capture && !s->callee &&
+					 !(spin && s->interface_covered && s->nr_dispatch_targets))
 					set->unknown = true;
 			}
 	}
@@ -1435,6 +1796,30 @@ static void derive_clobbers(struct context *c, bool spin)
 
 					if (s->write || s->capture)
 						continue;
+					if (spin && s->interface_covered && s->nr_dispatch_targets) {
+						unsigned int target;
+
+						for (target = 0; target < s->nr_dispatch_targets; ++target) {
+							struct function *g = s->dispatch_targets[target];
+							struct clobbers *from = &g->spin_clobbers;
+
+							if (g->covered && !g->known_contract) {
+								if (from->unknown) { set->unknown = changed = true; break; }
+								for (h = 0; h < from->n; ++h) {
+									struct clobber effect = from->v[h];
+
+									effect.address = expand_snapshots(c, f, substitute(c, effect.address, s));
+									changed |= add_clobber(set, effect);
+								}
+							} else {
+								for (h = 0; h < g->declared.n; ++h)
+									if (g->declared.v[h].op == RELEASE)
+										changed |= add_clobber(set, (struct clobber){
+											substitute(c, g->declared.v[h].lock, s), 0, true });
+							}
+						}
+						continue;
+					}
 					/* Clang's complete direct-call interface describes
 					 * ownership transfers even when a body is unavailable.
 					 * This is not a complete memory/acquisition summary.
@@ -1582,6 +1967,22 @@ static bool call_clobbers(struct context *c, struct function *f, struct site *si
 	bool spin = spin_expression(c, f, lock);
 	struct clobbers *set;
 
+	if (spin && site->interface_covered && site->nr_dispatch_targets) {
+		for (i = 0; i < site->nr_dispatch_targets; ++i) {
+			struct site direct = *site;
+			bool clobbered;
+
+			direct.callee = site->dispatch_targets[i];
+			direct.nr_dispatch_targets = 0;
+			clobbered = call_clobbers(c, f, &direct, lock);
+			site->substitutions = direct.substitutions;
+			site->nr_substitutions = direct.nr_substitutions;
+			site->substitution_slots = direct.substitution_slots;
+			if (clobbered)
+				return true;
+		}
+		return false;
+	}
 	if (!g)
 		return true;
 	if (spin && site->interface_covered && g->defined && !g->covered) {
@@ -2371,6 +2772,9 @@ static bool analyze_function(struct context *c, struct function *f)
 		    (site->visited != previous[i].visited ||
 		     !equal_order(&site->held, &previous[i].held)))
 			callee->entry_dirty = true;
+		if (site->visited != previous[i].visited || !equal_order(&site->held, &previous[i].held))
+			for (j = 0; j < site->nr_dispatch_targets; ++j)
+				site->dispatch_targets[j]->entry_dirty = true;
 		clear(&previous[i].held);
 	}
 	free(previous);
@@ -3473,11 +3877,13 @@ static void destroy_context(struct context *c)
 		for (j = 0; j < f->nr_witnesses; ++j)
 			free(f->witnesses[j].via);
 		free(f->witnesses);
+		free(f->signature);
 		free(f->name); clear(&f->declared); clear(&f->effects); clear(&f->may); clear(&f->entry);
 		for (j = 0; j < f->nr_blocks; ++j) {
 			for (k = 0; k < f->blocks[j].nr_sites; ++k) {
 				struct site *s = &f->blocks[j].sites[k];
 
+				free(s->dispatch_key); free(s->signature); free(s->dispatch_targets);
 				free(s->args); free(s->substitutions); clear(&s->held);
 			}
 			for (k = 0; k < f->blocks[j].nr_edges; ++k)
@@ -3533,6 +3939,14 @@ static void destroy_context(struct context *c)
 		free(c->entry_references[i].caller);
 	}
 	free(c->entry_references);
+	for (i = 0; i < c->nr_dispatch_bindings; ++i) {
+		free(c->dispatch_bindings[i].holder); free(c->dispatch_bindings[i].target);
+		free(c->dispatch_bindings[i].table);
+	}
+	for (i = 0; i < c->nr_dispatch_keys; ++i) {
+		free(c->dispatch_keys[i].name); free(c->dispatch_keys[i].table);
+	}
+	free(c->dispatch_bindings); free(c->dispatch_keys);
 }
 
 static void report_entries(struct context *c)
@@ -3630,6 +4044,8 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 		goto out;
 	c.deriving = true;
 	resolve_functions(&c);
+	qsort(c.entry_references, c.nr_entry_references, sizeof(*c.entry_references), compare_entry_references);
+	resolve_dispatches(&c);
 	close_entry_callers(&c);
 	if (verbose)
 		fprintf(stderr, "context-analysis: resolved calls at %.3fs\n", elapsed_seconds(&start));

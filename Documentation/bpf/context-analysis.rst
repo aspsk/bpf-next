@@ -22,8 +22,9 @@ optimization. ``resolve_btfids/context.c`` resolves the linked descriptions and
 adds BTF declaration tags before BTF deduplication and finalization. Pahole
 continues to generate ordinary BTF from DWARF; it needs no changes.
 
-Both ELF sections are build-only INFO sections. Runtime tags distinguish declared/derived ownership, conservative acquisition
-candidates and positive acquisition-path witnesses. Missing tags never establish
+Both ELF sections are build-only INFO sections. Runtime tags distinguish
+declared/derived ownership and positive acquisition-path witnesses.
+Conservative acquisition candidates remain build-time diagnostics. Missing tags never establish
 the absence of locking effects.
 The fmodret scanner and resolver are independent of this pipeline.
 
@@ -155,9 +156,8 @@ acquisition of its second argument on a nonzero return::
   bpf_context:v1:declared:acquires:exclusive:arg(1):ret_ne(0)
 
 Its internal mutex acquisition is relevant even when a subsequent unlock
-balances it::
-
-  bpf_context:v1:derived:may_acquire:exclusive:arg(1):always
+balances it. Such an acquisition appears in runtime BTF only when supported by
+a positive acquisition-path witness; a conservative candidate alone is omitted.
 
 The native ``struct mutex`` carries ``bpf_context:v1:capability:mutex``.
 
@@ -219,7 +219,21 @@ version 3 adds write events (address and byte width) and memory-effect
 coverage. Version 2 remains readable without the new preservation proofs.
 Version 4 adds scalar-load/AND branch values, per-call safe-prefix flags,
 per-block safe-tail flags and function-level witness coverage. Versions 2 and 3
-remain readable but cannot supply new body-path certificates. Version 3 also records pointer snapshots and ordered capture events. Each
+remain readable but cannot supply new body-path certificates. Version 5 adds
+function and call ``signature`` strings, per-call ``dispatch_key`` strings,
+and document-level ``dispatch_bindings`` and ``dispatch_keys`` arrays.
+Each binding records ``holder``, ``target``, ``table``, ``address``, ``offset``
+and ``size``. These identify the callback registration object, target function,
+dispatch table, function-pointer byte position within the registration,
+hook byte position within the table, and registration object size.
+Each key records ``name``, ``table``, ``offset``, ``address``, ``size``,
+``trampoline_address`` and ``closed``: its symbol, table, hook position, actual
+key-pointer position within the table, table size, optional native trampoline
+pointer position (or -1), and source-use coverage. Versions 2--4 remain readable
+without dispatch proofs. These additions change only the build-time transport;
+runtime tags keep version 1.
+
+Version 3 also records pointer snapshots and ordered capture events. Each
 snapshot identifies one SSA pointer value from a load or a supported getter.
 Repeated reads have distinct identities. A capture executed again in a loop
 invalidates ownership tied to that definition's previous dynamic instance.
@@ -294,6 +308,24 @@ address still does. Unknown function pointers and escaped callbacks remain
 incomplete. This does not resolve mutable operations tables or external entry
 paths, and does not establish closure for exported global functions.
 
+LSM dispatch uses a separate bounded registration model. The compiler records
+the actual ``security_hook_list`` initializers and ``static_calls_table`` key
+positions. The resolver validates their native object sizes, field relocations,
+key references and call signatures before accounting for callback entry paths.
+Every use of a dispatch key and every corresponding call must be represented;
+an extra escape or incompatible call keeps the registration's caller set open.
+This propagates entry ownership to BPF LSM stubs without handwritten hook
+contracts. A dispatch remains incomplete for internal acquisitions even when
+its entry callers are closed. Ownership preservation across represented
+dispatch targets uses the same trusted spinlock interfaces as direct calls.
+The native ARM64 fallback through key loads and x86-64 static-call trampolines
+are supported. The latter validates objtool's paired instruction/key records
+against native call relocations. Linker bounds identify jump-label, static-call
+and tracing tables even when they are merged into ordinary data sections.
+Only the exact native LSM null-trampoline templates count as definitions rather
+than additional assembly address uses. Other assembly references retain open
+caller sets.
+
 The compiler follows simple local pointer getters whose bodies do not write
 memory or call opaque functions and whose returns describe the same pointer
 path. This preserves paths such as ``d_inode(dentry)`` before inlining.
@@ -317,7 +349,10 @@ referenced functions' caller sets incomplete;
 block addresses and function addresses passed to assembly also escape. Empty
 inline-assembly templates, including compiler memory barriers, preserve lock
 ownership. Exact ARM64 memory barriers and thread-register reads, and x86 memory
-fences, preserve ownership too. Other assembly remains an opaque effect at its
+fences, preserve ownership too. The exact x86-64 GS-relative register read used
+for ``current`` preserves ownership. Exact ARM64 and x86-64 jump-label
+nop/branch templates and their data-only jump tables preserve ownership on both successors. Other
+assembly remains an opaque effect at its
 own call site.
 Assembly directives that import unseen text or construct symbol names retain a
 conservative translation-unit escape fallback. The fixed ARM64 sysreg

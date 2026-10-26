@@ -5,7 +5,7 @@
 /* Build-only, NUL-delimited JSON documents; never a runtime ABI. */
 #define BPF_CONTEXT_SECTION ".bpf_context"
 #define BPF_CONTEXT_FORMAT "bpf_context"
-#define BPF_CONTEXT_VERSION 4
+#define BPF_CONTEXT_VERSION 5
 #define BPF_CONTEXT_IR_METADATA "bpf.context.source"
 
 /* Runtime facts use ordinary BTF declaration tags on native FUNC/STRUCT types. */
