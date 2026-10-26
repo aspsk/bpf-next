@@ -175,7 +175,7 @@ struct emitted_tag {
 };
 
 struct entry_reference {
-	char *target, *caller;
+	char *target, *caller, *source_name;
 	bool call, code, dispatch, dispatch_metadata;
 	unsigned int source_section;
 	unsigned long long source_address;
@@ -1185,6 +1185,9 @@ static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
 		    !strcmp(section, "__mcount_loc") || !strcmp(section, ".eh_frame") ||
 		    !strcmp(section, ".discard.addressable") ||
 		    !strcmp(section, "__jump_table") ||
+		    !strcmp(section, ".return_sites") || !strcmp(section, ".retpoline_sites") ||
+		    !strcmp(section, ".call_sites") || !strcmp(section, ".ibt_endbr_seal") ||
+		    !strcmp(section, ".cfi_sites") ||
 		    !strcmp(section, ".eh_frame_hdr") || !strncmp(section, ".orc_unwind", 11))
 			continue;
 		if ((owner_sh.sh_flags & SHF_EXECINSTR) && c->native_reference_contract)
@@ -1303,6 +1306,7 @@ static int collect_entry_references(struct context *c, Elf *elf, size_t strings)
 			}
 			c->entry_references[c->nr_entry_references++] = (struct entry_reference){
 				.target = copy_string(name), .caller = copy_string(owner ? owner->name : ""),
+				.source_name = copy_string(section),
 				.call = call, .code = !!(owner_sh.sh_flags & SHF_EXECINSTR) || dispatch_metadata,
 				.dispatch = dispatch, .dispatch_metadata = dispatch_metadata,
 				.source_section = source_section, .source_address = source_address };
@@ -1712,8 +1716,8 @@ static void close_entry_callers(struct context *c)
 			}
 			if (!ref->call || !*ref->caller || calls < next - i) {
 				if (c->verbose > 2 && (!c->trace_filter || strstr(f->name, c->trace_filter)))
-					fprintf(stderr, "context-analysis: entry-unaccounted-reference %s: caller=%s section=%u address=%#llx call=%u represented=%u native=%u\n",
-						f->name, *ref->caller ? ref->caller : "<data>", ref->source_section,
+					fprintf(stderr, "context-analysis: entry-unaccounted-reference %s: caller=%s section=%u(%s) address=%#llx call=%u represented=%u native=%u\n",
+						f->name, *ref->caller ? ref->caller : "<data>", ref->source_section, ref->source_name,
 						ref->source_address, ref->call, calls, next - i);
 				f->entry_closed = false;
 			}
@@ -3937,6 +3941,7 @@ static void destroy_context(struct context *c)
 	for (i = 0; i < c->nr_entry_references; ++i) {
 		free(c->entry_references[i].target);
 		free(c->entry_references[i].caller);
+		free(c->entry_references[i].source_name);
 	}
 	free(c->entry_references);
 	for (i = 0; i < c->nr_dispatch_bindings; ++i) {

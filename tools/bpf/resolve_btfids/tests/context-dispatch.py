@@ -5,11 +5,44 @@ import json
 import os
 from pathlib import Path
 import shlex
+import struct
 import subprocess
 import tempfile
 
 root=Path(__file__).resolve().parents[4]
 flags=shlex.split(os.environ.get('CONTEXT_TEST_CFLAGS',''))
+
+def instruction_symbols(path):
+    """Exercise instruction metadata referencing FUNC symbols plus addends."""
+    data = bytearray(path.read_bytes())
+    offset = struct.unpack_from('<Q', data, 40)[0]
+    size, count, names_index = struct.unpack_from('<HHH', data, 58)
+    sections = [struct.unpack_from('<IIQQQQIIQQ', data, offset + i * size)
+                for i in range(count)]
+    strings = sections[names_index]
+    names = data[strings[4]:strings[4] + strings[5]]
+    rewritten = 0
+    for section in sections:
+        name = names[section[0]:names.index(0, section[0])]
+        if name != b'.rela.return_sites':
+            continue
+        symbols = sections[section[6]]
+        table = [struct.unpack_from('<IBBHQQ', data, symbols[4] + i * symbols[9])
+                 for i in range(symbols[5] // symbols[9])]
+        for pos in range(section[4], section[4] + section[5], section[9]):
+            address, info, addend = struct.unpack_from('<QQq', data, pos)
+            target = table[info >> 32]
+            location = target[4] + addend
+            for index, symbol in enumerate(table):
+                if symbol[1] & 15 == 2 and symbol[3] == target[3] and \
+                   symbol[4] <= location < symbol[4] + symbol[5]:
+                    struct.pack_into('<QQq', data, pos, address,
+                                     index << 32 | (info & 0xffffffff), location - symbol[4])
+                    rewritten += 1
+                    break
+    assert rewritten, 'return-thunk fixture contains no native instruction records'
+    path.write_bytes(data)
+
 with tempfile.TemporaryDirectory(prefix='context-dispatch-') as tmp:
     cases = ['', 'TEST_DISPATCH_MIXED', 'TEST_DISPATCH_ESCAPED', 'TEST_DISPATCH_KEY_ESCAPE',
              'TEST_DISPATCH_SIGNATURE']
@@ -40,7 +73,13 @@ with tempfile.TemporaryDirectory(prefix='context-dispatch-') as tmp:
         if os.environ.get('OBJTOOL'):
             subprocess.run([os.environ['OBJTOOL'], '--static-call', '--hacks=jump_label',
                             '--mcount', '--mnop',
+                            *(['--link', '--rethunk', '--ibt'] if '-fcf-protection=branch' in flags else []),
                             str(obj)], check=True)
+            if '-fcf-protection=branch' in flags:
+                instruction_symbols(obj)
+        if native_trampoline:
+            subprocess.run([os.environ.get('OBJCOPY', 'objcopy'),
+                            '--remove-section=.discard.annotate_insn', str(obj)], check=True)
         subprocess.run(['pahole','-J','--btf_features=var,global_var,decl_tag,type_tag',str(obj)],check=True)
         for merged in ([False, True] if native_trampoline else [False]):
             target = Path(str(image) + ('.merged' if merged else ''))
