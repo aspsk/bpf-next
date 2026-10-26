@@ -56,6 +56,8 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
     ], text=True))
     entries = {x["name"]: [f for f in x["facts"] if f.get("fact") == "entry_held"]
                for x in data}
+    may_entries = {x["name"]: [f for f in x["facts"] if f.get("fact") == "entry_may_hold"]
+                   for x in data}
     if "TEST_UNKNOWN_REPEAT_ASM" in os.environ.get("CONTEXT_TEST_CFLAGS", ""):
         if any(entries.values()):
             raise AssertionError("unknown symbol-generating assembly closed caller sets")
@@ -71,6 +73,16 @@ with tempfile.TemporaryDirectory(prefix="context-regression-") as tmp:
         if entries.get(name):
             raise AssertionError("unsafe global entry guarantee: " + name)
         print("PASS global ownership withheld:", name)
+    for name in ("mixed_context", "escaped_callback", "global_mixed", "global_unknown_caller",
+                 "global_data_escape", "may_middle", "may_leaf_a", "may_leaf_b"):
+        if not any(f["lock"] == "arg(0)" for f in may_entries.get(name, [])):
+            raise AssertionError("missing positive entry-may evidence: " + name)
+        print("PASS positive entry-may evidence:", name)
+    for name in ("may_middle", "may_leaf_a", "may_leaf_b", "may_guarded_leaf"):
+        if entries.get(name):
+            raise AssertionError("existential evidence became universal: " + name)
+    if may_entries.get("may_guarded_leaf"):
+        raise AssertionError("existential input was sent down an unproved branch")
     for name in ("after_store", "after_work", "after_loop", "after_capture",
                  "selected_a", "selected_b", "after_recursive", "after_pending",
                  "after_inner_release", "after_pending_inner", "after_stack_memory",

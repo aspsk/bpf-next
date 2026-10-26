@@ -1768,8 +1768,6 @@ int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 	err = copy_reference_state(dst_state, src);
 	if (err)
 		return err;
-	dst_state->context_condition = src->context_condition;
-	dst_state->context_call_seen = src->context_call_seen;
 	dst_state->speculative = src->speculative;
 	dst_state->in_sleepable = src->in_sleepable;
 	dst_state->unwound = src->unwound;
@@ -6858,7 +6856,7 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 		ret = mark_btf_ld_reg(env, regs, value_regno, ret, reg->btf, btf_id, flag);
 		if (!ret)
 			regs[value_regno].context_id = bpf_context_load(env, context_source,
-				context_offset, size, pointer);
+				context_offset, pointer);
 		if (ret < 0)
 			return ret;
 	}
@@ -17983,20 +17981,15 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	struct bpf_reg_state *regs = cur_regs(env);
 	u32 dst_id = 0, src_id = 0;
-	bool constant = BPF_SRC(insn->code) == BPF_K;
-	u64 value = (s64)insn->imm;
 	int err;
 
 	if (insn->dst_reg < MAX_BPF_REG)
 		dst_id = regs[insn->dst_reg].context_id;
-	if (!constant && insn->src_reg < MAX_BPF_REG) {
+	if (BPF_SRC(insn->code) == BPF_X && insn->src_reg < MAX_BPF_REG)
 		src_id = regs[insn->src_reg].context_id;
-		constant = tnum_is_const(regs[insn->src_reg].var_off);
-		value = regs[insn->src_reg].var_off.value;
-	}
 	err = __check_alu_op(env, insn);
 	if (!err)
-		bpf_context_alu(env, insn, dst_id, src_id, constant, value);
+		bpf_context_alu(env, insn, dst_id, src_id);
 	return err;
 }
 
@@ -18857,9 +18850,6 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	bool is_jmp32;
 	int pred = -1;
 	int err;
-	u32 context_left, context_right;
-	bool context_constant;
-	u64 context_value;
 
 	/* Only conditional jumps are expected to reach here. */
 	if (opcode == BPF_JA || opcode > BPF_JCOND) {
@@ -18952,10 +18942,6 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	if (dst_reg->type == SCALAR_VALUE && dst_reg->id)
 		collect_linked_regs(env, this_branch, dst_reg->id, &linked_regs);
 
-	context_left = dst_reg->context_id;
-	context_right = BPF_SRC(insn->code) == BPF_X ? src_reg->context_id : 0;
-	context_constant = BPF_SRC(insn->code) == BPF_K || tnum_is_const(src_reg->var_off);
-	context_value = BPF_SRC(insn->code) == BPF_K ? (s64)insn->imm : src_reg->var_off.value;
 	is_jmp32 = BPF_CLASS(insn->code) == BPF_JMP32;
 	env->false_reg1 = *dst_reg;
 	env->false_reg2 = *src_reg;
@@ -18975,12 +18961,6 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			return err;
 	}
 
-	if (pred >= 0) {
-		err = bpf_context_branch(env, this_branch, insn, context_left, context_right,
-					 context_constant, context_value, pred == 1);
-		if (err)
-			return err;
-	}
 	if (pred == 1) {
 		/* Only follow the goto, ignore fall-through. If needed, push
 		 * the fall-through branch for simulation under speculative
@@ -19029,12 +19009,6 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	if (IS_ERR(other_branch))
 		return PTR_ERR(other_branch);
 	other_branch_regs = other_branch->frame[other_branch->curframe]->regs;
-	err = bpf_context_branch(env, this_branch, insn, context_left, context_right,
-				 context_constant, context_value, false);
-	err = err ?: bpf_context_branch(env, other_branch, insn, context_left, context_right,
-					context_constant, context_value, true);
-	if (err)
-		return err;
 
 	err = regs_bounds_sanity_check_branches(env);
 	if (err)
@@ -20342,12 +20316,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			if (insn->src_reg == BPF_PSEUDO_CALL)
 				return check_func_call(env, insn, &env->insn_idx);
 			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
-				err = check_kfunc_call(env, insn, &env->insn_idx);
-			else
-				err = check_helper_call(env, insn, &env->insn_idx);
-			if (!err && env->context_state)
-				env->cur_state->context_call_seen = true;
-			return err;
+				return check_kfunc_call(env, insn, &env->insn_idx);
+			return check_helper_call(env, insn, &env->insn_idx);
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
 				return check_indirect_jump(env, insn);

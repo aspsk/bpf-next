@@ -5,43 +5,30 @@
 #include <linux/btf.h>
 #include <linux/filter.h>
 #include <linux/ctype.h>
-#include <linux/log2.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
 
 #define CONTEXT_PREFIX "bpf_context:v1:"
 #define CONTEXT_DEPTH 3
 #define CONTEXT_IDS 256
-#define CONTEXT_CONDITIONS 4096
-#define CONTEXT_ENTRY_LOCKS 16
+#define CONTEXT_ENTRY_LOCKS 128
 
 struct context_path {
 	u32 arg;
-	u8 depth, bits;
-	bool opaque;
+	u8 depth;
 	s32 load[CONTEXT_DEPTH], offset;
-	u64 mask;
 };
 
 struct context_fact {
-	struct context_path lock, guard;
-	u64 mask, value;
-	bool exclusive, conditional;
-};
-
-enum context_condition_kind { CONTEXT_BITS, CONTEXT_OPAQUE };
-struct context_condition {
-	u32 parent, left, right;
-	enum context_condition_kind kind;
-	u64 mask, value;
+	struct context_path lock;
+	bool exclusive;
 };
 
 struct bpf_context_state {
 	struct context_fact entry[CONTEXT_ENTRY_LOCKS];
-	u32 nr_entry, nr_ids, nr_conditions;
+	u32 nr_entry, nr_ids;
 	bool exhausted;
 	struct context_path ids[CONTEXT_IDS];
-	struct context_condition conditions[CONTEXT_CONDITIONS];
 };
 
 static bool context_path_equal(const struct context_path *a, const struct context_path *b)
@@ -55,8 +42,7 @@ static u32 intern_path(struct bpf_context_state *ctx, struct context_path p)
 	u32 i;
 
 	for (i = 1; i <= ctx->nr_ids; ++i)
-		if (context_path_equal(&ctx->ids[i], &p) && ctx->ids[i].bits == p.bits &&
-		    ctx->ids[i].mask == p.mask && ctx->ids[i].opaque == p.opaque)
+		if (context_path_equal(&ctx->ids[i], &p))
 			return i;
 	if (ctx->nr_ids + 1 >= CONTEXT_IDS) {
 		ctx->exhausted = true;
@@ -121,7 +107,7 @@ static bool parse_path(const char **s, struct context_path *p, u32 depth)
 
 static bool parse_fact(const char *tag, struct context_fact *fact, bool entry)
 {
-	char *copy, *rest, *fields[5], *end;
+	char *copy, *rest, *fields[5];
 	const char *p;
 	int i;
 	bool ok = false;
@@ -141,7 +127,8 @@ static bool parse_fact(const char *tag, struct context_fact *fact, bool entry)
 		goto out;
 	memset(fact, 0, sizeof(*fact));
 	if (entry) {
-		if ((strcmp(fields[0], "derived") || strcmp(fields[1], "entry_held")) &&
+		if ((strcmp(fields[0], "derived") ||
+		     (strcmp(fields[1], "entry_held") && strcmp(fields[1], "entry_may_hold"))) &&
 		    (strcmp(fields[0], "declared") || strcmp(fields[1], "requires")))
 			goto out;
 		if (strcmp(fields[4], "always"))
@@ -160,32 +147,9 @@ static bool parse_fact(const char *tag, struct context_fact *fact, bool entry)
 	p = fields[3];
 	if (!parse_path(&p, &fact->lock, 0) || *p)
 		goto out;
-	if (!entry && strcmp(fields[4], "always")) {
-		s32 bits;
-		char *mask, *value;
-
-		p = fields[4];
-		if (strncmp(p, "bits_eq(", 8))
-			goto out;
-		p += 8;
-		if (!parse_path(&p, &fact->guard, 0) || *p++ != ',' ||
-		    !number(&p, &bits) || bits <= 0 || bits > 64 || *p++ != ',')
-			goto out;
-		mask = (char *)p;
-		value = strchr(mask, ',');
-		if (!value)
-			goto out;
-		*value++ = 0;
-		end = strchr(value, ')');
-		if (!end || end[1])
-			goto out;
-		*end = 0;
-		if (kstrtou64(mask, 10, &fact->mask) || kstrtou64(value, 10, &fact->value) ||
-		    (fact->value & ~fact->mask) || (bits < 64 && fact->mask >> bits))
-			goto out;
-		fact->guard.bits = bits;
-		fact->conditional = true;
-	}
+	/* A witness guard describes one known path, not all acquisitions.
+	 * Keep it in BTF for diagnostics, but never use it to permit a call.
+	 */
 	ok = true;
 out:
 	kfree(copy);
@@ -214,7 +178,7 @@ int bpf_context_init(struct bpf_verifier_env *env)
 		if (!parse_fact(btf_name_by_offset(btf, tag->name_off), &fact, true))
 			continue;
 		if (!env->context_state) {
-			env->context_state = kvzalloc(sizeof(*env->context_state), GFP_KERNEL_ACCOUNT);
+			env->context_state = kvzalloc_obj(*env->context_state, GFP_KERNEL_ACCOUNT);
 			if (!env->context_state)
 				return -ENOMEM;
 		}
@@ -238,123 +202,40 @@ u32 bpf_context_argument(struct bpf_verifier_env *env, u32 arg)
 	return env->context_state ? intern_path(env->context_state, p) : 0;
 }
 
-u32 bpf_context_load(struct bpf_verifier_env *env, u32 source, s64 offset,
-		     int size, bool pointer)
+u32 bpf_context_load(struct bpf_verifier_env *env, u32 source, s64 offset, bool pointer)
 {
 	struct bpf_context_state *ctx = env->context_state;
 	struct context_path p;
 
-	if (!ctx || !source || source > ctx->nr_ids || offset < 0 || offset > INT_MAX)
+	if (!ctx || !pointer || !source || source > ctx->nr_ids || offset < 0 || offset > INT_MAX)
 		return 0;
 	p = ctx->ids[source];
-	if (p.bits || check_add_overflow(p.offset, (s32)offset, &p.offset))
+	if (check_add_overflow(p.offset, (s32)offset, &p.offset))
 		return 0;
-	if (pointer) {
-		if (p.depth == CONTEXT_DEPTH)
-			return 0;
-		p.load[p.depth++] = p.offset;
-		p.offset = 0;
-	} else {
-		p.bits = size * 8;
-		p.mask = size == 8 ? U64_MAX : (1ULL << p.bits) - 1;
-	}
+	if (p.depth == CONTEXT_DEPTH)
+		return 0;
+	p.load[p.depth++] = p.offset;
+	p.offset = 0;
 	return intern_path(ctx, p);
 }
 
 void bpf_context_alu(struct bpf_verifier_env *env, const struct bpf_insn *insn,
-		     u32 dst_id, u32 src_id, bool src_const, u64 src_value)
+		     u32 dst_id, u32 src_id)
 {
-	struct bpf_context_state *ctx = env->context_state;
-	struct bpf_reg_state *dst = &env->cur_state->frame[env->cur_state->curframe]->regs[insn->dst_reg];
-	struct context_path p;
+	struct bpf_reg_state *dst;
 	u8 op = BPF_OP(insn->code);
 
-	if (!ctx)
+	if (!env->context_state)
 		return;
-	if (op == BPF_MOV) {
-		if (BPF_SRC(insn->code) == BPF_K || !src_id) {
-			dst->context_id = 0;
-			return;
-		}
-		p = ctx->ids[src_id];
-		if (insn->off || insn->imm)
-			p.opaque = true;
-		else if (BPF_CLASS(insn->code) == BPF_ALU && p.bits)
-			p.mask &= U32_MAX;
-		dst->context_id = intern_path(ctx, p);
-		return;
-	}
-	if (!dst_id && !src_id)
-		return;
-	if (!dst_id || (src_id && !src_const && src_id != dst_id)) {
-		p = (struct context_path){ .bits = 64, .opaque = true };
-	} else {
-		p = ctx->ids[dst_id];
-		if (!p.bits && (op == BPF_ADD || op == BPF_SUB)) {
-			dst->context_id = dst_id;
-			return;
-		}
-		if (p.bits && op == BPF_AND && src_const) {
-			p.mask &= src_value;
-			if (BPF_CLASS(insn->code) == BPF_ALU)
-				p.mask &= U32_MAX;
-		} else {
-			p.opaque = true;
-		}
-	}
-	dst->context_id = intern_path(ctx, p);
-}
-
-static int add_condition(struct bpf_context_state *ctx, struct bpf_verifier_state *state,
-			 struct context_condition condition)
-{
-	u32 id;
-
-	for (id = state->context_condition; id; id = ctx->conditions[id].parent) {
-		struct context_condition *old = &ctx->conditions[id];
-
-		if (old->kind == condition.kind && old->left == condition.left &&
-		    old->right == condition.right && old->mask == condition.mask &&
-		    old->value == condition.value)
-			return 0;
-	}
-	if (ctx->nr_conditions + 1 == CONTEXT_CONDITIONS)
-		return -E2BIG;
-	condition.parent = state->context_condition;
-	ctx->conditions[++ctx->nr_conditions] = condition;
-	state->context_condition = ctx->nr_conditions;
-	return 0;
-}
-
-int bpf_context_branch(struct bpf_verifier_env *env, struct bpf_verifier_state *state,
-		       const struct bpf_insn *insn, u32 left, u32 right,
-		       bool constant, u64 value, bool taken)
-{
-	struct bpf_context_state *ctx = env->context_state;
-	struct context_condition condition = { .left = left, .right = right };
-	struct context_path *p;
-	u8 op = BPF_OP(insn->code);
-	bool eq = (op == BPF_JEQ) == taken;
-
-	if (!ctx || (!left && !right))
-		return 0;
-	if (!left) {
-		condition.left = right;
-		condition.right = 0;
-		goto opaque;
-	}
-	p = &ctx->ids[left];
-	if (!p->bits || p->opaque || !constant ||
-	    (op != BPF_JEQ && op != BPF_JNE) || value ||
-	    !is_power_of_2(p->mask))
-		goto opaque;
-	condition.kind = CONTEXT_BITS;
-	condition.mask = p->mask;
-	condition.value = eq ? 0 : p->mask;
-	return add_condition(ctx, state, condition);
-opaque:
-	condition.kind = CONTEXT_OPAQUE;
-	return add_condition(ctx, state, condition);
+	dst = &env->cur_state->frame[env->cur_state->curframe]->regs[insn->dst_reg];
+	if (op == BPF_MOV && BPF_SRC(insn->code) == BPF_X &&
+	    BPF_CLASS(insn->code) == BPF_ALU64 && !insn->off && !insn->imm)
+		dst->context_id = src_id;
+	else if ((op == BPF_ADD || op == BPF_SUB) &&
+		 base_type(dst->type) == PTR_TO_BTF_ID)
+		dst->context_id = dst_id;
+	else
+		dst->context_id = 0;
 }
 
 static bool has_property(const struct btf *btf, const struct btf_type *t, const char *prefix)
@@ -445,7 +326,7 @@ static bool substitute_argument(struct bpf_verifier_env *env, const struct btf *
 		return false;
 	result = env->context_state->ids[reg->context_id];
 	offset = (s64)reg->var_off.value;
-	if (result.bits || result.opaque || offset < INT_MIN || offset > INT_MAX ||
+	if (offset < INT_MIN || offset > INT_MAX ||
 	    check_add_overflow(result.offset, (s32)offset, &result.offset) ||
 	    result.depth + path->depth > CONTEXT_DEPTH)
 		return false;
@@ -460,37 +341,7 @@ static bool substitute_argument(struct bpf_verifier_env *env, const struct btf *
 		result.offset = path->offset;
 	else if (check_add_overflow(result.offset, path->offset, &result.offset))
 		return false;
-	result.bits = path->bits;
 	*path = result;
-	return true;
-}
-
-/* Conditions are about input-field observations. Unsupported correlated tests
- * withhold a conflict proof instead of silently treating them as independent.
- */
-static bool guard_possible(struct bpf_verifier_env *env, const struct context_fact *fact)
-{
-	struct bpf_context_state *ctx = env->context_state;
-	u32 id;
-
-	if (!fact->conditional)
-		return true;
-	for (id = env->cur_state->context_condition; id; id = ctx->conditions[id].parent) {
-		const struct context_condition *condition = &ctx->conditions[id];
-		const struct context_path *p = &ctx->ids[condition->left];
-
-		if (!context_path_equal(p, &fact->guard)) {
-			if (condition->kind == CONTEXT_OPAQUE && (!p->arg ||
-			    (condition->right && context_path_equal(&ctx->ids[condition->right], &fact->guard))))
-				return false;
-			continue;
-		}
-		if (condition->kind == CONTEXT_OPAQUE)
-			return false;
-		if (condition->kind == CONTEXT_BITS &&
-		    ((condition->value ^ fact->value) & condition->mask & fact->mask))
-			return false;
-	}
 	return true;
 }
 
@@ -508,8 +359,7 @@ int bpf_context_check_kfunc(struct bpf_verifier_env *env, struct btf *btf,
 	int id = 0;
 	u32 i;
 
-	if (!ctx || !btf_is_kernel(btf) || env->cur_state->speculative ||
-	    env->cur_state->context_call_seen)
+	if (!ctx || !btf_is_kernel(btf) || env->cur_state->speculative)
 		return 0;
 	for (i = 0; i <= env->cur_state->curframe; ++i)
 		if (env->cur_state->frame[i]->in_async_callback_fn)
@@ -528,9 +378,7 @@ int bpf_context_check_kfunc(struct bpf_verifier_env *env, struct btf *btf,
 		acquired = lock_type(btf, proto, &fact.lock);
 		if (!acquired || has_property(btf, acquired, CONTEXT_PREFIX "reentrant"))
 			continue;
-		if (!substitute_argument(env, btf, proto, &fact.lock) ||
-		    (fact.conditional && !substitute_argument(env, btf, proto, &fact.guard)) ||
-		    !guard_possible(env, &fact))
+		if (!substitute_argument(env, btf, proto, &fact.lock))
 			continue;
 		for (i = 0; i < ctx->nr_entry; ++i) {
 			if (!ctx->entry[i].exclusive && !fact.exclusive)
