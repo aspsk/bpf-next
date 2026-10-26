@@ -35,10 +35,11 @@ endif
 
 TEST_FILES = xsk_prereqs.sh $(wildcard progs/btf_dump_test_case_*.c)	\
 	     bpftool_btf_dump_sorted.expected					\
-	     bpftool_btf_dump_unsorted.expected
+	     bpftool_btf_dump_unsorted.expected llvm_plugins
 
 # Order correspond to 'make run_tests' order
-TEST_PROGS := test_bpftool_build.sh \
+TEST_PROGS := test_llvm_plugins.py \
+	test_bpftool_build.sh \
 	test_doc_build.sh \
 	test_xsk.sh \
 	test_xdp_features.sh
