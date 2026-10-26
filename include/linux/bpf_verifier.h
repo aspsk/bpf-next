@@ -125,6 +125,8 @@ struct bpf_reg_state {
 
 		u32 subprogno; /* for PTR_TO_FUNC */
 	};
+	/* Native attachment argument/field identity; local to this verification. */
+	u32 context_id;
 	/* For scalar types (SCALAR_VALUE), this represents our knowledge of
 	 * the actual value.
 	 * For pointer types, this represents the variable part of the offset
@@ -468,6 +470,10 @@ static_assert(MAX_BPF_STACK_SLOTS <= (1 << 12));
 			 MAX_CALL_FRAMES)
 
 struct bpf_verifier_state {
+	/* Persistent context path-condition node, shared through the verifier env. */
+	u32 context_condition;
+	/* Unknown native effects end the supported acquisition-proof prefix. */
+	bool context_call_seen;
 	/* call stack tracking */
 	struct bpf_func_state *frame[MAX_CALL_FRAMES];
 	struct bpf_verifier_state *parent;
@@ -1064,6 +1070,7 @@ struct bpf_fd_array {
  * one verifier_env per bpf_check() call
  */
 struct bpf_verifier_env {
+	struct bpf_context_state *context_state;
 	u32 insn_idx;
 	u32 prev_insn_idx;
 	struct bpf_prog *prog;		/* eBPF program being verified */

@@ -27,6 +27,7 @@
 #include <linux/verification.h>
 #include <linux/keyctl.h>
 #include <linux/btf_ids.h>
+#include <linux/bpf_context.h>
 #include <linux/poison.h>
 #include <linux/module.h>
 #include <linux/cpumask.h>
@@ -1767,6 +1768,8 @@ int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 	err = copy_reference_state(dst_state, src);
 	if (err)
 		return err;
+	dst_state->context_condition = src->context_condition;
+	dst_state->context_call_seen = src->context_call_seen;
 	dst_state->speculative = src->speculative;
 	dst_state->in_sleepable = src->in_sleepable;
 	dst_state->unwound = src->unwound;
@@ -6675,7 +6678,9 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 	const char *tname = btf_name_by_offset(reg->btf, t->name_off);
 	const char *field_name = NULL;
 	enum bpf_type_flag flag = 0;
-	u32 btf_id = 0;
+	u32 btf_id = 0, context_source = reg->context_id;
+	s64 context_offset = tnum_is_const(reg->var_off) ?
+		(s64)reg->var_off.value + off : -1;
 	s64 min_off;
 	int ret;
 
@@ -6848,7 +6853,12 @@ static int check_ptr_to_btf_access(struct bpf_verifier_env *env,
 		flag &= ~PTR_MAYBE_NULL;
 
 	if (atype == BPF_READ && value_regno >= 0) {
+		bool pointer = ret == PTR_TO_BTF_ID;
+
 		ret = mark_btf_ld_reg(env, regs, value_regno, ret, reg->btf, btf_id, flag);
+		if (!ret)
+			regs[value_regno].context_id = bpf_context_load(env, context_source,
+				context_offset, size, pointer);
 		if (ret < 0)
 			return ret;
 	}
@@ -7367,6 +7377,9 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, struct b
 				if (base_type(info.reg_type) == PTR_TO_BTF_ID) {
 					regs[value_regno].btf = info.btf;
 					regs[value_regno].btf_id = info.btf_id;
+					regs[value_regno].context_id = bpf_context_argument(env,
+						btf_ctx_arg_idx(env->prog->aux->attach_btf,
+								env->prog->aux->attach_func_proto, off));
 					regs[value_regno].id = info.ref_id;
 				} else if (base_type(info.reg_type) == PTR_TO_MEM) {
 					regs[value_regno].mem_size = info.mem_size;
@@ -11548,7 +11561,7 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	err = btf_check_subprog_call(env, subprog);
 	if (err == -EFAULT)
 		return err;
-	if (bpf_subprog_is_global(env, subprog)) {
+	if (bpf_subprog_is_global(env, subprog) && !env->context_state) {
 		struct bpf_func_info_aux *sub_aux = subprog_aux(env, subprog);
 		const char *sub_name = bpf_subprog_name(env, subprog);
 		const char *operation;
@@ -15511,6 +15524,10 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err < 0)
 		return err;
 
+	err = bpf_context_check_kfunc(env, meta.btf, meta.func_id, meta.func_name);
+	if (err)
+		return err;
+
 	err = mark_raw_stack(env, &meta, insn_idx);
 	if (err)
 		return err;
@@ -17773,7 +17790,7 @@ int bpf_reg_union(struct bpf_verifier_env *env, struct bpf_reg_state *acc,
 }
 
 /* check validity of 32-bit and 64-bit arithmetic operations */
-static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+static int __check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	struct bpf_reg_state *regs = cur_regs(env);
 	u8 opcode = BPF_OP(insn->code);
@@ -17960,6 +17977,27 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 
 	bpf_diag_mod_end(env);
 	return 0;
+}
+
+static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	struct bpf_reg_state *regs = cur_regs(env);
+	u32 dst_id = 0, src_id = 0;
+	bool constant = BPF_SRC(insn->code) == BPF_K;
+	u64 value = (s64)insn->imm;
+	int err;
+
+	if (insn->dst_reg < MAX_BPF_REG)
+		dst_id = regs[insn->dst_reg].context_id;
+	if (!constant && insn->src_reg < MAX_BPF_REG) {
+		src_id = regs[insn->src_reg].context_id;
+		constant = tnum_is_const(regs[insn->src_reg].var_off);
+		value = regs[insn->src_reg].var_off.value;
+	}
+	err = __check_alu_op(env, insn);
+	if (!err)
+		bpf_context_alu(env, insn, dst_id, src_id, constant, value);
+	return err;
 }
 
 static void find_good_pkt_pointers(struct bpf_verifier_state *vstate,
@@ -18819,6 +18857,9 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	bool is_jmp32;
 	int pred = -1;
 	int err;
+	u32 context_left, context_right;
+	bool context_constant;
+	u64 context_value;
 
 	/* Only conditional jumps are expected to reach here. */
 	if (opcode == BPF_JA || opcode > BPF_JCOND) {
@@ -18911,6 +18952,10 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	if (dst_reg->type == SCALAR_VALUE && dst_reg->id)
 		collect_linked_regs(env, this_branch, dst_reg->id, &linked_regs);
 
+	context_left = dst_reg->context_id;
+	context_right = BPF_SRC(insn->code) == BPF_X ? src_reg->context_id : 0;
+	context_constant = BPF_SRC(insn->code) == BPF_K || tnum_is_const(src_reg->var_off);
+	context_value = BPF_SRC(insn->code) == BPF_K ? (s64)insn->imm : src_reg->var_off.value;
 	is_jmp32 = BPF_CLASS(insn->code) == BPF_JMP32;
 	env->false_reg1 = *dst_reg;
 	env->false_reg2 = *src_reg;
@@ -18930,6 +18975,12 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			return err;
 	}
 
+	if (pred >= 0) {
+		err = bpf_context_branch(env, this_branch, insn, context_left, context_right,
+					 context_constant, context_value, pred == 1);
+		if (err)
+			return err;
+	}
 	if (pred == 1) {
 		/* Only follow the goto, ignore fall-through. If needed, push
 		 * the fall-through branch for simulation under speculative
@@ -18978,6 +19029,12 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	if (IS_ERR(other_branch))
 		return PTR_ERR(other_branch);
 	other_branch_regs = other_branch->frame[other_branch->curframe]->regs;
+	err = bpf_context_branch(env, this_branch, insn, context_left, context_right,
+				 context_constant, context_value, false);
+	err = err ?: bpf_context_branch(env, other_branch, insn, context_left, context_right,
+					context_constant, context_value, true);
+	if (err)
+		return err;
 
 	err = regs_bounds_sanity_check_branches(env);
 	if (err)
@@ -20285,8 +20342,12 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			if (insn->src_reg == BPF_PSEUDO_CALL)
 				return check_func_call(env, insn, &env->insn_idx);
 			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
-				return check_kfunc_call(env, insn, &env->insn_idx);
-			return check_helper_call(env, insn, &env->insn_idx);
+				err = check_kfunc_call(env, insn, &env->insn_idx);
+			else
+				err = check_helper_call(env, insn, &env->insn_idx);
+			if (!err && env->context_state)
+				env->cur_state->context_call_seen = true;
+			return err;
 		} else if (opcode == BPF_JA) {
 			if (BPF_SRC(insn->code) == BPF_X)
 				return check_indirect_jump(env, insn);
@@ -23961,6 +24022,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	ret = check_attach_btf_id(env);
 	if (ret)
 		goto skip_full_check;
+	ret = bpf_context_init(env);
+	if (ret)
+		goto skip_full_check;
 
 	ret = bpf_compute_const_regs(env);
 	if (ret < 0)
@@ -24154,6 +24218,7 @@ err_prep:
 	release_maps(env);
 	release_btfs(env);
 err_free_env:
+	bpf_context_free(env);
 	bpf_free_subprog_jts(env);
 	if (env->insn_aux_data)
 		bpf_clear_insn_aux_data(env, 0, env->insn_aux_data_len);

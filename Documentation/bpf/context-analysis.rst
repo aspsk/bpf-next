@@ -4,8 +4,10 @@ BPF Context Analysis
 ====================
 
 This facility preserves declared locking contracts and derives locking facts
-for native kernel functions. It does not change the verifier or attachment
-permissions. Interrupt, preemption and scheduling contexts are outside version 1.
+for native kernel functions. The verifier can use proven entry ownership and
+kfunc acquisition paths to reject recursive native locking. Attachment and
+kfunc availability permissions are unchanged. Interrupt, preemption and
+scheduling contexts are outside version 1.
 
 Enable ``CONFIG_CLANG_PLUGIN_BPF_CONTEXT_IR`` together with the AST collector
 and BTF debug information. The first implementation requires non-LTO builds;
@@ -377,3 +379,36 @@ alternatives and complete capability extents count as lock storage. Unknown
 pointers, lengths, layouts, embedded roots and out-of-bounds ranges retain the
 conservative alias result. Expanding a capture here recovers its historical
 type; it never substitutes a newly loaded pointer for the captured identity.
+
+Verifier checks
+---------------
+
+For native entry attachments, the verifier reads unconditional ``entry_held``
+facts (and existing trusted ``requires`` contracts) from the attachment target.
+At a kfunc call, it consumes positive ``witness`` tags, substitutes the actual
+BPF arguments and compares the resulting lock instance and native capability
+type with the entry-held locks. A conflict requires incompatible ownership
+modes, an exact instance match and a supported acquisition guard consistent
+with the BPF path. Reentrant capabilities and shared/shared ownership do not
+conflict. Unproved acquisition candidates never drive rejection.
+
+Track native argument identity through register copies, stack spills and
+synchronous BPF subprogram calls, including global functions. Scalar field
+loads and constant masks retain enough provenance to compare supported
+zero/one-bit branch conditions with a kfunc's ``bits_eq`` guard. Unsupported
+correlated predicates withhold the conflict proof. Do not infer object equality
+from matching lock types or recursive pointer fields.
+
+This first checker supports argument-rooted physical lock paths and a bounded
+input prefix. A preceding native helper/kfunc call ends that prefix because its
+effects may invalidate the entry ownership or field observations. Speculative
+execution states and asynchronous callbacks cannot establish a conflict from
+the original attachment's entry facts. Unknown identities, globals, symbolic
+tokens and unsupported predicates require further modelling. Consequently,
+acceptance is not a certificate that the whole BPF program cannot deadlock.
+
+For example, the ptrace LSM target inherits ``child->alloc_lock``. Passing that
+same ``child`` to ``bpf_get_task_exe_file`` matches its exclusive acquisition
+witness when ``PF_KTHREAD`` is clear, so the verifier rejects the call. A BPF
+path restricted to ``PF_KTHREAD`` being set excludes that witness: the kfunc
+returns before attempting the lock.
