@@ -72,7 +72,7 @@ struct site {
 	const struct expression **args;
 	unsigned int nargs, propagated_may;
 	bool unrepresentable_may;
-	bool interface_covered;
+	bool interface_covered, witness_prefix_safe;
 	struct facts held;
 	struct substitution *substitutions;
 	unsigned int nr_substitutions, substitution_slots;
@@ -84,7 +84,7 @@ struct site {
 	unsigned int snapshot;
 };
 
-enum value_kind { VALUE_UNKNOWN, VALUE_INTEGER, VALUE_CALL, VALUE_TEST, VALUE_PHI };
+enum value_kind { VALUE_UNKNOWN, VALUE_INTEGER, VALUE_CALL, VALUE_TEST, VALUE_PHI, VALUE_LOAD, VALUE_AND };
 
 struct value;
 struct phi_input {
@@ -95,7 +95,8 @@ struct phi_input {
 struct value {
 	enum value_kind kind;
 	long long number;
-	unsigned int call, nr_incoming;
+	unsigned int call, nr_incoming, bits;
+	const struct expression *address;
 	bool eq, number_valid;
 	struct value *left, *right;
 	struct phi_input *incoming;
@@ -112,6 +113,18 @@ struct block {
 	unsigned int nr_sites, nr_edges;
 	struct edge *edges;
 	struct value *ret;
+	bool witness_tail_safe;
+};
+
+/* A sufficient, consistent equality on one input scalar. No opaque effects
+ * precede the acquisition. This is independent of the may-acquire superset.
+ */
+struct acquisition_witness {
+	const struct expression *lock, *guard;
+	unsigned long long mask, value;
+	unsigned int bits;
+	enum mode mode;
+	char *via;
 };
 
 struct function {
@@ -121,7 +134,9 @@ struct function {
 	bool local, weak, defined, live, escaped, covered, raw_complete, complete;
 	bool entry_closed;
 	bool known_contract, exit_complete;
-	bool memory_covered;
+	bool memory_covered, witness_covered;
+	unsigned int witness_state, nr_witnesses;
+	struct acquisition_witness *witnesses;
 	bool may_incomplete, may_budget;
 	unsigned int loaded_may;
 	struct clobbers memory_clobbers, spin_clobbers;
@@ -192,7 +207,7 @@ struct context {
 	unsigned long long analyses, ownership_visits;
 	const char *trace_filter;
 	int verbose;
-	unsigned int tags, matched, complete, incomplete, entries;
+	unsigned int tags, matched, complete, incomplete, entries, witness_tags, witness_functions;
 };
 
 static void *resize(void *p, size_t count, size_t size)
@@ -791,7 +806,7 @@ static bool read_contracts(struct context *c, struct function *f, unsigned int a
 }
 
 /* Decode the hot CFG fields once; JSON is only a transport format. */
-static struct value *read_value(struct cj_doc *d, unsigned int id)
+static struct value *read_value(struct context *c, struct cj_doc *d, unsigned int id)
 {
 	struct value *v;
 	unsigned int kind, a, i, n = 0;
@@ -808,11 +823,22 @@ static struct value *read_value(struct cj_doc *d, unsigned int id)
 	} else if (cj_equal(d, kind, "call")) {
 		v->kind = VALUE_CALL;
 		v->call = cj_number(d, cj_get(d, id, "call"), UINT_MAX);
+	} else if (cj_equal(d, kind, "scalar_load")) {
+		char *address = string_field(d, id, "address");
+
+		v->kind = VALUE_LOAD;
+		v->address = intern_expression(c, address);
+		free(address);
+		v->bits = cj_number(d, cj_get(d, id, "bits"), 0);
+	} else if (cj_equal(d, kind, "and")) {
+		v->kind = VALUE_AND;
+		v->left = read_value(c, d, cj_get(d, id, "left"));
+		v->right = read_value(c, d, cj_get(d, id, "right"));
 	} else if (cj_equal(d, kind, "test")) {
 		v->kind = VALUE_TEST;
 		v->eq = cj_equal(d, cj_get(d, id, "predicate"), "eq");
-		v->left = read_value(d, cj_get(d, id, "left"));
-		v->right = read_value(d, cj_get(d, id, "right"));
+		v->left = read_value(c, d, cj_get(d, id, "left"));
+		v->right = read_value(c, d, cj_get(d, id, "right"));
 	} else if (cj_equal(d, kind, "phi")) {
 		v->kind = VALUE_PHI;
 		a = cj_get(d, id, "incoming");
@@ -820,7 +846,7 @@ static struct value *read_value(struct cj_doc *d, unsigned int id)
 		v->incoming = resize(NULL, v->nr_incoming, sizeof(*v->incoming));
 		cj_each(d, a, i) {
 			v->incoming[n].block = cj_number(d, cj_get(d, i, "block"), UINT_MAX);
-			v->incoming[n++].value = read_value(d, cj_get(d, i, "value"));
+			v->incoming[n++].value = read_value(c, d, cj_get(d, i, "value"));
 		}
 	}
 	return v;
@@ -885,7 +911,8 @@ static int read_document(struct context *c, const char *data, size_t len)
 	if (root < 0 || pos != len ||
 	    !cj_equal(d, cj_get(d, root, "format"), BPF_CONTEXT_FORMAT) ||
 	    (cj_number(d, cj_get(d, root, "version"), -1) != BPF_CONTEXT_VERSION &&
-	     cj_number(d, cj_get(d, root, "version"), -1) != 2))
+	     cj_number(d, cj_get(d, root, "version"), -1) != 2 &&
+	     cj_number(d, cj_get(d, root, "version"), -1) != 3))
 		return -EINVAL;
 	if (read_tokens(c, d, cj_get(d, root, "tokens")))
 		return -EINVAL;
@@ -914,6 +941,8 @@ static int read_document(struct context *c, const char *data, size_t len)
 		f->live = cj_bool(d, cj_get(d, i, "live"));
 		f->escaped = cj_bool(d, cj_get(d, i, "escaped")) || !symbolic_name(f->name);
 		f->covered = cj_bool(d, cj_get(d, i, "covered"));
+		f->witness_covered = cj_number(d, cj_get(d, root, "version"), 0) >= 4 &&
+			cj_bool(d, cj_get(d, i, "witness_covered"));
 		f->raw_complete = cj_bool(d, cj_get(d, i, "complete"));
 		f->memory_covered = cj_number(d, cj_get(d, root, "version"), 0) >= 3 &&
 			cj_bool(d, cj_get(d, i, "memory_covered"));
@@ -946,6 +975,7 @@ static int read_document(struct context *c, const char *data, size_t len)
 			if (bi >= f->nr_blocks)
 				return -EINVAL;
 			block = &f->blocks[bi];
+			block->witness_tail_safe = cj_bool(d, cj_get(d, b, "witness_tail_safe"));
 			{
 				unsigned int edges = cj_get(d, b, "edges"), e, n = 0;
 
@@ -954,10 +984,10 @@ static int read_document(struct context *c, const char *data, size_t len)
 				cj_each(d, edges, e) {
 					block->edges[n].block = cj_number(d, cj_get(d, e, "block"), UINT_MAX);
 					block->edges[n].truth = cj_bool(d, cj_get(d, e, "true"));
-					block->edges[n++].test = read_value(d, cj_get(d, e, "test"));
+					block->edges[n++].test = read_value(c, d, cj_get(d, e, "test"));
 				}
 			}
-			block->ret = read_value(d, cj_get(d, b, "return"));
+			block->ret = read_value(c, d, cj_get(d, b, "return"));
 			sites = cj_get(d, b, "calls");
 			block->nr_sites = sites ? d->tokens[sites].children : 0;
 			f->nr_sites += block->nr_sites;
@@ -968,6 +998,7 @@ static int read_document(struct context *c, const char *data, size_t len)
 				unsigned int args = cj_get(d, s, "arguments"), arg, j = 0;
 
 				site->id = cj_number(d, cj_get(d, s, "id"), UINT_MAX);
+				site->witness_prefix_safe = cj_bool(d, cj_get(d, s, "witness_prefix_safe"));
 				site->reference = cj_number(d, cj_get(d, s, "callee"), -1);
 				site->write = cj_equal(d, cj_get(d, s, "kind"), "write");
 				site->capture = cj_equal(d, cj_get(d, s, "kind"), "capture");
@@ -3080,6 +3111,261 @@ static bool reentrant_expression(struct context *c, struct function *f,
 	return type && c->reentrant[type];
 }
 
+/* Positive path certificates deliberately stop at the first ordinary call.
+ * They never inherit the speculative transitive may set. Unsupported prefixes
+ * and exhausted budgets withhold witnesses without changing completeness.
+ */
+static bool merge_witness_guard(struct acquisition_witness *to,
+				const struct acquisition_witness *from)
+{
+	if (!from->guard)
+		return true;
+	if (!to->guard) {
+		to->guard = from->guard;
+		to->bits = from->bits;
+		to->mask = from->mask;
+		to->value = from->value;
+		return true;
+	}
+	if (to->guard != from->guard || to->bits != from->bits ||
+	    ((to->value ^ from->value) & to->mask & from->mask))
+		return false;
+	to->value |= from->value;
+	to->mask |= from->mask;
+	return true;
+}
+
+static bool witness_edge(struct acquisition_witness *guard, const struct edge *edge,
+			 unsigned int pred)
+{
+	const struct value *v = phi_value(edge->test, pred), *left, *right, *load;
+	struct acquisition_witness next = {};
+	unsigned long long mask, number;
+	bool eq;
+
+	if (!v)
+		return true;
+	if (v->kind == VALUE_INTEGER && v->number_valid)
+		return !!v->number == edge->truth;
+	if (v->kind != VALUE_TEST)
+		return false;
+	left = phi_value(v->left, pred);
+	right = phi_value(v->right, pred);
+	if (!left || !right || right->kind != VALUE_INTEGER || !right->number_valid)
+		return false;
+	number = right->number;
+	/* Only zero comparisons are represented without integer-cast ambiguity. */
+	if (number)
+		return false;
+	load = left;
+	mask = ULLONG_MAX;
+	if (left->kind == VALUE_AND) {
+		load = left->left;
+		right = left->right;
+		if (load && load->kind == VALUE_INTEGER) {
+			load = left->right;
+			right = left->left;
+		}
+		if (!right || right->kind != VALUE_INTEGER || !right->number_valid)
+			return false;
+		mask = right->number;
+	}
+	if (!load || load->kind != VALUE_LOAD || !load->bits || load->bits > 64 ||
+	    !load->address || load->address->has_load || load->address->has_snapshot ||
+	    load->address->has_local)
+		return false;
+	if (left->kind == VALUE_AND && load->bits < 64 && (mask >> load->bits))
+		return false; /* Do not guess integer extension semantics. */
+	mask &= load->bits == 64 ? ULLONG_MAX : (1ULL << load->bits) - 1;
+	eq = v->eq == edge->truth;
+	if (number & ~mask)
+		return !eq;
+	if (!eq) {
+		/* A one-bit inequality is another equality. Wider disjunctions are
+		 * intentionally unsupported rather than guessed to be feasible.
+		 */
+		if (!mask || (mask & (mask - 1)))
+			return false;
+		number ^= mask;
+	}
+	next.guard = load->address;
+	next.bits = load->bits;
+	next.mask = mask;
+	next.value = number;
+	return merge_witness_guard(guard, &next);
+}
+
+static void save_witness(struct function *f, struct acquisition_witness w)
+{
+	unsigned int i;
+
+	if (!w.lock || !w.via)
+		return;
+	for (i = 0; i < f->nr_witnesses; ++i)
+		if (f->witnesses[i].lock == w.lock && f->witnesses[i].mode == w.mode) {
+			free(w.via);
+			return; /* One sufficient path per lock/mode. */
+		}
+	if (f->nr_witnesses == 8) {
+		free(w.via);
+		return;
+	}
+	f->witnesses = resize(f->witnesses, f->nr_witnesses + 1, sizeof(*f->witnesses));
+	f->witnesses[f->nr_witnesses++] = w;
+}
+
+static void derive_witnesses(struct context *c, struct function *f, unsigned int depth);
+
+static void witness_block(struct context *c, struct function *f, unsigned int block,
+			  unsigned int pred, unsigned long long visited,
+			  struct acquisition_witness guard, unsigned int *budget,
+			  unsigned int depth)
+{
+	struct block *b;
+	unsigned int i, j;
+
+	if (block >= f->nr_blocks || block >= 64 || (visited & (1ULL << block)) || !*budget)
+		return;
+	--*budget;
+	visited |= 1ULL << block;
+	b = &f->blocks[block];
+	for (i = 0; i < b->nr_sites; ++i) {
+		struct site *s = &b->sites[i];
+		struct function *g = s->callee;
+
+		if (s->capture)
+			continue;
+		if (s->write || !s->witness_prefix_safe || !g)
+			return;
+		derive_witnesses(c, g, depth + 1);
+		for (j = 0; j < g->nr_witnesses; ++j) {
+			struct acquisition_witness w = g->witnesses[j], combined = guard;
+			char via[512];
+			int n;
+
+			w.lock = substitute(c, w.lock, s);
+			if (w.guard)
+				w.guard = substitute(c, w.guard, s);
+			if (!w.lock || w.lock->has_load || w.lock->has_snapshot || w.lock->has_local ||
+			    (g->witnesses[j].guard && !w.guard) || !merge_witness_guard(&combined, &w))
+				continue;
+			n = snprintf(via, sizeof(via), "%s@%u/%s", f->name, s->id, w.via);
+			if (n < 0 || n >= sizeof(via))
+				continue;
+			combined.lock = w.lock;
+			combined.mode = w.mode;
+			combined.via = copy_string(via);
+			save_witness(f, combined);
+		}
+		return; /* Never assume that an earlier call returns or preserves guards. */
+	}
+	if (!b->witness_tail_safe)
+		return;
+	for (i = 0; i < b->nr_edges; ++i) {
+		struct acquisition_witness next = guard;
+
+		if (witness_edge(&next, &b->edges[i], pred))
+			witness_block(c, f, b->edges[i].block, block, visited, next, budget, depth);
+	}
+}
+
+static void derive_witnesses(struct context *c, struct function *f, unsigned int depth)
+{
+	unsigned int i, budget = 128;
+
+	if (f->witness_state || depth >= 16 || !symbolic_name(f->name))
+		return;
+	f->witness_state = 1;
+	/* This is the explicit trust boundary: a declared acquisition contract,
+	 * not an independently proved implementation of the locking primitive.
+	 */
+	if (f->known_contract) {
+		for (i = 0; i < f->declared.n; ++i)
+			if (f->declared.v[i].op == REQUIRE)
+				break;
+		if (i == f->declared.n)
+			for (i = 0; i < f->declared.n; ++i) {
+				struct fact fact = f->declared.v[i];
+				char via[256];
+
+				if (fact.op != ACQUIRE || fact.cond != ALWAYS || strlen(f->name) > 240)
+					continue;
+				snprintf(via, sizeof(via), "%s[declared]", f->name);
+				save_witness(f, (struct acquisition_witness){ .lock = fact.lock,
+					.mode = fact.mode, .via = copy_string(via) });
+			}
+	}
+	if (f->defined && f->witness_covered && f->nr_blocks <= 64)
+		witness_block(c, f, 0, UINT_MAX, 0, (struct acquisition_witness){}, &budget, depth);
+	f->witness_state = 2;
+}
+
+/* Resolve a scalar field exactly; unions and partial/bitfield reads stay unknown. */
+static bool witness_scalar(struct context *c, unsigned int type, long long offset,
+			   unsigned int bits, unsigned int depth)
+{
+	const struct btf_type *t;
+	unsigned int i;
+
+	if (depth > 24 || offset < 0 || !(type = unqualified(c, type)))
+		return false;
+	t = btf__type_by_id(c->btf, type);
+	if (btf_is_int(t) || btf_is_enum(t) || btf_is_enum64(t))
+		return !offset && bits == 8 * btf__resolve_size(c->btf, type);
+	if (!btf_is_struct(t))
+		return false;
+	for (i = 0; i < btf_vlen(t); ++i) {
+		long long start = btf_member_bit_offset(t, i) / 8;
+		long long size = btf__resolve_size(c->btf, btf_members(t)[i].type);
+
+		if (offset >= start && size > 0 && offset - start < size &&
+		    !(btf_member_bit_offset(t, i) % 8) && !btf_member_bitfield_size(t, i))
+			return witness_scalar(c, btf_members(t)[i].type, offset - start, bits, depth + 1);
+	}
+	return false;
+}
+
+static int emit_witnesses(struct context *c, struct function *f, unsigned int id)
+{
+	static const char * const modes[] = { "exclusive", "shared", "generic" };
+	unsigned int i, before = c->witness_tags;
+
+	derive_witnesses(c, f, 0);
+	for (i = 0; i < f->nr_witnesses; ++i) {
+		struct acquisition_witness *w = &f->witnesses[i];
+		const struct btf_type *t = btf__type_by_id(c->btf, id);
+		const struct btf_type *proto = btf__type_by_id(c->btf, t->type);
+		char tag[1280], guard[MAX_EXPR + 128];
+		int n, err;
+
+		if (!typed_expression(c, proto, w->lock, false))
+			continue;
+		strcpy(guard, "always");
+		if (w->guard) {
+			struct location loc;
+			const char *p = w->guard->text;
+
+			if (!native_expression(c, w->guard, false) ||
+			    !expression_location(c, proto, &p, &loc, 0) || *p ||
+			    !witness_scalar(c, loc.type, loc.offset, w->bits, 0))
+				continue;
+			snprintf(guard, sizeof(guard), "bits_eq(%s,%u,%llu,%llu)",
+				 w->guard->text, w->bits, w->mask, w->value);
+		}
+		n = snprintf(tag, sizeof(tag), BPF_CONTEXT_TAG_PREFIX "witness:%s:%s:%s:%s",
+			     modes[w->mode], w->lock->text, guard, w->via);
+		if (n < 0 || n >= sizeof(tag))
+			continue;
+		err = add_tag(c, id, tag);
+		if (err)
+			return err;
+		++c->witness_tags;
+	}
+	if (c->witness_tags != before)
+		++c->witness_functions;
+	return 0;
+}
+
 static int emit_functions(struct context *c)
 {
 	unsigned int i, j;
@@ -3104,6 +3390,10 @@ static int emit_functions(struct context *c)
 		if (!proto || !btf_is_func_proto(proto) || btf_vlen(proto) != f->nargs)
 			continue; /* Do not guess through ABI lowering or implicit kfunc arguments. */
 		++c->matched;
+		if ((err = emit_witnesses(c, f, id)))
+			return err;
+		t = btf__type_by_id(c->btf, id);
+		proto = btf__type_by_id(c->btf, t->type);
 		for (j = 0; j < f->effects.n; ++j) {
 			bool declared = contains(&f->declared, &f->effects.v[j]);
 			if (typed_expression(c, proto, f->effects.v[j].lock, false)) {
@@ -3160,6 +3450,9 @@ static void destroy_context(struct context *c)
 	for (i = 0; i < c->nr_functions; ++i) {
 		struct function *f = &c->functions[i];
 
+		for (j = 0; j < f->nr_witnesses; ++j)
+			free(f->witnesses[j].via);
+		free(f->witnesses);
 		free(f->name); clear(&f->declared); clear(&f->effects); clear(&f->may); clear(&f->entry);
 		for (j = 0; j < f->nr_blocks; ++j) {
 			for (k = 0; k < f->blocks[j].nr_sites; ++k) {
@@ -3412,6 +3705,9 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 		fprintf(stderr, "context-analysis: %u function descriptions, %u native matches, "
 			"%u complete summaries, %u incomplete summaries, %u entry facts, %u tags; %u rounds\n",
 			c.nr_functions, c.matched, c.complete, c.incomplete, c.entries, c.tags, round + 1);
+	if (verbose)
+		fprintf(stderr, "context-analysis: %u acquisition witnesses in %u native functions; "
+			"unwitnessed may-acquire candidates remain unproved\n", c.witness_tags, c.witness_functions);
 	if (verbose)
 		fprintf(stderr, "context-analysis: %u interned expressions, "
 			"%llu substitution cache hits, %llu misses\n",

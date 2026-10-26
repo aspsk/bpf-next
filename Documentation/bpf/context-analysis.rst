@@ -22,8 +22,9 @@ optimization. ``resolve_btfids/context.c`` resolves the linked descriptions and
 adds BTF declaration tags before BTF deduplication and finalization. Pahole
 continues to generate ordinary BTF from DWARF; it needs no changes.
 
-Both ELF sections are build-only INFO sections. Only positive facts become
-runtime BTF tags. Missing tags never establish the absence of locking effects.
+Both ELF sections are build-only INFO sections. Runtime tags distinguish declared/derived ownership, conservative acquisition
+candidates and positive acquisition-path witnesses. Missing tags never establish
+the absence of locking effects.
 The fmodret scanner and resolver are independent of this pipeline.
 
 Runtime format
@@ -58,10 +59,44 @@ type, so function tags do not duplicate a lock-kind enumeration.
 
 ``CONDITION`` is ``always``, ``ret_eq(N)`` or ``ret_ne(N)``, with signed decimal
 N. Conditional acquisition is an exit effect: the function returns holding the
-lock on the specified return branch. ``may_acquire`` describes an internal
-acquisition, including locks released before returning; ``always`` imposes no
+lock on the specified return branch. ``may_acquire`` is a conservative internal-acquisition candidate, including locks
+released before returning. Transitive propagation does not prove path feasibility; ``always`` imposes no
 return-value restriction and does not assert that every execution acquires it.
 ``entry_held`` describes ownership inherited from every possible caller.
+
+Positive acquisition paths use a separate function tag::
+
+  bpf_context:v1:witness:MODE:LOCK:GUARD:VIA
+
+``GUARD`` is ``always`` or ``bits_eq(ADDRESS,BITS,MASK,VALUE)``. It describes a
+sufficient, consistent equality on a native integer input field: the field read
+at ADDRESS, with width BITS, satisfies ``(field & MASK) == VALUE``. Supported
+zero comparisons and one-bit inequalities are combined through direct calls;
+conflicting masks on the same field reject the path. Constraints on multiple
+unrelated fields, unknown predicates and integer extension ambiguities are not
+proved. Native BTF validates the scalar width and physical lock path.
+
+``VIA`` records ``function@call/function@call/primitive[declared]``. A witness
+proves a supported path reaches a declared acquisition of the specified lock;
+it does not claim every execution takes that path or that acquisition completes
+when the lock is already held. The locking primitive's source contract is the
+explicit trust boundary, not an independent proof of its implementation.
+
+The initial proof language stops at the first ordinary call and permits only
+pure supported prefixes before it. Writes, opaque calls, assumptions, unrelated
+reads and unsupported instructions withhold the witness. A scalar guard read
+must be checked on the branch before the acquisition; its address cannot itself
+contain a pointer load. Captured, local and pointer-loaded lock identities are
+not emitted as witnesses. Recursion, CFG and result budgets only reduce positive
+coverage. No witness is inferred from the transitive ``may_acquire`` set.
+
+Bpftool labels ordinary ``may_acquire`` candidates ``[unproven path]`` and
+prints witnesses separately, with the scalar member name, bit mask and call
+chain. JSON uses ``evidence: candidate`` versus ``evidence: path``. Absence of a
+witness is unknown; it never certifies a lock-free function. Complete-summary
+tags continue to describe the conservative candidate/effect summary, independently
+of witnesses. Withholding a witness never upgrades completeness.
+
 
 There is one additional positive function fact::
 
@@ -175,7 +210,9 @@ unit, with ``format``, ``version``, ``unit``, ``types``, ``tokens`` and
 ``functions``. Version 2 adds symbolic-token declarations. IR transport
 version 3 adds write events (address and byte width) and memory-effect
 coverage. Version 2 remains readable without the new preservation proofs.
-Version 3 also records pointer snapshots and ordered capture events. Each
+Version 4 adds scalar-load/AND branch values, per-call safe-prefix flags,
+per-block safe-tail flags and function-level witness coverage. Versions 2 and 3
+remain readable but cannot supply new body-path certificates. Version 3 also records pointer snapshots and ordered capture events. Each
 snapshot identifies one SSA pointer value from a load or a supported getter.
 Repeated reads have distinct identities. A capture executed again in a loop
 invalidates ownership tied to that definition's previous dynamic instance.
