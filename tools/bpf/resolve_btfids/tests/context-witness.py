@@ -47,11 +47,12 @@ with tempfile.TemporaryDirectory(prefix="context-witness-") as tmp:
         assert not witnesses(name), (name, witnesses(name))
         print("PASS witness withheld:", name)
     # Removing an unsupported witness never upgrades the old may summary.
-    for name in ("opaque_first", "write_first", "unreadable_prefix"):
+    for name in ("guarded", "wrapper", "wrong_instance", "opaque_first", "write_first", "unreadable_prefix"):
         assert not any(x.get("fact") == "lock_summary_complete" for x in records.get(name, [])), name
     pretty = subprocess.check_output([
         str(root / "tools/bpf/bpftool/bpftool"), "btf", "context-analysis",
         "file", str(obj) + ".BTF", "func", "wrapper"], text=True)
     assert "(task->flags & 0x200000) == 0x0" in pretty, pretty
-    assert "[unproven path]" in pretty and "witnessed may_acquire" in pretty, pretty
+    assert "[unproven path]" not in pretty and "derived may_acquire" in pretty, pretty
+    assert not any(x.get("evidence") == "candidate" for f in data for x in f["facts"]), data
     print("PASS readable guards and distinct candidate/witness evidence")

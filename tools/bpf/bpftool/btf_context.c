@@ -430,7 +430,8 @@ static void print_context_tag(struct context_printer *p, const struct btf_type *
 				jsonw_string_field(json_wtr, "evidence", "candidate");
 			}
 		} else {
-			printf("  %s %s %s ", tag.source, tag.effect, tag.mode);
+			printf("  %s %s %s ", tag.kind == BTF_CONTEXT_WITNESS ? "derived" : tag.source,
+			       tag.effect, tag.mode);
 			print_context_lock(p, proto, tag.lock);
 			if (tag.kind == BTF_CONTEXT_WITNESS) {
 				print_witness_condition(p, proto, tag.condition);

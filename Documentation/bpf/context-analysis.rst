@@ -92,12 +92,17 @@ contain a pointer load. Captured, local and pointer-loaded lock identities are
 not emitted as witnesses. Recursion, CFG and result budgets only reduce positive
 coverage. No witness is inferred from the transitive ``may_acquire`` set.
 
-Bpftool labels ordinary ``may_acquire`` candidates ``[unproven path]`` and
-prints witnesses separately, with the scalar member name, bit mask and call
-chain. JSON uses ``evidence: candidate`` versus ``evidence: path``. Absence of a
-witness is unknown; it never certifies a lock-free function. Complete-summary
-tags continue to describe the conservative candidate/effect summary, independently
-of witnesses. Withholding a witness never upgrades completeness.
+Unproved acquisition candidates remain internal. With at least two
+``--verbose`` flags and ``BPF_CONTEXT_TRACE=FUNCTION``, resolve_btfids prints
+matching functions' candidates for diagnosis. It never emits those candidates
+as runtime tags. Bpftool prints proven acquisition paths as ``derived may_acquire``
+with their scalar guard and call chain; JSON retains ``evidence: path``.
+
+Absence of a witness is unknown; it never certifies a lock-free function.
+A complete runtime summary additionally requires every internal candidate to
+be covered by an emitted unconditional witness. Conditional witnesses describe
+sufficient paths, not all possible acquisition conditions, so they alone cannot
+certify completeness. Withholding any witness never upgrades completeness.
 
 
 There is one additional positive function fact::
