@@ -93,6 +93,7 @@
 #include <subcmd/parse-options.h>
 
 #include "context.h"
+#include "datasec.h"
 
 #define BTF_IDS_SECTION	".BTF_ids"
 #define BTF_LINK_MODULE_NAME_MAX	64
@@ -2174,6 +2175,9 @@ int main(int argc, const char **argv)
 			goto out;
 
 	if (load_btf(&obj))
+		goto out;
+
+	if (btf_datasec_dedup(&obj.btf, obj.efile.elf, verbose))
 		goto out;
 
 	if (btf2btf(&obj))

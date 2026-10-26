@@ -24,3 +24,17 @@ raw writes inside the outer capability's storage. Releases at an aliased
 address must still invalidate ownership.
 The caller and callee may both use snapshot number zero for different
 objects; a callee's private capture cannot establish caller ownership.
+
+DATASEC regressions
+===================
+
+Build resolve_btfids, then run::
+
+  python3 tools/bpf/resolve_btfids/tests/datasec.py
+
+This test links real weak and strong ELF definitions and supplies synthetic
+BTF to exercise duplicate global variables, repeated DATASEC members,
+declaration-tag reference remapping and split BTF. Distinct names are not
+merged and incompatible definitions must fail. It does not load BTF or run
+kernel code. Override CLANG, LD and DATASEC_TEST_CFLAGS to test other ELF
+architectures, word sizes and byte orders.
