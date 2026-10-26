@@ -179,6 +179,8 @@ struct context {
 	unsigned int nr_btf_names, nr_elf_names;
 	struct btf *btf;
 	bool *capabilities, *spin_capabilities, *reentrant;
+	bool *embedded_storage;
+	bool storage_layout_complete;
 	struct context_token *tokens;
 	unsigned int nr_tokens;
 	struct emitted_tag **emitted;
@@ -2698,6 +2700,133 @@ static bool spin_expression(struct context *c, struct function *f,
 	return c->spin_capabilities[type];
 }
 
+/* A pointer member does not embed its pointee. By-value members and arrays
+ * do: a seemingly ordinary object can then overlap an enclosing capability
+ * or another union member. Do not use typed separation for those roots.
+ */
+static void index_embedded_storage(struct context *c)
+{
+	unsigned int id, i;
+
+	c->storage_layout_complete = true;
+	for (id = 1; id < btf__type_cnt(c->btf); ++id) {
+		const struct btf_type *t = btf__type_by_id(c->btf, id);
+
+		if (!btf_is_composite(t))
+			continue;
+		for (i = 0; i < btf_vlen(t); ++i) {
+			unsigned int type = btf_members(t)[i].type, depth;
+
+			for (depth = 0; depth < 24; ++depth) {
+				if (!(type = unqualified(c, type)))
+					break;
+				if (!btf_is_array(btf__type_by_id(c->btf, type)))
+					break;
+				type = btf_array(btf__type_by_id(c->btf, type))->type;
+			}
+			if (!type || depth == 24) {
+				c->storage_layout_complete = false;
+				continue;
+			}
+			if (btf_is_composite(btf__type_by_id(c->btf, type)))
+				c->embedded_storage[type] = true;
+		}
+	}
+}
+
+/* Inspect storage, never follow pointer members. All union alternatives count.
+ * Unknown layouts, extents and partially modelled arrays may contain a lock.
+ */
+static bool overlaps_capability_storage(struct context *c, unsigned int type,
+					long long offset, long long width, unsigned int depth)
+{
+	const struct btf_type *t;
+	long long size;
+	unsigned int i;
+
+	if (depth > 24 || !(type = unqualified(c, type)) || offset < 0 || width <= 0)
+		return true;
+	t = btf__type_by_id(c->btf, type);
+	size = btf__resolve_size(c->btf, type);
+	if (size <= 0 || offset > size || width > size - offset || c->capabilities[type])
+		return true;
+	if (btf_is_array(t)) {
+		const struct btf_array *a = btf_array(t);
+		long long element = btf__resolve_size(c->btf, a->type), first, last, tail;
+
+		if (element <= 0 || !a->nelems)
+			return true;
+		first = offset / element;
+		last = (offset + width - 1) / element;
+		if (last >= a->nelems)
+			return true;
+		tail = element - offset % element;
+		if (overlaps_capability_storage(c, a->type, offset % element,
+					       width < tail ? width : tail, depth + 1))
+			return true;
+		if (last == first)
+			return false;
+		if (overlaps_capability_storage(c, a->type, 0,
+					       (offset + width - 1) % element + 1, depth + 1))
+			return true;
+		return last > first + 1 &&
+			overlaps_capability_storage(c, a->type, 0, element, depth + 1);
+	}
+	if (!btf_is_composite(t))
+		return !(btf_is_int(t) || btf_is_enum(t) || btf_is_enum64(t) ||
+			 btf_is_ptr(t) || btf_is_float(t));
+	for (i = 0; i < btf_vlen(t); ++i) {
+		const struct btf_member *m = &btf_members(t)[i];
+		long long start = btf_member_bit_offset(t, i) / 8;
+		long long length = btf__resolve_size(c->btf, m->type), begin, end;
+
+		if (length <= 0) {
+			if (offset + width > start)
+				return true;
+			continue;
+		}
+		if (start >= offset + width || length <= offset - start)
+			continue;
+		if (btf_member_bitfield_size(t, i) || btf_member_bit_offset(t, i) % 8)
+			return true;
+		begin = offset > start ? offset : start;
+		end = offset + width < start + length ? offset + width : start + length;
+		if (overlaps_capability_storage(c, m->type, begin - start, end - begin, depth + 1))
+			return true;
+	}
+	return false;
+}
+
+static bool typed_write_disjoint(struct context *c, struct function *f,
+				 const struct expression *lock, struct clobber effect)
+{
+	const struct btf_type *proto = f->native_proto ? btf__type_by_id(c->btf, f->native_proto) : NULL;
+	const struct expression *origin;
+	struct location owned, written;
+	const char *p;
+	unsigned int root;
+
+	if (effect.release || !effect.width || !c->storage_layout_complete || !lock->has_snapshot)
+		return false;
+	/* Expanding a capture recovers its type, not a current pointer value. */
+	origin = expand_snapshots(c, f, lock);
+	if (!origin)
+		return false;
+	p = origin->text;
+	if (!expression_location(c, proto, &p, &owned, 0) || *p ||
+	    !capability_at(c, owned.type, owned.offset, 0))
+		return false;
+	origin = expand_snapshots(c, f, effect.address);
+	if (!origin)
+		return false;
+	p = origin->text;
+	if (!expression_location(c, proto, &p, &written, 0) || *p ||
+	    !(root = unqualified(c, written.type)) ||
+	    !btf_is_composite(btf__type_by_id(c->btf, root)) || c->embedded_storage[root])
+		return false;
+	return !overlaps_capability_storage(c, root, written.offset, effect.width, 0);
+}
+
 static bool address_base(const struct expression *expr, char *base, long long *offset)
 {
 	char text[MAX_EXPR];
@@ -2760,6 +2889,8 @@ static bool clobber_aliases(struct context *c, struct function *f,
 	/* Raw stores may implement a symbolic context's low-level transition. */
 	if (left || right)
 		return true;
+	if (typed_write_disjoint(c, f, lock, effect))
+		return false;
 	if (!address_base(lock, a, &x) || !address_base(effect.address, b, &y))
 		return true;
 	/* A declared release changes ownership of that instance, not every
@@ -3077,6 +3208,7 @@ static void destroy_context(struct context *c)
 	}
 	free(c->tokens); free(c->reentrant);
 	free(c->spin_capabilities);
+	free(c->embedded_storage);
 	free(c->functions); free(c->names); free(c->elf_names); free(c->btf_names); free(c->capabilities);
 	for (i = 0; i < c->nr_entry_references; ++i) {
 		free(c->entry_references[i].target);
@@ -3188,6 +3320,8 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 	memset(c.capabilities, 0, (btf__type_cnt(btf) + 5 * c.nr_tokens) * sizeof(*c.capabilities));
 	c.spin_capabilities = resize(NULL, btf__type_cnt(btf) + 5 * c.nr_tokens, sizeof(*c.spin_capabilities));
 	memset(c.spin_capabilities, 0, (btf__type_cnt(btf) + 5 * c.nr_tokens) * sizeof(*c.spin_capabilities));
+	c.embedded_storage = resize(NULL, btf__type_cnt(btf) + 5 * c.nr_tokens, sizeof(*c.embedded_storage));
+	memset(c.embedded_storage, 0, (btf__type_cnt(btf) + 5 * c.nr_tokens) * sizeof(*c.embedded_storage));
 	c.reentrant = resize(NULL, btf__type_cnt(btf) + 5 * c.nr_tokens, sizeof(*c.reentrant));
 	memset(c.reentrant, 0, (btf__type_cnt(btf) + 5 * c.nr_tokens) * sizeof(*c.reentrant));
 	for (i = 1; i < btf__type_cnt(btf); ++i) {
@@ -3201,6 +3335,7 @@ int context_btf_generate(const char *path, struct btf *btf, int verbose)
 	err = err ?: emit_types(&c);
 	if (err)
 		goto out;
+	index_embedded_storage(&c);
 	for (i = 0; i < c.nr_functions; ++i) {
 		struct function *f = &c.functions[i];
 		unsigned int id = f->live && unique_symbol(&c, f->name) ?
