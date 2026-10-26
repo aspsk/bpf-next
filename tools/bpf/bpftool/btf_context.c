@@ -350,7 +350,8 @@ static bool context_scalar_member(struct context_printer *p, struct context_loca
 		strcpy(loc->name, path);
 		loc->type = m->type;
 		loc->offset -= offset;
-		loc->pointer = false;
+		if (*name)
+			loc->pointer = false;
 		return context_scalar_member(p, loc, depth + 1);
 	}
 	return false;

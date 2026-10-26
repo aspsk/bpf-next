@@ -2,7 +2,7 @@
 #define NOINLINE __attribute__((noinline))
 #define MASK 0x200000U
 struct __attribute__((capability("spinlock"))) witness_lock { unsigned int state; };
-struct witness_task { unsigned int flags; struct witness_lock lock; };
+struct witness_task { struct { unsigned int flags; }; struct witness_lock lock; };
 void witness_lock(struct witness_lock *lock) __attribute__((acquire_capability(lock)));
 void witness_unlock(struct witness_lock *lock) __attribute__((release_capability(lock)));
 void opaque_prefix(void);
