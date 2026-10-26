@@ -2690,10 +2690,15 @@ static bool spin_expression(struct context *c, struct function *f,
 {
 	const struct btf_type *proto = f->native_proto ? btf__type_by_id(c->btf, f->native_proto) : NULL;
 	struct location loc;
-	const char *p = lock->text;
+	const char *p;
 	unsigned int type;
 
-	if (!native_expression(c, lock, false) ||
+	/* Classify the captured object without replacing its ownership identity. */
+	lock = expand_snapshots(c, f, lock);
+	if (!lock)
+		return false;
+	p = lock->text;
+	if (!native_expression(c, lock, true) ||
 	    !expression_location(c, proto, &p, &loc, 0) || *p ||
 	    !(type = capability_at(c, loc.type, loc.offset, 0)))
 		return false;
