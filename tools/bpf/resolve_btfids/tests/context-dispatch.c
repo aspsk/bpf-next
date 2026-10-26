@@ -19,6 +19,7 @@ static int jump_key;
 asm(".pushsection .static_call.text, \"ax\"\n"
     ".align 4\n.globl __SCT__lsm_static_call_example_0\n"
     "__SCT__lsm_static_call_example_0:\n"
+    "911: .pushsection .discard.annotate_insn, \"M\", @progbits, 8; .long 911b - ., 1; .popsection\n"
     TRAMP_BODY ".byte 0x0f, 0xb9, 0xcc\n"
     ".type __SCT__lsm_static_call_example_0, @function\n"
     ".size __SCT__lsm_static_call_example_0, . - __SCT__lsm_static_call_example_0\n"
