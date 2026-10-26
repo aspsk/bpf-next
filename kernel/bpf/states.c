@@ -528,6 +528,9 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 		    struct bpf_reg_state *rcur, struct bpf_idmap *idmap,
 		    enum exact_level exact)
 {
+	if (rold->context_id != rcur->context_id)
+		return false;
+
 	if (exact == EXACT)
 		return regs_exact(rold, rcur, idmap);
 
@@ -1031,6 +1034,10 @@ static bool states_equal(struct bpf_verifier_env *env,
 {
 	u32 insn_idx;
 	int i;
+
+	if (old->context_condition != cur->context_condition ||
+	    old->context_call_seen != cur->context_call_seen)
+		return false;
 
 	if (old->curframe != cur->curframe)
 		return false;
