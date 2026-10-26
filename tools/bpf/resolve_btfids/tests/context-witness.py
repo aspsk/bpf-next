@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix="context-witness-") as tmp:
     assert facts[0]["condition"] == "bits_eq(arg(1),32,2097152,0)", facts
     print("PASS exact lock instance substitution")
     for name in ("contradictory", "opaque_first", "unknown_guard", "write_first", "assumed",
-                 "unreadable_prefix", "unsupported_mask", "extension_guard"):
+                 "unreadable_prefix", "unsupported_mask", "extension_guard", "global_guard", "impossible_bool"):
         assert not witnesses(name), (name, witnesses(name))
         print("PASS witness withheld:", name)
     # Removing an unsupported witness never upgrades the old may summary.

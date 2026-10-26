@@ -69,7 +69,7 @@ Positive acquisition paths use a separate function tag::
   bpf_context:v1:witness:MODE:LOCK:GUARD:VIA
 
 ``GUARD`` is ``always`` or ``bits_eq(ADDRESS,BITS,MASK,VALUE)``. It describes a
-sufficient, consistent equality on a native integer input field: the field read
+sufficient, consistent equality on a native integer field rooted in a pointer argument: the field read
 at ADDRESS, with width BITS, satisfies ``(field & MASK) == VALUE``. Supported
 zero comparisons and one-bit inequalities are combined through direct calls;
 conflicting masks on the same field reject the path. Constraints on multiple
@@ -85,7 +85,9 @@ explicit trust boundary, not an independent proof of its implementation.
 The initial proof language stops at the first ordinary call and permits only
 pure supported prefixes before it. Writes, opaque calls, assumptions, unrelated
 reads and unsupported instructions withhold the witness. A scalar guard read
-must be checked on the branch before the acquisition; its address cannot itself
+must be checked on the branch before the acquisition; global predicates require
+additional value proofs and are currently rejected. Boolean fields cannot witness
+values outside their native domain. The guard address cannot itself
 contain a pointer load. Captured, local and pointer-loaded lock identities are
 not emitted as witnesses. Recursion, CFG and result budgets only reduce positive
 coverage. No witness is inferred from the transitive ``may_acquire`` set.
