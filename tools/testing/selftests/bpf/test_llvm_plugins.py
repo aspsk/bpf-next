@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Check atomic CLEAN_SEED recognition in readable kernel C examples."""
+"""Check atomic CLEAN_SEED recognition in readable kernel C tests."""
 import argparse
 import os
 from pathlib import Path

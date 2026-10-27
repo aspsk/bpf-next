@@ -39,6 +39,7 @@ TEST_FILES = xsk_prereqs.sh $(wildcard progs/btf_dump_test_case_*.c)	\
 
 # Order correspond to 'make run_tests' order
 TEST_PROGS := test_llvm_plugins.py \
+	test_llvm_plugins_derived.py \
 	test_bpftool_build.sh \
 	test_doc_build.sh \
 	test_xsk.sh \
