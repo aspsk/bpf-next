@@ -74,6 +74,9 @@
  * programs. For each of them resolve_btfids emits a "bpf_fmodret" decl tag,
  * and "bpf_fmodret_sleepable" when KF_SLEEPABLE is set. The kernel builds
  * the set of fmod_ret targets from these tags when it loads BTF.
+ *
+ * Functions which the analysis of the compiler plugin metadata proves safe
+ * to fail get "bpf_fmodret" too, and "bpf_fmodret_auto" to tell them apart.
  */
 
 #define  _GNU_SOURCE
@@ -155,6 +158,9 @@ struct object {
 	bool distill_base;
 	bool extract_inline;
 
+	/* Functions the analysis found safe for fmod_ret, see fmodret-analyse.c */
+	struct btf_id_set8 *fmodret_auto;
+
 	struct {
 		int		 fd;
 		Elf		*elf;
@@ -205,6 +211,7 @@ struct btf_links {
 #define DECL_TAG_KFUNC "bpf_kfunc"
 #define DECL_TAG_FMODRET "bpf_fmodret"
 #define DECL_TAG_FMODRET_SLEEPABLE "bpf_fmodret_sleepable"
+#define DECL_TAG_FMODRET_AUTO "bpf_fmodret_auto"
 
 #define KF_SLEEPABLE	(1 << 5)
 #define KF_FASTCALL	(1 << 12)
@@ -1778,6 +1785,24 @@ static int add_decl_tag(struct btf2btf_context *ctx, const char *tag_name,
 	return push_decl_tag_id(ctx, new_id);
 }
 
+static struct kfunc *find_set_func(struct rb_root *root, u32 btf_id)
+{
+	struct rb_node *node = root->rb_node;
+
+	while (node) {
+		struct kfunc *k = rb_entry(node, struct kfunc, rb_node);
+
+		if (btf_id < k->btf_id)
+			node = node->rb_left;
+		else if (btf_id > k->btf_id)
+			node = node->rb_right;
+		else
+			return k;
+	}
+
+	return NULL;
+}
+
 static int btf2btf(struct object *obj)
 {
 	struct btf2btf_context ctx = {};
@@ -1825,6 +1850,22 @@ static int btf2btf(struct object *obj)
 			if (err)
 				goto out;
 		}
+	}
+
+	/* Functions found safe by the analysis, unless declared explicitly */
+	for (u32 i = 0; obj->fmodret_auto && i < obj->fmodret_auto->cnt; i++) {
+		u32 btf_id = obj->fmodret_auto->pairs[i].id;
+
+		if (find_set_func(&ctx.fmodrets, btf_id))
+			continue;
+
+		err = add_decl_tag(&ctx, DECL_TAG_FMODRET, btf_id, -1);
+		if (err)
+			goto out;
+
+		err = add_decl_tag(&ctx, DECL_TAG_FMODRET_AUTO, btf_id, -1);
+		if (err)
+			goto out;
 	}
 
 	err = 0;
@@ -2238,7 +2279,7 @@ int main(int argc, const char **argv)
 	if (load_btf(&obj))
 		goto out;
 
-	err = fmodret_analyse(obj.efile.elf, verbose);
+	err = fmodret_analyse_collect(obj.efile.elf, obj.btf, &obj.fmodret_auto, verbose);
 	if (err)
 		goto out;
 
@@ -2299,6 +2340,7 @@ out:
 	btf_id__free_all(&obj.funcs);
 	btf_id__free_all(&obj.sets);
 	free(obj.addr_syms);
+	free(obj.fmodret_auto);
 	free(obj.efile.func_symbols);
 	if (obj.efile.elf) {
 		elf_end(obj.efile.elf);

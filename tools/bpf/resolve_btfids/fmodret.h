@@ -4,6 +4,10 @@
 
 #include <libelf.h>
 
-int fmodret_analyse(Elf *elf, int verbose);
+struct btf;
+struct btf_id_set8;
+
+int fmodret_analyse_collect(Elf *elf, const struct btf *btf,
+			    struct btf_id_set8 **result, int verbose);
 
 #endif
