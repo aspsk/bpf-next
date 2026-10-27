@@ -83,7 +83,7 @@ def read_btf(path, base=None):
         name, info, value = struct.unpack_from(endian + 'III', data, pos)
         pos += 12
         kind, count = info >> 24 & 127, info & 0xffffff
-        size = {1: 4, 2: 0, 8: 0, 14: 4, 15: count * 12, 17: 4}[kind]
+        size = {1: 4, 2: 0, 3: 12, 8: 0, 10: 0, 14: 4, 15: count * 12, 17: 4}[kind]
         words = struct.unpack_from(endian + 'I' * (size // 4), data, pos)
         records[len(records) + 1] = (kind, strings[name:strings.index(0, name)].decode(), value, words)
         pos += size
@@ -93,9 +93,15 @@ def read_btf(path, base=None):
 with tempfile.TemporaryDirectory(prefix='btf-datasec-') as directory:
     tmp = Path(directory)
     source = tmp / 'strong.c'
-    source.write_text('int shared = 7; int other = 9; void entry(void) {}\n')
+    source.write_text('int shared = 7; int other = 9; void entry(void) {}\n'
+                      'extern int shared_alias __attribute__((alias("shared")));\n'
+                      'unsigned char shrunk = 1; unsigned char adjacent = 2;\n'
+                      'static unsigned char p0 __asm__("piece.0") __attribute__((used)) = 1;\n'
+                      'static unsigned char p1 __asm__("piece.1") __attribute__((used)) = 2;\n'
+                      'static volatile int local = 1; int read_local(void) { return local; }\n')
     weak = tmp / 'weak.c'
-    weak.write_text('int shared __attribute__((weak));\n')
+    weak.write_text('int shared __attribute__((weak));\n'
+                    'static volatile int local = 2; int read_other(void) { return local; }\n')
     objects = []
     for path in (source, weak):
         obj = path.with_suffix('.o')
@@ -110,7 +116,8 @@ with tempfile.TemporaryDirectory(prefix='btf-datasec-') as directory:
     other_section, other_offset, other_size = symbols['other'][0]
     assert shared_section == other_section
 
-    def run(name, different_type=False, base=False, false_identity=False, repeated_member=False):
+    def run(name, different_type=False, base=False, false_identity=False,
+            repeated_member=False, embedded=False):
         ancestor = Btf(endian) if base else None
         if ancestor:
             integer = ancestor.add(1, 'int', 4, [1 << 24 | 32])
@@ -134,32 +141,141 @@ with tempfile.TemporaryDirectory(prefix='btf-datasec-') as directory:
         if ancestor:
             parent = tmp / 'base.btf'
             ancestor.write(parent)
-            args += ['--btf_base', str(parent)]
-        result = subprocess.run([*args, str(image)], capture_output=True, text=True)
+            if not embedded:
+                args += ['--btf_base', str(parent)]
+        target = image
+        if embedded:
+            target = tmp / 'embedded'
+            subprocess.run([os.environ.get('OBJCOPY', 'llvm-objcopy-23'),
+                            '--add-section', '.BTF=' + str(raw),
+                            '--add-section', '.BTF.base=' + str(parent),
+                            str(image), str(target)], check=True)
+            args = [str(resolver), '--verbose']
+        result = subprocess.run([*args, str(target)], capture_output=True, text=True)
         if different_type:
             assert result.returncode and 'incompatible definitions' in result.stderr, result.stderr
             print('PASS incompatible definitions rejected')
             return
+        if false_identity:
+            assert result.returncode and 'overlaps' in result.stderr, result.stderr
+            assert 'shared' in result.stderr and 'other' in result.stderr, result.stderr
+            print('PASS unverified overlap rejected without merging distinct names')
+            return
         assert result.returncode == 0, result.stderr
-        records, _ = read_btf(Path(str(image) + '.BTF'), read_btf(parent) if parent else None)
+        records, _ = read_btf(Path(str(target) + '.BTF'), read_btf(parent) if parent else None)
         variables = [(i, t) for i, t in records.items() if t[0] == 14]
         members = next(t[3] for t in records.values() if t[0] == 15)
         shared = [i for i, t in variables if t[1] == 'shared']
-        if false_identity:
-            assert len(variables) == 3 and len(members) == 9, records
-        else:
-            assert len(shared) == (2 if repeated_member else 1), records
-            assert len(members) == 6, records
-            tag = next(t for t in records.values() if t[0] == 17)
-            assert tag[2] in shared, records
-            if not repeated_member:
-                assert tag[2] == shared[0], records
+        assert len(shared) == (2 if repeated_member else 1), records
+        assert len(members) == 6, records
+        tag = next(t for t in records.values() if t[0] == 17)
+        assert tag[2] in shared, records
+        if not repeated_member:
+            assert tag[2] == shared[0], records
         if base:
             assert records[1][0] == 1 and all(t[2] == 1 for _, t in variables), records
         print('PASS', name)
 
     run('weak-strong')
     run('split-btf', base=True)
+    run('embedded-base', base=True, embedded=True)
     run('distinct-names', false_identity=True)
     run('repeated-member', repeated_member=True)
     run('incompatible', different_type=True)
+
+    def storage(name, rows, expected=None, error=None, base=False):
+        ancestor = Btf(endian) if base else None
+        if ancestor:
+            integer = ancestor.add(1, 'int', 4, [1 << 24 | 32])
+        btf = Btf(endian, ancestor)
+        if not ancestor:
+            integer = btf.add(1, 'int', 4, [1 << 24 | 32])
+        members = []
+        for variable, offset, size, linkage in rows:
+            ident = btf.add(14, variable, integer, [linkage])
+            members += [ident, offset, size]
+            btf.add(17, 'keep-' + variable, ident, [0xffffffff])
+        btf.add(15, shared_section, sections[shared_section], members, len(rows))
+        raw = tmp / (name + '.btf')
+        btf.write(raw)
+        args = [str(resolver), '--verbose', '--btf', str(raw)]
+        parent = None
+        if ancestor:
+            parent = tmp / 'base.btf'
+            ancestor.write(parent)
+            args += ['--btf_base', str(parent)]
+        result = subprocess.run([*args, str(image)], capture_output=True, text=True)
+        if error:
+            assert result.returncode and error in result.stderr, result.stderr
+        else:
+            assert result.returncode == 0, result.stderr
+            records, _ = read_btf(Path(str(image) + '.BTF'), read_btf(parent) if parent else None)
+            members = next(t[3] for t in records.values() if t[0] == 15)
+            actual = [(records[members[i]][1], members[i + 1], members[i + 2])
+                      for i in range(0, len(members), 3)]
+            assert actual == expected, (actual, expected)
+            variables = {t[1]: (i, t) for i, t in records.items() if t[0] == 14}
+            for variable, _, _, _ in rows:
+                # Aliases and shrunk variables retain their source types and tags.
+                ident, var = variables[variable]
+                assert records[var[2]][0:3] == (1, 'int', 4), records
+                assert any(t[0] == 17 and t[1] == 'keep-' + variable and t[2] == ident
+                           for t in records.values()), records
+        print('PASS', name)
+
+    shrunk_section, shrunk_offset, shrunk_size = symbols['shrunk'][0]
+    adjacent_section, adjacent_offset, adjacent_size = symbols['adjacent'][0]
+    assert shrunk_section == adjacent_section == shared_section
+    assert adjacent_offset == shrunk_offset + 1
+    storage('optimized-size', [('shrunk', shrunk_offset, 4, 1), ('adjacent', adjacent_offset, 4, 1)],
+            [('shrunk', shrunk_offset, 1), ('adjacent', adjacent_offset, 1)])
+    storage('size-without-next-member', [('shrunk', shrunk_offset, 4, 1)],
+            [('shrunk', shrunk_offset, 1)])
+    storage('split-optimized-size', [('shrunk', shrunk_offset, 4, 1)],
+            [('shrunk', shrunk_offset, 1)], base=True)
+    # Incorrect incoming sizes must be corrected before duplicate matching.
+    storage('duplicate-with-different-size', [('shared', shared_offset, 1, 1),
+                                            ('shared', shared_offset, 4, 1)],
+            [('shared', shared_offset, 4)])
+    assert symbols['shared_alias'][0] == symbols['shared'][0]
+    storage('verified-ELF-alias', [('shared', shared_offset, 4, 1),
+                                 ('shared_alias', shared_offset, 4, 1)],
+            [('shared', shared_offset, 4)])
+    locals_ = sorted(symbols['local'], key=lambda x: x[1])
+    assert len(locals_) == 2 and locals_[0][1] != locals_[1][1]
+    storage('same-local-name', [('local', offset, size, 0) for _, offset, size in locals_],
+            [('local', offset, size) for _, offset, size in locals_])
+    pieces = sorted([symbols['piece.0'][0], symbols['piece.1'][0]], key=lambda x: x[1])
+    storage('compiler-split-pieces', [('piece', offset, 4, 0) for _, offset, _ in pieces],
+            [('piece', offset, size) for _, offset, size in pieces])
+    storage('unknown-valid-piece', [('unknown_piece', shrunk_offset, 1, 0)],
+            [('unknown_piece', shrunk_offset, 1)])
+    storage('unverified-partial-overlap', [('shared', shared_offset, 4, 1),
+                                         ('unknown_piece', shared_offset + 1, 1, 0)], error='overlaps')
+    storage('offset-overflow', [('shrunk', 0xfffffffe, 4, 1)], error='outside section')
+    storage('size-overflow', [('unknown_piece', shrunk_offset, 0xffffffff, 0)], error='outside section')
+    storage('empty-unknown-piece', [('unknown_piece', shrunk_offset, 0, 0)], error='empty')
+
+    for reverse in (False, True):
+        btf = Btf(endian)
+        integer = btf.add(1, 'int', 4, [1 << 24 | 32])
+        char = btf.add(1, 'char', 1, [1 << 24 | 8])
+        char = btf.add(10, '', char)
+        short = btf.add(3, '', 0, [char, integer, 3])
+        full = btf.add(3, '', 0, [char, integer, 4])
+        a = btf.add(14, 'shared', full if reverse else short, [1])
+        b = btf.add(14, 'shared', short if reverse else full, [1])
+        btf.add(17, 'array-reference', a, [0xffffffff])
+        btf.add(15, shared_section, sections[shared_section],
+                [a, shared_offset, 4 if reverse else 3,
+                 b, shared_offset, 3 if reverse else 4], 2)
+        raw = tmp / 'array.btf'
+        btf.write(raw)
+        result = subprocess.run([str(resolver), '--btf', str(raw), str(image)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        records, _ = read_btf(Path(str(image) + '.BTF'))
+        variables = [(i, t) for i, t in records.items() if t[0] == 14]
+        assert len(variables) == 1 and records[variables[0][1][2]][3][2] == 4, records
+        assert next(t for t in records.values() if t[0] == 17)[2] == variables[0][0], records
+        print('PASS final array extent', '(reverse order)' if reverse else '')

@@ -35,6 +35,11 @@ Build resolve_btfids, then run::
 This test links real weak and strong ELF definitions and supplies synthetic
 BTF to exercise duplicate global variables, repeated DATASEC members,
 declaration-tag reference remapping and split BTF. Distinct names are not
-merged and incompatible definitions must fail. It does not load BTF or run
-kernel code. Override CLANG, LD and DATASEC_TEST_CFLAGS to test other ELF
-architectures, word sizes and byte orders.
+merged and incompatible definitions must fail. Additional cases cover actual
+ELF storage sizes, variables smaller than their source types, constant aliases,
+repeated local names, unknown pieces and invalid ranges. ELF-confirmed aliases
+retain their VARs and tags but share one DATASEC storage entry. Unverified
+overlaps and invalid ranges must fail with a diagnostic.
+
+It does not load BTF or run kernel code. Override CLANG, LD and
+DATASEC_TEST_CFLAGS to test other ELF architectures, word sizes and byte orders.

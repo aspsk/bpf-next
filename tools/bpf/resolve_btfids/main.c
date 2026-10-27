@@ -149,6 +149,7 @@ struct object {
 	struct btf *base_btf;
 	struct btf *inline_btf;
 	struct btf *orig_btf;
+	struct btf *datasec_btf;
 	bool distill_base;
 	bool extract_inline;
 
@@ -2177,8 +2178,13 @@ int main(int argc, const char **argv)
 	if (load_btf(&obj))
 		goto out;
 
-	if (btf_datasec_dedup(&obj.btf, obj.efile.elf, verbose))
+	obj.datasec_btf = obj.btf;
+	err = btf_datasec_fixup(&obj.btf, obj.efile.elf, verbose);
+	if (obj.datasec_btf == obj.btf)
+		obj.datasec_btf = NULL;
+	if (err)
 		goto out;
+	err = -1;
 
 	if (btf2btf(&obj))
 		goto out;
@@ -2229,10 +2235,12 @@ out:
 	 * Free BTFs in reverse dependency order.  inline_btf borrows obj.btf;
 	 * obj.btf can borrow a base owned by orig_btf or obj.base_btf, and
 	 * orig_btf can also borrow obj.base_btf.
+	 * datasec_btf can own an embedded base borrowed by the repaired BTF.
 	 */
 	btf__free(obj.inline_btf);
 	btf__free(obj.btf);
 	btf__free(obj.orig_btf);
+	btf__free(obj.datasec_btf);
 	btf__free(obj.base_btf);
 	btf_id__free_all(&obj.structs);
 	btf_id__free_all(&obj.unions);

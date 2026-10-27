@@ -114,12 +114,45 @@ static const struct variable_symbol *find_symbol(const struct variable_symbols *
 		.offset = offset,
 	};
 	const struct variable_symbol *symbol, *first, *last;
+	size_t low, high, length = strlen(name);
 
 	if (!symbols->n)
 		return NULL;
 	symbol = bsearch(&key, symbols->v, symbols->n, sizeof(*symbols->v), cmp_symbol);
-	if (!symbol)
-		return NULL;
+	if (!symbol) {
+		/* LLVM global optimization can split a source variable into
+		 * objects named NAME.0, NAME.1, ... . DWARF/BTF retains NAME
+		 * and the source type for a piece. Require its exact address.
+		 */
+		key.name = "";
+		low = 0;
+		high = symbols->n;
+		while (low < high) {
+			size_t mid = low + (high - low) / 2;
+
+			if (cmp_symbol(&symbols->v[mid], &key) < 0)
+				low = mid + 1;
+			else
+				high = mid;
+		}
+		first = NULL;
+		for (; low < symbols->n; low++) {
+			const char *suffix;
+
+			symbol = &symbols->v[low];
+			if (symbol->section != key.section || symbol->offset != key.offset)
+				break;
+			if (strncmp(symbol->name, name, length) || symbol->name[length] != '.')
+				continue;
+			suffix = symbol->name + length + 1;
+			if (!*suffix || strspn(suffix, "0123456789") != strlen(suffix))
+				continue;
+			if (first && (first->size != symbol->size || first->binding != symbol->binding))
+				return NULL;
+			first = symbol;
+		}
+		return first;
+	}
 	first = symbol;
 	last = symbols->v + symbols->n;
 	while (first > symbols->v && !cmp_symbol(&key, first - 1))
@@ -163,8 +196,63 @@ static int cmp_secinfo(const void *left, const void *right)
 	return a->size < b->size ? -1 : a->size != b->size;
 }
 
+static __u32 canonical_id(const __u32 *canonical, __u32 id)
+{
+	while (canonical[id] != id)
+		id = canonical[id];
+	return id;
+}
+
+static int select_definition(struct btf *btf, __u32 a, __u32 b,
+			     const struct variable_symbol *symbol)
+{
+	const struct btf_type *va = btf__type_by_id(btf, a);
+	const struct btf_type *vb = btf__type_by_id(btf, b);
+	const struct btf_type *ta, *tb;
+	int type_a, type_b;
+
+	if (va->type == vb->type)
+		return a < b ? a : b;
+	/* A weak array can have an older extent, e.g. linux_banner after the
+	 * final timestamp rebuild. Select the extent matching actual storage,
+	 * provided the array element and index types agree.
+	 */
+	type_a = btf__resolve_type(btf, va->type);
+	type_b = btf__resolve_type(btf, vb->type);
+	if (type_a < 0 || type_b < 0)
+		return -EINVAL;
+	ta = btf__type_by_id(btf, type_a);
+	tb = btf__type_by_id(btf, type_b);
+	if (!btf_is_array(ta) || !btf_is_array(tb) ||
+	    btf_array(ta)->type != btf_array(tb)->type ||
+	    btf_array(ta)->index_type != btf_array(tb)->index_type)
+		return -EINVAL;
+	if (btf__resolve_size(btf, va->type) == symbol->size)
+		return a;
+	if (btf__resolve_size(btf, vb->type) == symbol->size)
+		return b;
+	return -EINVAL;
+}
+
+static bool storage_alias(struct btf *btf, const struct variable_symbols *symbols,
+			  Elf_Scn *section, const struct btf_var_secinfo *a,
+			  const struct btf_var_secinfo *b)
+{
+	const struct variable_symbol *sa, *sb;
+	const struct btf_type *va, *vb;
+
+	if (!section || !a->size || a->offset != b->offset || a->size != b->size)
+		return false;
+	va = btf__type_by_id(btf, a->type);
+	vb = btf__type_by_id(btf, b->type);
+	sa = find_symbol(symbols, section, btf__name_by_offset(btf, va->name_off), a->offset);
+	sb = find_symbol(symbols, section, btf__name_by_offset(btf, vb->name_off), b->offset);
+	return sa && sb && sa->size == a->size && sb->size == b->size;
+}
+
 /* Rebuild to remove duplicate VARs and DATASEC members, then remap every kind. */
-static int rebuild_btf(struct btf **btfp, __u32 *canonical)
+static int rebuild_btf(struct btf **btfp, __u32 *canonical, Elf *elf,
+		       const struct variable_symbols *symbols, int verbose)
 {
 	struct btf *src = *btfp, *dst;
 	const struct btf *base = btf__base_btf(src);
@@ -194,7 +282,9 @@ static int rebuild_btf(struct btf **btfp, __u32 *canonical)
 			continue;
 		if (btf_is_datasec(t)) {
 			struct btf_var_secinfo *v;
-			__u32 j, count = btf_vlen(t);
+			const char *name = btf__name_by_offset(src, t->name_off);
+			Elf_Scn *section = find_section(elf, name);
+			__u32 j, last = 0, count = btf_vlen(t);
 
 			v = calloc(count ?: 1, sizeof(*v));
 			if (!v) {
@@ -205,15 +295,27 @@ static int rebuild_btf(struct btf **btfp, __u32 *canonical)
 			for (j = 0; j < count; j++)
 				v[j].type = canonical[v[j].type];
 			qsort(v, count, sizeof(*v), cmp_secinfo);
-			err = btf__add_datasec(dst, btf__name_by_offset(src, t->name_off), t->size);
+			err = btf__add_datasec(dst, name, t->size);
 			if (err >= 0) {
 				id_map[i] = err;
 				for (j = 0; j < count; j++) {
 					if (j && !cmp_secinfo(&v[j - 1], &v[j]))
 						continue;
+					/* Constant merging and explicit aliases can give distinct
+					 * variables exactly the same ELF storage. Describe it once,
+					 * but retain every alias VAR and its original source type.
+					 */
+					if (j && storage_alias(src, symbols, section, &v[last], &v[j])) {
+						if (verbose)
+							fprintf(stderr, "DATASEC %s: shared storage at %#x, retaining alias VAR %s\n",
+								name, v[j].offset,
+								btf__name_by_offset(src, btf__type_by_id(src, v[j].type)->name_off));
+						continue;
+					}
 					err = btf__add_datasec_var_info(dst, v[j].type, v[j].offset, v[j].size);
 					if (err < 0)
 						break;
+					last = j;
 				}
 			}
 			free(v);
@@ -244,7 +346,6 @@ static int rebuild_btf(struct btf **btfp, __u32 *canonical)
 			*id = id_map[*id];
 		}
 	}
-	btf__free(src);
 	*btfp = dst;
 	dst = NULL;
 	err = 0;
@@ -254,13 +355,119 @@ out:
 	return err;
 }
 
-int btf_datasec_dedup(struct btf **btfp, Elf *elf, int verbose)
+static int fix_storage_sizes(struct btf *btf, Elf *elf,
+			     const struct variable_symbols *symbols, int verbose)
+{
+	const struct btf *base = btf__base_btf(btf);
+	__u32 start = base ? btf__type_cnt(base) : 1, i;
+	unsigned int resized = 0;
+
+	/* btf__dedup() has made the local types modifiable. No raw-data
+	 * serialization may be cached between this point and the repairs.
+	 */
+	for (i = start; i < btf__type_cnt(btf); i++) {
+		struct btf_type *t = (struct btf_type *)btf__type_by_id(btf, i);
+		const char *name;
+		Elf_Scn *section;
+		GElf_Shdr shdr;
+		__u32 j;
+
+		if (!btf_is_datasec(t))
+			continue;
+		name = btf__name_by_offset(btf, t->name_off);
+		section = find_section(elf, name);
+		/* Size-zero object-file DATASECs can be unresolved BPF metadata.
+		 * Leave relocation of those records to their existing consumers.
+		 */
+		if (!section || !t->size)
+			continue;
+		if (!gelf_getshdr(section, &shdr) || shdr.sh_size > UINT_MAX)
+			return -E2BIG;
+		t->size = shdr.sh_size;
+		for (j = 0; j < btf_vlen(t); j++) {
+			struct btf_var_secinfo *v = btf_var_secinfos(t) + j;
+			const struct variable_symbol *symbol;
+			const struct btf_type *var = btf__type_by_id(btf, v->type);
+
+			if (!var || !btf_is_var(var))
+				return -EINVAL;
+			symbol = find_symbol(symbols, section, btf__name_by_offset(btf, var->name_off), v->offset);
+			if (!symbol || !symbol->size)
+				continue;
+			if (symbol->size > UINT_MAX)
+				return -E2BIG;
+			if (v->size != symbol->size) {
+				if (verbose)
+					fprintf(stderr, "DATASEC %s: %s at %#x: storage size %u -> %llu\n",
+						name, symbol->name, v->offset, v->size,
+						(unsigned long long)symbol->size);
+				v->size = symbol->size;
+				resized++;
+			}
+		}
+	}
+	if (verbose)
+		fprintf(stderr, "DATASEC: corrected %u variable storage sizes\n", resized);
+	return 0;
+}
+
+static int validate_datasecs(struct btf *btf, Elf *elf)
+{
+	const struct btf *base = btf__base_btf(btf);
+	__u32 start = base ? btf__type_cnt(base) : 1, i;
+	GElf_Ehdr ehdr;
+
+	if (!gelf_getehdr(elf, &ehdr))
+		return -EINVAL;
+	for (i = start; i < btf__type_cnt(btf); i++) {
+		const struct btf_type *t = btf__type_by_id(btf, i);
+		const char *name, *previous = "<none>";
+		__u64 end = 0;
+		__u32 j;
+
+		if (!btf_is_datasec(t))
+			continue;
+		name = btf__name_by_offset(btf, t->name_off);
+		if (!find_section(elf, name) || (!t->size && ehdr.e_type == ET_REL))
+			continue;
+		if (!t->size) {
+			fprintf(stderr, "DATASEC %s: section size is zero\n", name);
+			return -EINVAL;
+		}
+		for (j = 0; j < btf_vlen(t); j++) {
+			const struct btf_var_secinfo *v = btf_var_secinfos(t) + j;
+			const struct btf_type *var = btf__type_by_id(btf, v->type);
+			const char *variable;
+
+			if (!var || !btf_is_var(var))
+				return -EINVAL;
+			variable = btf__name_by_offset(btf, var->name_off);
+			if (!v->size || v->offset >= t->size || (__u64)v->offset + v->size > t->size) {
+				fprintf(stderr, "DATASEC %s: %s at %#x size %u is outside section size %u or empty\n",
+					name, variable, v->offset, v->size, t->size);
+				return -EINVAL;
+			}
+			if (v->offset < end) {
+				fprintf(stderr, "DATASEC %s: %s at %#x size %u overlaps %s ending at %#llx\n",
+					name, variable, v->offset, v->size, previous,
+					(unsigned long long)end);
+				return -EINVAL;
+			}
+			end = (__u64)v->offset + v->size;
+			previous = variable;
+		}
+	}
+	return 0;
+}
+
+int btf_datasec_fixup(struct btf **btfp, Elf *elf, int verbose)
 {
 	struct variable_symbols symbols = {};
 	struct btf *btf = *btfp;
 	const struct btf *base = btf__base_btf(btf);
 	__u32 start = base ? btf__type_cnt(base) : 1;
 	__u32 i, n, *canonical = NULL, duplicates = 0;
+	bool rebuild = false;
 	int err;
 
 	/* Compare referenced types only after their ordinary deduplication. */
@@ -268,6 +475,9 @@ int btf_datasec_dedup(struct btf **btfp, Elf *elf, int verbose)
 	if (err)
 		return err;
 	err = collect_symbols(elf, &symbols);
+	if (err)
+		goto out;
+	err = fix_storage_sizes(btf, elf, &symbols, verbose);
 	if (err)
 		goto out;
 	n = btf__type_cnt(btf);
@@ -313,7 +523,11 @@ int btf_datasec_dedup(struct btf **btfp, Elf *elf, int verbose)
 		for (j = 1; j < count; j++) {
 			const struct variable_symbol *symbol;
 			struct variable *a = &v[j - 1], *b = &v[j];
+			__u32 first, second;
+			int selected;
 
+			if (a->info.offset == b->info.offset && a->info.size == b->info.size)
+				rebuild = true;
 			if (a->info.offset != b->info.offset || a->info.size != b->info.size ||
 			    strcmp(a->name, b->name) ||
 			    a->linkage != BTF_VAR_GLOBAL_ALLOCATED ||
@@ -322,24 +536,30 @@ int btf_datasec_dedup(struct btf **btfp, Elf *elf, int verbose)
 			symbol = find_symbol(&symbols, section, b->name, b->info.offset);
 			if (!symbol || (symbol->binding != STB_GLOBAL && symbol->binding != STB_WEAK))
 				continue;
-			if (a->type != b->type) {
+			first = canonical_id(canonical, a->info.type);
+			second = canonical_id(canonical, b->info.type);
+			selected = select_definition(btf, first, second, symbol);
+			if (selected < 0) {
 				fprintf(stderr, "DATASEC %s: incompatible definitions of %s at %#x\n",
 					btf__name_by_offset(btf, t->name_off), b->name, b->info.offset);
 				free(v);
 				err = -EINVAL;
 				goto out;
 			}
-			canonical[b->info.type] = canonical[a->info.type];
+			canonical[first] = selected;
+			canonical[second] = selected;
 			duplicates++;
 		}
 		free(v);
 	}
-	if (duplicates) {
+	if (rebuild) {
 		for (i = start; i < n; i++)
 			while (canonical[i] != canonical[canonical[i]])
 				canonical[i] = canonical[canonical[i]];
-		err = rebuild_btf(btfp, canonical);
+		err = rebuild_btf(btfp, canonical, elf, &symbols, verbose);
 	}
+	if (!err)
+		err = validate_datasecs(*btfp, elf);
 	if (!err && verbose)
 		fprintf(stderr, "DATASEC: merged %u duplicate global variable records\n", duplicates);
 out:
