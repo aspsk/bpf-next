@@ -12,4 +12,14 @@ menuconfig LLVM_PLUGINS
 
 if LLVM_PLUGINS
 
+config CLANG_PLUGIN_BPF_SCAN_IR
+	bool "Scan optimized LLVM IR for BPF"
+	depends on DEBUG_INFO_BTF
+	depends on !LTO_CLANG
+	default y
+	help
+	  Collect functions with a clean negative-error return path in
+	  .BTF_fmodret_candidates. These build-time facts do not grant BPF
+	  attachment permission without further analysis by resolve_btfids.
+
 endif
