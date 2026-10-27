@@ -95,6 +95,7 @@
 #include <bpf/btf.h>
 #include <bpf/libbpf.h>
 #include "btf_colors.h"
+#include "fmodret.h"
 #include <subcmd/parse-options.h>
 
 #define BTF_IDS_SECTION	".BTF_ids"
@@ -2235,6 +2236,10 @@ int main(int argc, const char **argv)
 			goto out;
 
 	if (load_btf(&obj))
+		goto out;
+
+	err = fmodret_analyse(obj.efile.elf, verbose);
+	if (err)
 		goto out;
 
 	if (btf2btf(&obj))
