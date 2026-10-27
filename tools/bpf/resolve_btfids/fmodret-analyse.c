@@ -963,7 +963,104 @@ static bool in_symbol_range(const struct symbol_range *r, size_t shndx,
 	       address >= r->start.st_value && address < r->end;
 }
 
+static bool jump_label_reference(const GElf_Ehdr *ehdr,
+				 const struct symbol_range *table, size_t shndx,
+				 GElf_Addr site, unsigned int type, size_t ptr_size)
+{
+	size_t entry_size = 8 + ptr_size;
+	GElf_Addr field;
 
+	/* These architectures use two relative s32 code labels followed by a
+	 * pointer-sized key. Only the code labels are patching metadata; a key
+	 * that references a function must still fail the runtime-reference audit.
+	 */
+	if (ptr_size != 8 ||
+	    !((ehdr->e_machine == EM_AARCH64 && type == R_AARCH64_PREL32) ||
+	      (ehdr->e_machine == EM_X86_64 && type == R_X86_64_PC32)) ||
+	    !in_symbol_range(table, shndx, site) ||
+	    (table->end - table->start.st_value) % entry_size)
+		return false;
+	field = (site - table->start.st_value) % entry_size;
+	return field == 0 || field == 4;
+}
+
+static bool arm64_code_metadata_reference(Elf *elf, const char *name,
+					 Elf_Scn *scn, const GElf_Shdr *shdr,
+					 size_t offset, const GElf_Sym *sym,
+					 GElf_Sxword addend, unsigned int encoding,
+					 const struct elf_function_list *functions,
+					 size_t node)
+{
+	Elf_Data *data;
+	GElf_Shdr code;
+	GElf_Addr address;
+	size_t field;
+
+	if (!strcmp(name, ".altinstructions")) {
+		/* arm64 struct alt_instr: two s32 offsets, u16 cpucap and
+		 * two u8 lengths. The second offset can name a real callback.
+		 */
+		if (shdr->sh_size % 12)
+			return false;
+		field = offset % 12;
+		if (!field)
+			return true;
+		if (field != 4)
+			return false;
+		data = elf_getdata(scn, NULL);
+		if (!data || data->d_off || data->d_size != shdr->sh_size)
+			return false;
+		return !(read_elf_value((unsigned char *)data->d_buf + offset + 4,
+				       2, encoding) & (1U << 15));
+	}
+	if (!strcmp(name, "__ex_table")) {
+		GElf_Ehdr ehdr;
+
+		/* arm64 exception entries contain s32 insn/fixup and u16 type/data.
+		 * The fault site identifies an instruction, not another caller.
+		 * A fixup is an intra-function continuation only when its fault site
+		 * belongs to the same function as the fixup target being audited.
+		 */
+		if (shdr->sh_size % 12)
+			return false;
+		field = offset % 12;
+		if (!field)
+			return true;
+		if (field != 4 || !gelf_getehdr(elf, &ehdr) || ehdr.e_type == ET_REL)
+			return false;
+		data = elf_getdata(scn, NULL);
+		if (!data || data->d_off || data->d_size != shdr->sh_size)
+			return false;
+		address = shdr->sh_addr + offset - 4 +
+			  (int32_t)read_elf_value((unsigned char *)data->d_buf + offset - 4,
+						 4, encoding);
+		return graph_function(functions, sym->st_shndx, address, true) == node;
+	}
+	/* Runtime-constant sections are arrays of s32 instruction offsets. */
+	if (!strncmp(name, "runtime_ptr_", 12) ||
+	    !strncmp(name, "runtime_shift_", 14) ||
+	    !strncmp(name, "runtime_mask_", 13))
+		return !(shdr->sh_size % 4) && !(offset % 4);
+	if (strcmp(name, "__bug_table"))
+		return false;
+	/* A bug record points at a BRK #BUG_BRK_IMM instruction. Check the
+	 * instruction instead of guessing the configuration-dependent record
+	 * size. Filename references and arbitrary function pointers stay audited.
+	 */
+	scn = elf_getscn(elf, sym->st_shndx);
+	if (!scn || !gelf_getshdr(scn, &code) || !(code.sh_flags & SHF_EXECINSTR))
+		return false;
+	address = sym->st_value + addend;
+	if (address < code.sh_addr || address - code.sh_addr > code.sh_size ||
+	    code.sh_size - (address - code.sh_addr) < 4)
+		return false;
+	data = elf_getdata(scn, NULL);
+	if (!data || data->d_off || data->d_size != code.sh_size)
+		return false;
+	/* AArch64 instructions are little endian even in a big-endian ELF. */
+	return read_elf_value((unsigned char *)data->d_buf + address - code.sh_addr,
+			      4, ELFDATA2LSB) == 0xd4210000;
+}
 
 static bool described_call(const struct error_graph *g, size_t caller,
 			   size_t callee)
@@ -1030,7 +1127,7 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 		{ "__start_mcount_loc", "__stop_mcount_loc" },
 		{ "__start_error_injection_whitelist", "__stop_error_injection_whitelist" },
 	};
-	struct symbol_range roots[4] = {}, skip[2] = {};
+	struct symbol_range roots[4] = {}, skip[2] = {}, jump_table = {};
 	Elf_Scn *scn = NULL;
 	GElf_Ehdr ehdr;
 	size_t shstrndx, i;
@@ -1054,7 +1151,10 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 			if (err)
 				return err;
 		}
-
+		err = get_symbol_range(elf, "__start___jump_table",
+				       "__stop___jump_table", &jump_table);
+		if (err)
+			return err;
 	}
 	while ((scn = elf_nextscn(elf, scn))) {
 		GElf_Shdr shdr, target;
@@ -1166,7 +1266,13 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 				}
 			for (j = 0; j < 2; j++)
 				handled |= in_symbol_range(&skip[j], shdr.sh_info, site);
-			if (handled)
+			if (handled || jump_label_reference(&ehdr, &jump_table,
+							   shdr.sh_info, site, type, ptr_size))
+				continue;
+			if (ehdr.e_machine == EM_AARCH64 && type == R_AARCH64_PREL32 &&
+			    arm64_code_metadata_reference(elf, name, target_scn, &target,
+							  offset, &sym, rela.r_addend, encoding,
+							  functions, node))
 				continue;
 			if (!described_call(g, caller, node))
 				record_unmodelled_reference(g, node,
