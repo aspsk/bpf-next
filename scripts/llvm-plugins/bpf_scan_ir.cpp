@@ -1101,6 +1101,70 @@ static bool addressEscapes(const Value *V, SmallPtrSetImpl<const Value *> &Seen)
 	return false;
 }
 
+// Trusted resource-failure contracts, not a claim that allocator tracing and
+// accounting are side-effect-free. NULL leaves no allocation owned by the caller.
+static bool nullFailureAllocator(const CallBase &Call, const Function *F)
+{
+	const DataLayout &DL = Call.getModule()->getDataLayout();
+	if (!F || !isa<CallInst>(Call) || !F->hasExternalLinkage() ||
+	    F->isWeakForLinker() || F->isVarArg() ||
+	    !isErrorPointerType(F->getReturnType(), DL) ||
+	    Call.hasRetAttr(Attribute::NonNull))
+		return false;
+	auto *Ty = F->getFunctionType();
+	unsigned N = Ty->getNumParams();
+	unsigned Word = DL.getPointerTypeSizeInBits(F->getReturnType());
+	auto Size = [&](unsigned I) { return I < N && Ty->getParamType(I)->isIntegerTy(Word); };
+	auto Int = [&](unsigned I) { return I < N && Ty->getParamType(I)->isIntegerTy(32); };
+	auto Ptr = [&](unsigned I) { return I < N && Ty->getParamType(I)->isPointerTy(); };
+	StringRef Name = F->getName();
+
+	if (Call.arg_size() != N || Call.getType() != Ty->getReturnType())
+		return false;
+	for (unsigned I = 0; I < N; I++)
+		if (Call.getArgOperand(I)->getType() != Ty->getParamType(I))
+			return false;
+	if (Name == "__kmalloc_cache_noprof")
+		return N == 3 && Ptr(0) && Int(1) && Size(2);
+	if (Name == "__kmalloc_cache_node_noprof")
+		return N == 4 && Ptr(0) && Int(1) && Int(2) && Size(3);
+	if (Name == "__kmalloc_large_noprof")
+		return N == 2 && Size(0) && Int(1);
+	if (Name == "__kmalloc_large_node_noprof")
+		return N == 3 && Size(0) && Int(1) && Int(2);
+	if (Name == "kmem_cache_alloc_noprof")
+		return N == 2 && Ptr(0) && Int(1);
+	if (Name == "kmem_cache_alloc_node_noprof")
+		return N == 3 && Ptr(0) && Int(1) && Int(2);
+
+	unsigned Tail;
+	bool Buckets;
+	if (Name == "__kmalloc_noprof") {
+		Tail = 1;
+		Buckets = false;
+	} else if (Name == "__kmalloc_node_noprof") {
+		Tail = 2;
+		Buckets = true;
+	} else if (Name == "__kvmalloc_node_noprof") {
+		Tail = 3;
+		Buckets = true;
+	} else {
+		return false;
+	}
+	if (N < 1 + Tail || N > 3 + Tail || !Size(0))
+		return false;
+	if (!Int(N - (Tail == 1 ? 1 : 2)) ||
+	    (Tail >= 2 && !Int(N - 1)) || (Tail == 3 && !Size(N - 3)))
+		return false;
+	unsigned I = 1, End = N - Tail;
+	if (I < End && Buckets && Ptr(I))
+		I++;
+	// Optional kmalloc partition token, lowered to one target word by the ABI.
+	if (I < End && Size(I))
+		I++;
+	return I == End;
+}
+
 static CallDescription describeCall(CallBase &Call, bool CleanPrefix)
 {
 	auto *Callee = dyn_cast<Function>(Call.getCalledOperand()->stripPointerCasts());
@@ -1116,6 +1180,14 @@ static CallDescription describeCall(CallBase &Call, bool CleanPrefix)
 		D.Flags |= FMODRET_CALL_RESULT64;
 	else if (Call.getType()->isPointerTy())
 		D.Flags |= FMODRET_CALL_RESULT_PTR;
+	if (nullFailureAllocator(Call, Callee)) {
+		D.Flags |= FMODRET_CALL_NULL_ALLOCATOR;
+		ErrorMap Null = traceError(Call, 0);
+
+		if (Null.Kind == FMODRET_ERROR_CONSTANT &&
+		    Null.Replacement >= -MaxErrno && Null.Replacement < 0)
+			D.Flags |= FMODRET_CALL_NULL_ERROR;
+	}
 	for (unsigned I = 0; I < Call.arg_size(); I++) {
 		if (!modelledCallbackArgument(Call.getArgOperandUse(I)))
 			continue;
