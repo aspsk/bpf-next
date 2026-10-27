@@ -885,6 +885,71 @@ static int find_section(Elf *elf, size_t shstrndx, const char *wanted,
 }
 
 
+static bool all_errors_returned(const struct error_call *c)
+{
+	unsigned int i;
+
+	for (i = 0; i < c->nr_cases; i++)
+		/* An accepted endpoint does not establish a clean return path. */
+		if (c->cases[i].kind != FMODRET_ERROR_IDENTITY &&
+		    c->cases[i].kind != FMODRET_ERROR_CONSTANT)
+			return false;
+	return true;
+}
+
+
+static int derive_clean_graph(struct error_graph *g, int verbose)
+{
+	size_t *queue, head = 0, tail = 0, i, e, atomic, clean = 0, pointers = 0;
+
+	queue = calloc(g->nr_nodes, sizeof(*queue));
+	if (g->nr_nodes && !queue)
+		return -ENOMEM;
+	for (i = 0; i < g->nr_nodes; i++) {
+		struct error_node *n = &g->nodes[i];
+
+		if (n->definitions == 1 &&
+		    (n->flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR)) &&
+		    !(n->flags & FMODRET_FN_WEAK) &&
+		    (n->flags & FMODRET_FN_CLEAN_SEED)) {
+			n->clean = true;
+			queue[tail++] = i;
+		}
+	}
+	atomic = tail;
+	while (head < tail) {
+		size_t node = queue[head++];
+
+		for (e = g->nodes[node].incoming; e != NO_NODE; e = g->calls[e].next_in) {
+			struct error_call *c = &g->calls[e];
+			struct error_node *caller = &g->nodes[c->caller];
+
+			if (!caller->clean && caller->definitions == 1 &&
+			    !(caller->flags & FMODRET_FN_WEAK) &&
+			    (caller->flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR)) &&
+			    (c->flags & FMODRET_CALL_CLEAN_PREFIX) && all_errors_returned(c)) {
+				caller->clean = true;
+				caller->clean_via = e;
+				queue[tail++] = c->caller;
+			}
+		}
+	}
+	for (i = 0; i < g->nr_nodes; i++) {
+		clean += g->nodes[i].clean;
+		pointers += g->nodes[i].clean && !(g->nodes[i].flags & FMODRET_FN_INTEGER);
+	}
+	if (verbose) {
+		fprintf(stderr, "fmodret clean: %zu atomic, %zu constructed, %zu total\n",
+			atomic, clean - atomic, clean);
+		fprintf(stderr, "fmodret clean-types: %zu integers, %zu error-pointer relays\n",
+			clean - pointers, pointers);
+
+	}
+	free(queue);
+	return 0;
+}
+
+
 int fmodret_analyse(Elf *elf, int verbose)
 {
 	struct elf_function_list functions = {};
@@ -934,6 +999,8 @@ int fmodret_analyse(Elf *elf, int verbose)
 	select_error_descriptions(&g);
 	err = graph_relocations(elf, &functions, &g, elf_ndxscn(scn), &shdr,
 				buf, refs, ptr_size, ehdr.e_ident[EI_DATA], true);
+	if (!err)
+		err = derive_clean_graph(&g, verbose);
 	if (!err && verbose)
 		fprintf(stderr, "fmodret descriptions: %zu records, %zu linked bodies, %zu calls\n",
 			g.nr_records, g.nr_nodes, g.nr_calls);
