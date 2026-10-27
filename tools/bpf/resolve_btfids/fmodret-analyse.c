@@ -761,12 +761,24 @@ struct error_case {
 	int replacement;
 };
 
+struct callback_binding {
+	size_t function;
+	unsigned int argument, source_param;
+};
+
+struct callback_parameters {
+	unsigned int nr;
+	unsigned int *flags;
+};
+
 struct error_call {
 	size_t caller, callee;
 	size_t next_in, next_out, metadata_offset;
 	unsigned int flags, nr_cases, ordinal;
-	bool weak_definition;
+	unsigned int callee_param, nr_bindings;
+	bool weak_definition, resolved_callback;
 	struct error_case *cases;
+	struct callback_binding *bindings;
 };
 
 struct error_node {
@@ -780,7 +792,9 @@ struct error_node {
 	size_t nr_unmodelled_refs, reference_caller;
 	const char *reference_section, *reference_reason;
 	GElf_Addr reference_site;
-	bool clean, terminal, incomplete, queued;
+	bool clean, terminal, incomplete, queued, callback_unresolved;
+	struct callback_parameters strong_params, weak_params;
+	const struct callback_parameters *params;
 	uint64_t good[ERROR_WORDS];
 };
 
@@ -790,6 +804,7 @@ struct error_graph {
 	size_t nr_nodes, nr_calls, capacity;
 	size_t nr_records, nr_defined_records, nr_reference_records;
 	size_t nr_overridden_weak, nr_discarded_calls;
+	size_t nr_input_calls, nr_callback_bindings, nr_resolved_bindings, nr_callback_edges;
 	bool audited_text;
 };
 
@@ -797,8 +812,14 @@ static void free_error_graph(struct error_graph *g)
 {
 	size_t i;
 
-	for (i = 0; i < g->nr_calls; i++)
+	for (i = 0; i < g->nr_calls; i++) {
 		free(g->calls[i].cases);
+		free(g->calls[i].bindings);
+	}
+	for (i = 0; i < g->nr_nodes; i++) {
+		free(g->nodes[i].strong_params.flags);
+		free(g->nodes[i].weak_params.flags);
+	}
 	free(g->calls);
 	free(g->nodes);
 }
@@ -896,6 +917,7 @@ static int add_error_call(struct error_graph *g, size_t caller, size_t callee,
 		.flags = flags, .nr_cases = nr_cases,
 		.metadata_offset = metadata_offset, .ordinal = ordinal,
 		.weak_definition = weak_definition,
+		.callee_param = FMODRET_NO_PARAM,
 		.next_in = NO_NODE, .next_out = NO_NODE };
 	c->cases = calloc(nr_cases, sizeof(*c->cases));
 	if (!c->cases)
@@ -1146,6 +1168,24 @@ static bool described_call(const struct error_graph *g, size_t caller,
 /* Materializing a callback argument is a code reference to its address,
  * rather than a direct invocation. Its complete use chain is checked later.
  */
+static bool described_callback_argument(const struct error_graph *g, size_t caller,
+				       size_t function)
+{
+	size_t e;
+
+	if (caller == NO_NODE || g->nodes[caller].definitions != 1)
+		return false;
+	for (e = g->nodes[caller].outgoing; e != NO_NODE; e = g->calls[e].next_out) {
+		const struct error_call *c = &g->calls[e];
+		unsigned int i;
+
+		for (i = 0; i < c->nr_bindings; i++)
+			if (c->bindings[i].source_param == FMODRET_NO_PARAM &&
+			    c->bindings[i].function == function)
+				return true;
+	}
+	return false;
+}
 
 static void record_unmodelled_reference(struct error_graph *g, size_t node,
 					const char *reason, const char *section,
@@ -1347,7 +1387,8 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 							&target, offset, &sym, rela.r_addend,
 							functions, node))
 				continue;
-			if (!described_call(g, caller, node))
+			if (!described_call(g, caller, node) &&
+			    !described_callback_argument(g, caller, node))
 				record_unmodelled_reference(g, node,
 					target.sh_flags & SHF_EXECINSTR ?
 					"unmodelled-code-reference" : "runtime-data-reference",
@@ -1455,11 +1496,40 @@ static int parse_error_graph(Elf *elf, const struct elf_function_list *functions
 					(FMODRET_FN_ESCAPED | FMODRET_FN_ADDRESS_TAKEN);
 			}
 		}
-		if (params || (calls && !(flags & FMODRET_FN_DEFINED)))
+		if ((calls || params) && !(flags & FMODRET_FN_DEFINED))
 			goto invalid;
 		pos = offset + FMODRET_META_HEADER_SIZE(ptr_size);
+		if (params > (end - pos) / FMODRET_META_PARAM_SIZE)
+			goto invalid;
+		{
+			struct error_node *n = node == NO_NODE ? NULL : &g->nodes[node];
+			struct callback_parameters *p = NULL;
+
+			if (n && (flags & FMODRET_FN_DEFINED)) {
+				if ((flags & FMODRET_FN_WEAK) && n->weak_definitions == 1)
+					p = &n->weak_params;
+				else if (!(flags & FMODRET_FN_WEAK) && n->strong_definitions == 1)
+					p = &n->strong_params;
+			}
+			if (p && params) {
+				p->flags = calloc(params, sizeof(*p->flags));
+				if (!p->flags)
+					return -ENOMEM;
+				p->nr = params;
+			}
+			for (i = 0; i < params; i++, pos += FMODRET_META_PARAM_SIZE) {
+				unsigned int pf = read_elf_value(buf + pos, 4, encoding);
+
+				if ((pf & ~FMODRET_PARAM_CLOSED) ||
+				    read_elf_value(buf + pos + 4, 4, encoding))
+					goto invalid;
+				if (p)
+					p->flags[i] = pf;
+			}
+		}
 		for (i = 0; i < calls; i++) {
-			unsigned int nr_cases, call_flags, callee_param, bindings;
+			unsigned int nr_cases, call_flags, callee_param, bindings, j;
+			struct error_call *c;
 			size_t callee, call_offset = pos;
 			int err;
 
@@ -1470,7 +1540,8 @@ static int parse_error_graph(Elf *elf, const struct elf_function_list *functions
 			nr_cases = read_elf_value(buf + pos + ptr_size + 4, 4, encoding);
 			callee_param = read_elf_value(buf + pos + ptr_size + 8, 4, encoding);
 			bindings = read_elf_value(buf + pos + ptr_size + 12, 4, encoding);
-			if (callee_param != FMODRET_NO_PARAM || bindings)
+			if (callee_param != FMODRET_NO_PARAM &&
+			    (callee != NO_NODE || callee_param >= params || bindings))
 				goto invalid;
 			pos += FMODRET_META_CALL_SIZE(ptr_size);
 			if (nr_cases > (end - pos) / FMODRET_META_CASE_SIZE)
@@ -1481,7 +1552,27 @@ static int parse_error_graph(Elf *elf, const struct elf_function_list *functions
 			if (err)
 				return err;
 			pos += nr_cases * FMODRET_META_CASE_SIZE;
+			c = &g->calls[g->nr_calls - 1];
+			c->callee_param = callee_param;
+			if (bindings > (end - pos) / FMODRET_META_BINDING_SIZE(ptr_size))
+				goto invalid;
+			if (bindings) {
+				c->bindings = calloc(bindings, sizeof(*c->bindings));
+				if (!c->bindings)
+					return -ENOMEM;
+				c->nr_bindings = bindings;
+			}
+			for (j = 0; j < bindings; j++, pos += FMODRET_META_BINDING_SIZE(ptr_size)) {
+				struct callback_binding *b = &c->bindings[j];
 
+				b->function = metadata_reference(elf, functions, buf, refs, pos,
+							 ptr_size, encoding);
+				b->argument = read_elf_value(buf + pos + ptr_size, 4, encoding);
+				b->source_param = read_elf_value(buf + pos + ptr_size + 4, 4, encoding);
+				if (b->source_param != FMODRET_NO_PARAM &&
+				    (b->source_param >= params || b->function != NO_NODE))
+					goto invalid;
+			}
 		}
 		if (pos != end)
 			goto invalid;
@@ -1509,10 +1600,12 @@ static void select_error_descriptions(struct error_graph *g)
 		if (n->strong_definitions) {
 			n->flags |= n->strong_flags;
 			n->definitions = n->strong_definitions;
+			n->params = &n->strong_params;
 			g->nr_overridden_weak += n->weak_definitions;
 		} else {
 			n->flags |= n->weak_flags;
 			n->definitions = n->weak_definitions;
+			n->params = &n->weak_params;
 		}
 	}
 	for (i = 0; i < g->nr_calls; i++) {
@@ -1540,7 +1633,256 @@ static bool graph_node_known(const struct error_node *n)
 	return n->definitions == 1 &&
 	       (n->flags & (FMODRET_FN_INTEGER | FMODRET_FN_ERRPTR)) &&
 	       !(n->flags & (FMODRET_FN_ESCAPED | FMODRET_FN_WEAK)) &&
-	       !n->incomplete;
+	       !n->incomplete && !n->callback_unresolved;
+}
+
+struct callback_edge {
+	size_t call, function;
+};
+
+struct callback_walk {
+	struct callback_edge *edges;
+	size_t nr, capacity;
+	struct {
+		size_t node;
+		unsigned int param;
+	} path[64];
+	unsigned int budget;
+	const char *reason;
+	size_t failed_node;
+	unsigned int failed_param;
+};
+
+static int add_callback_edge(struct callback_walk *walk, size_t call, size_t function)
+{
+	if (walk->nr == walk->capacity) {
+		size_t cap = walk->capacity ? walk->capacity * 2 : 64;
+		void *edges;
+
+		if (cap < walk->capacity || cap > SIZE_MAX / sizeof(*walk->edges))
+			return -E2BIG;
+		edges = realloc(walk->edges, cap * sizeof(*walk->edges));
+		if (!edges)
+			return -ENOMEM;
+		walk->edges = edges;
+		walk->capacity = cap;
+	}
+	walk->edges[walk->nr++] = (struct callback_edge){ call, function };
+	return 1;
+}
+
+/* Resolve one concrete function address through formal parameters. This
+ * proves coverage of that address; other, unknown callback values reaching
+ * the same dispatcher need not be assigned to this function. Return 0 for
+ * incomplete coverage and a negative value only for allocation failures.
+ */
+static int walk_callback_parameter(const struct error_graph *g,
+				   struct callback_walk *walk, size_t node,
+				   unsigned int param, size_t function,
+				   unsigned int depth)
+{
+	const struct error_node *n;
+	size_t e;
+	unsigned int i;
+	int err;
+
+	walk->failed_node = node;
+	walk->failed_param = param;
+	if (depth == sizeof(walk->path) / sizeof(walk->path[0]) || !walk->budget) {
+		walk->reason = "callback-walk-limit";
+		return 0;
+	}
+	if (node == NO_NODE || g->nodes[node].definitions != 1 ||
+	    (g->nodes[node].flags & FMODRET_FN_WEAK)) {
+		walk->reason = "missing-or-ambiguous-dispatcher-body";
+		return 0;
+	}
+	n = &g->nodes[node];
+	if (!n->params || param >= n->params->nr ||
+	    !(n->params->flags[param] & FMODRET_PARAM_CLOSED)) {
+		walk->reason = "unmodelled-parameter-use";
+		return 0;
+	}
+	for (i = 0; i < depth; i++)
+		if (walk->path[i].node == node && walk->path[i].param == param) {
+			walk->reason = "callback-forwarding-cycle";
+			return 0;
+		}
+	walk->path[depth].node = node;
+	walk->path[depth].param = param;
+	for (e = n->outgoing; e != NO_NODE; e = g->calls[e].next_out) {
+		const struct error_call *c = &g->calls[e];
+
+		if (!walk->budget) {
+			walk->reason = "callback-walk-limit";
+			walk->failed_node = node;
+			walk->failed_param = param;
+			return 0;
+		}
+		walk->budget--;
+		if (c->callee_param == param) {
+			const struct error_node *f = &g->nodes[function];
+			unsigned int result = f->flags & FMODRET_FN_ERRPTR ?
+				FMODRET_CALL_RESULT_PTR : f->flags & FMODRET_FN_INTEGER ?
+				(f->flags & FMODRET_FN_RET64 ? FMODRET_CALL_RESULT64 :
+				 FMODRET_CALL_RESULT32) : 0;
+
+			if (!result || (c->flags & FMODRET_CALL_RESULT_MASK) != result) {
+				walk->reason = "incompatible-callback-result";
+				walk->failed_node = node;
+				walk->failed_param = param;
+				return 0;
+			}
+			err = add_callback_edge(walk, e, function);
+			if (err < 0)
+				return err;
+		}
+		for (i = 0; i < c->nr_bindings; i++) {
+			const struct callback_binding *b = &c->bindings[i];
+
+			if (b->source_param != param)
+				continue;
+			err = walk_callback_parameter(g, walk, c->callee, b->argument,
+						      function, depth + 1);
+			if (err <= 0)
+				return err;
+		}
+	}
+	return 1;
+}
+
+static int cmp_callback_edge(const void *left, const void *right)
+{
+	const struct callback_edge *a = left, *b = right;
+
+	if (a->call != b->call)
+		return a->call < b->call ? -1 : 1;
+	return a->function < b->function ? -1 : a->function != b->function;
+}
+
+static int materialize_callback_edge(struct error_graph *g,
+				     const struct callback_edge *edge)
+{
+	struct error_call source = g->calls[edge->call], *c;
+	struct error_case *cases;
+
+	cases = malloc(source.nr_cases * sizeof(*cases));
+	if (!cases)
+		return -ENOMEM;
+	memcpy(cases, source.cases, source.nr_cases * sizeof(*cases));
+	if (g->nr_calls == g->capacity) {
+		size_t cap = g->capacity ? g->capacity * 2 : 1024;
+		void *calls;
+
+		if (cap < g->capacity || cap > SIZE_MAX / sizeof(*c)) {
+			free(cases);
+			return -E2BIG;
+		}
+		calls = realloc(g->calls, cap * sizeof(*c));
+		if (!calls) {
+			free(cases);
+			return -ENOMEM;
+		}
+		g->calls = calls;
+		g->capacity = cap;
+	}
+	c = &g->calls[g->nr_calls];
+	*c = source;
+	c->callee = edge->function;
+	c->callee_param = FMODRET_NO_PARAM;
+	c->resolved_callback = true;
+	c->nr_bindings = 0;
+	c->bindings = NULL;
+	c->cases = cases;
+	c->next_out = g->nodes[c->caller].outgoing;
+	c->next_in = g->nodes[c->callee].incoming;
+	g->nodes[c->caller].outgoing = g->nr_calls;
+	g->nodes[c->callee].incoming = g->nr_calls++;
+	g->nr_callback_edges++;
+	return 0;
+}
+
+static int resolve_callback_arguments(struct error_graph *g, int verbose)
+{
+	struct callback_walk walk = {};
+	size_t e, i;
+	int err = 0;
+
+	g->nr_input_calls = g->nr_calls;
+	/* Finish all parameter walks before growing CALLS or adding adjacency
+	 * entries, so templates and forwarding paths stay stable during closure.
+	 */
+	for (e = 0; e < g->nr_input_calls; e++) {
+		const struct error_call *c = &g->calls[e];
+		unsigned int j;
+
+		if (c->weak_definition && g->nodes[c->caller].strong_definitions)
+			continue;
+		for (j = 0; j < c->nr_bindings; j++) {
+			const struct callback_binding *b = &c->bindings[j];
+			size_t before = walk.nr;
+
+			if (b->source_param != FMODRET_NO_PARAM || b->function == NO_NODE)
+				continue;
+			g->nr_callback_bindings++;
+			walk.budget = 4096;
+			walk.reason = "proven";
+			if (g->nodes[c->caller].definitions != 1 ||
+			    (g->nodes[c->caller].flags & FMODRET_FN_WEAK)) {
+				walk.reason = "missing-or-ambiguous-binding-owner";
+				walk.failed_node = c->caller;
+				walk.failed_param = FMODRET_NO_PARAM;
+				err = 0;
+			} else {
+				err = walk_callback_parameter(g, &walk, c->callee, b->argument,
+							      b->function, 0);
+			}
+			if (err < 0)
+				goto out;
+			if (!err) {
+				walk.nr = before;
+				g->nodes[b->function].callback_unresolved = true;
+			} else {
+				g->nr_resolved_bindings++;
+			}
+			if (verbose)
+				fprintf(stderr, "fmodret callback-binding: function=%s@%#llx "
+					"caller=%s dispatcher=%s argument=%u call=%u "
+					"metadata=%#zx coverage=%s reason=%s "
+					"blocked-at=%s blocked-parameter=%u\n",
+					g->nodes[b->function].name,
+					(unsigned long long)g->nodes[b->function].value,
+					g->nodes[c->caller].name,
+					c->callee == NO_NODE ? "<unknown>" : g->nodes[c->callee].name,
+					b->argument, c->ordinal, c->metadata_offset,
+					err ? "complete" : "incomplete", walk.reason,
+					err ? "<none>" : walk.failed_node == NO_NODE ?
+					"<missing body>" : g->nodes[walk.failed_node].name,
+					err ? FMODRET_NO_PARAM : walk.failed_param);
+		}
+	}
+	if (walk.nr)
+		qsort(walk.edges, walk.nr, sizeof(*walk.edges), cmp_callback_edge);
+	for (i = 0; i < walk.nr; i++) {
+		if (i && !cmp_callback_edge(&walk.edges[i - 1], &walk.edges[i]))
+			continue;
+		err = materialize_callback_edge(g, &walk.edges[i]);
+		if (err)
+			goto out;
+		if (verbose) {
+			const struct error_call *c = &g->calls[g->nr_calls - 1];
+
+			fprintf(stderr, "fmodret callback-edge: caller=%s callee=%s "
+				"parameter=%u call=%u metadata=%#zx\n",
+				g->nodes[c->caller].name, g->nodes[c->callee].name,
+				g->calls[walk.edges[i].call].callee_param,
+				c->ordinal, c->metadata_offset);
+		}
+	}
+	err = 0;
+out:
+	free(walk.edges);
+	return err;
 }
 
 static bool error_bit(const uint64_t *bits, int error)
@@ -1602,6 +1944,7 @@ enum error_rejection {
 	ERROR_NON_INTEGER,
 	ERROR_WEAK,
 	ERROR_ESCAPED,
+	ERROR_CALLBACK_UNRESOLVED,
 	ERROR_INCOMPLETE_CALLERS,
 	ERROR_NO_CALLERS,
 	ERROR_UNKNOWN_OUTCOME,
@@ -1617,6 +1960,7 @@ static const char * const error_rejection_names[] = {
 	[ERROR_NON_INTEGER] = "non-errno-return-type",
 	[ERROR_WEAK] = "weak-definition",
 	[ERROR_ESCAPED] = "address-escaped",
+	[ERROR_CALLBACK_UNRESOLVED] = "unresolved-callback-argument",
 	[ERROR_INCOMPLETE_CALLERS] = "unmodelled-ELF-reference",
 	[ERROR_NO_CALLERS] = "no-callers-and-no-userspace-boundary",
 	[ERROR_UNKNOWN_OUTCOME] = "unknown-error-outcome",
@@ -1664,6 +2008,8 @@ static unsigned int error_rejection_mask(const struct error_graph *g, size_t nod
 		reasons |= 1U << ERROR_WEAK;
 	if (n->flags & FMODRET_FN_ESCAPED)
 		reasons |= 1U << ERROR_ESCAPED;
+	if (n->callback_unresolved)
+		reasons |= 1U << ERROR_CALLBACK_UNRESOLVED;
 	if (n->incomplete)
 		reasons |= 1U << ERROR_INCOMPLETE_CALLERS;
 	if (!n->terminal && n->incoming == NO_NODE)
@@ -1751,7 +2097,7 @@ static void print_blocked_call(const struct error_graph *g,
 		callee->name, (unsigned long long)callee->value,
 		caller->name, (unsigned long long)caller->value,
 		call->ordinal, call->metadata_offset,
-		"direct",
+		call->resolved_callback ? "callback" : "direct",
 		call->flags & FMODRET_CALL_CLEAN_PREFIX ? "clean" : "dirty",
 		c->first, c->last, missing, sample);
 	if (kind == FMODRET_ERROR_IDENTITY)
@@ -1998,6 +2344,9 @@ static int read_error_metadata(Elf *elf, Elf_Scn *scn, size_t ptr_size,
 	if (err)
 		goto out;
 	select_error_descriptions(&g);
+	err = resolve_callback_arguments(&g, verbose);
+	if (err)
+		goto out;
 	err = graph_relocations(elf, functions, &g, elf_ndxscn(scn), &shdr,
 				buf, refs, ptr_size, encoding, true);
 	if (err)

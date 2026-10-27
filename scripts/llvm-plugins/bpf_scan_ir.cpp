@@ -696,16 +696,24 @@ struct ErrorCase {
 	ErrorMap Map;
 };
 
+struct CallbackBinding {
+	Function *Fn;
+	unsigned Argument, SourceParam;
+};
+
 struct CallDescription {
 	Function *Callee;
 	unsigned Flags;
 	SmallVector<ErrorCase, 4> Cases;
+	unsigned CalleeParam;
+	SmallVector<CallbackBinding, 2> Bindings;
 };
 
 struct FunctionDescription {
 	Function *Fn;
 	unsigned Flags;
 	SmallVector<CallDescription, 8> Calls;
+	SmallVector<unsigned, 8> Params;
 };
 
 using Predecessors = DenseMap<const BasicBlock *, const BasicBlock *>;
@@ -998,6 +1006,68 @@ static bool assemblyReferences(StringRef Assembly, StringRef Name)
 	return false;
 }
 
+static const Value *callbackValue(const Value *V)
+{
+	for (unsigned Depth = 0; Depth < MaxValueDepth; Depth++) {
+		if (auto *Cast = dyn_cast<BitCastInst>(V)) {
+			V = Cast->getOperand(0);
+			continue;
+		}
+		if (auto *Expr = dyn_cast<ConstantExpr>(V);
+		    Expr && Expr->getOpcode() == Instruction::BitCast) {
+			V = Expr->getOperand(0);
+			continue;
+		}
+		return V;
+	}
+	return nullptr;
+}
+
+static bool modelledCallbackArgument(const Use &U)
+{
+	auto *Call = dyn_cast<CallInst>(U.getUser());
+	if (!Call || !Call->isArgOperand(&U))
+		return false;
+	auto *Callee = dyn_cast_or_null<Function>(callbackValue(Call->getCalledOperand()));
+	const Value *V = callbackValue(U.get());
+	unsigned Index = Call->getArgOperandNo(&U);
+	return Callee && !Callee->isIntrinsic() && Index < Callee->arg_size() &&
+	       Callee->getArg(Index)->getType()->isPointerTy() && V &&
+	       (isa<Function>(V) || (isa<Argument>(V) && V->getType()->isPointerTy()));
+}
+
+static bool closedCallbackParameter(const Value *V,
+				    SmallPtrSetImpl<const Value *> &Seen,
+				    unsigned Depth = 0)
+{
+	if (Depth >= MaxValueDepth)
+		return false;
+	if (!Seen.insert(V).second)
+		return true;
+	for (const Use &U : V->uses()) {
+		const User *User = U.getUser();
+		if (auto *Call = dyn_cast<CallInst>(User)) {
+			if ((&U == &Call->getCalledOperandUse() &&
+			     isa_and_nonnull<Argument>(callbackValue(U.get()))) ||
+			    modelledCallbackArgument(U))
+				continue;
+			return false;
+		}
+		if (isa<BitCastInst>(User)) {
+			if (!closedCallbackParameter(User, Seen, Depth + 1))
+				return false;
+			continue;
+		}
+		if (auto *Cmp = dyn_cast<ICmpInst>(User)) {
+			if (Cmp->isEquality() &&
+			    isa<ConstantPointerNull>(Cmp->getOperand(1 - U.getOperandNo())))
+				continue;
+		}
+		return false;
+	}
+	return true;
+}
+
 static bool addressEscapes(const Value *V, SmallPtrSetImpl<const Value *> &Seen)
 {
 	if (!Seen.insert(V).second)
@@ -1006,6 +1076,8 @@ static bool addressEscapes(const Value *V, SmallPtrSetImpl<const Value *> &Seen)
 		const User *User = U.getUser();
 		if (auto *Call = dyn_cast<CallBase>(User)) {
 			if (&U == &Call->getCalledOperandUse())
+				continue;
+			if (modelledCallbackArgument(U))
 				continue;
 			return true;
 		}
@@ -1034,14 +1106,25 @@ static CallDescription describeCall(CallBase &Call, bool CleanPrefix)
 	auto *Callee = dyn_cast<Function>(Call.getCalledOperand()->stripPointerCasts());
 	if (Callee && Callee->isIntrinsic())
 		Callee = nullptr;
+	auto *Param = dyn_cast_or_null<Argument>(callbackValue(Call.getCalledOperand()));
+	unsigned Index = Param ? Param->getArgNo() : FMODRET_NO_PARAM;
 	CallDescription D{Callee, CleanPrefix ? FMODRET_CALL_CLEAN_PREFIX : 0U,
-			  describeErrors(Call)};
+			  describeErrors(Call), Index, {}};
 	if (Call.getType()->isIntegerTy(32))
 		D.Flags |= FMODRET_CALL_RESULT32;
 	else if (Call.getType()->isIntegerTy(64))
 		D.Flags |= FMODRET_CALL_RESULT64;
 	else if (Call.getType()->isPointerTy())
 		D.Flags |= FMODRET_CALL_RESULT_PTR;
+	for (unsigned I = 0; I < Call.arg_size(); I++) {
+		if (!modelledCallbackArgument(Call.getArgOperandUse(I)))
+			continue;
+		const Value *V = callbackValue(Call.getArgOperand(I));
+		if (auto *F = dyn_cast_or_null<Function>(V))
+			D.Bindings.push_back({const_cast<Function *>(F), I, FMODRET_NO_PARAM});
+		else if (auto *A = dyn_cast_or_null<Argument>(V); A && A->getType()->isPointerTy())
+			D.Bindings.push_back({nullptr, I, A->getArgNo()});
+	}
 	return D;
 }
 
@@ -1079,22 +1162,31 @@ static void emitDescriptions(Module &M, ArrayRef<FunctionDescription> Functions)
 		return ConstantStruct::getAnon(C, Fields, true);
 	};
 	unsigned PtrSize = M.getDataLayout().getPointerSize();
-
 	for (const auto &F : Functions) {
 		SmallVector<Constant *, 16> Calls;
-		unsigned Size = FMODRET_META_HEADER_SIZE(PtrSize);
-
+		SmallVector<Constant *, 8> Params;
+		for (unsigned Flags : F.Params)
+			Params.push_back(Struct({N(Flags), N(0)}));
+		unsigned Size = FMODRET_META_HEADER_SIZE(PtrSize) +
+			       Params.size() * FMODRET_META_PARAM_SIZE;
 		for (const auto &Call : F.Calls) {
 			SmallVector<Constant *, 8> Cases;
+			SmallVector<Constant *, 4> Bindings;
 			for (const auto &E : Call.Cases)
 				Cases.push_back(Struct({N(E.First), N(E.Last), N(E.Map.Kind), N(E.Map.Replacement)}));
 			Constant *Callee = Call.Callee ? (Constant *)Call.Callee : ConstantPointerNull::get(Ptr);
+			for (const auto &B : Call.Bindings) {
+				Constant *Fn = B.Fn ? (Constant *)B.Fn : ConstantPointerNull::get(Ptr);
+				Bindings.push_back(Struct({Fn, N(B.Argument), N(B.SourceParam)}));
+			}
 			Calls.push_back(Struct({Callee, N(Call.Flags), N(Cases.size()),
-				N(FMODRET_NO_PARAM), N(0), Struct(Cases)}));
-			Size += FMODRET_META_CALL_SIZE(PtrSize) + Cases.size() * FMODRET_META_CASE_SIZE;
+				N(Call.CalleeParam), N(Bindings.size()), Struct(Cases), Struct(Bindings)}));
+			Size += FMODRET_META_CALL_SIZE(PtrSize) + Cases.size() * FMODRET_META_CASE_SIZE +
+				Bindings.size() * FMODRET_META_BINDING_SIZE(PtrSize);
 		}
 		Constant *Record = Struct({N(FMODRET_META_MAGIC), N(FMODRET_META_VERSION),
-			N(Size), N(F.Flags), F.Fn, N(Calls.size()), N(0), Struct(Calls)});
+			N(Size), N(F.Flags), F.Fn, N(Calls.size()), N(Params.size()),
+			Struct(Params), Struct(Calls)});
 		auto *GV = new GlobalVariable(M, Record->getType(), true, GlobalValue::PrivateLinkage,
 					      Record, "fmodret.function." + F.Fn->getName());
 		GV->setSection(".BTF_fmodret_candidates");
@@ -1168,8 +1260,13 @@ public:
 				if (functionHasCleanErrnoPath(F, LVI, DT, *Clean))
 					Flags |= FMODRET_FN_CLEAN_SEED;
 			}
-			FunctionDescription D{&F, Flags, {}};
+			FunctionDescription D{&F, Flags, {}, {}};
 			if (Defined) {
+				for (Argument &A : F.args()) {
+					SmallPtrSet<const Value *, 32> Uses;
+					D.Params.push_back(A.getType()->isPointerTy() &&
+						closedCallbackParameter(&A, Uses) ? FMODRET_PARAM_CLOSED : 0U);
+				}
 				SmallPtrSet<const CallBase *, 32> Prefixes;
 				findCleanPrefixes(F, Prefixes, *Clean);
 				for (BasicBlock &BB : F)
