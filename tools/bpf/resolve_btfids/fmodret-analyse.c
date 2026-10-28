@@ -1226,6 +1226,15 @@ static bool x86_syscall_entry(const struct error_node *n)
  * to propagate errors. Syscall entries are return-to-userspace boundaries;
  * explicit error-reporting endpoints are carried by individual call cases.
  */
+/* Export table entries only name the exported functions. Modules are the other
+ * users of those and are not part of the image: an exported function is an
+ * ordinary function, and a module which mishandles its error is at fault.
+ */
+static bool is_ksymtab_section(const char *name)
+{
+	return !strncmp(name, "__ksymtab", 9) || !strncmp(name, "___ksymtab+", 11);
+}
+
 static int graph_relocations(Elf *elf, const struct elf_function_list *functions,
 			     struct error_graph *g, size_t metadata_ndx,
 			     const GElf_Shdr *metadata_shdr,
@@ -1293,7 +1302,8 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 			return -1;
 		if (audit && (!strcmp(name, "__mcount_loc") ||
 			      !strcmp(name, "__patchable_function_entries") ||
-			      !strcmp(name, "_error_injection_whitelist")))
+			      !strcmp(name, "_error_injection_whitelist") ||
+			      is_ksymtab_section(name)))
 			continue;
 		if (!shdr.sh_entsize || shdr.sh_size % shdr.sh_entsize)
 			return -EINVAL;
@@ -1436,6 +1446,7 @@ static void print_function_flags(const struct error_node *node, size_t offset,
 		{ FMODRET_FN_ERRPTR, "error_pointer" },
 		{ FMODRET_FN_RET64, "integer_return64" },
 		{ FMODRET_FN_ADDRESS_TAKEN, "address_taken" },
+		{ FMODRET_FN_EXPORTED, "exported" },
 	};
 	size_t i;
 
@@ -2382,6 +2393,13 @@ static int read_error_metadata(Elf *elf, Elf_Scn *scn, size_t ptr_size,
 	if (err)
 		goto out;
 	select_error_descriptions(&g);
+	if (verbose) {
+		size_t exported = 0;
+
+		for (i = 0; i < g.nr_nodes; i++)
+			exported += !!(g.nodes[i].flags & FMODRET_FN_EXPORTED);
+		fprintf(stderr, "fmodret exports: %zu exported functions\n", exported);
+	}
 	err = resolve_callback_arguments(&g, verbose);
 	if (err)
 		goto out;
