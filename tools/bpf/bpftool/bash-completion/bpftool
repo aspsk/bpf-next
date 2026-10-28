@@ -675,6 +675,20 @@ _bpftool()
                     ;;
             esac
             ;;
+        fmodret)
+            case $prev in
+                $object)
+                    COMPREPLY=( $( compgen -W 'list help' -- "$cur" ) )
+                    ;;
+                list)
+                    COMPREPLY=( $( compgen -W 'file' -- "$cur" ) )
+                    ;;
+                file)
+                    _filedir
+                    ;;
+            esac
+            return 0
+            ;;
         map)
             case $command in
                 show|list|dump|peek|pop|dequeue|freeze)
