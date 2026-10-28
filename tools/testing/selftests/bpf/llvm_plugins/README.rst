@@ -61,12 +61,17 @@ The fixtures are split into three readable groups:
 ``fmodret_derived_helpers.c`` supplies shared seeds, dispatchers and synthetic
 syscall table entries. None of these tests is loaded or executed.
 
+``fmodret_linked.c`` tests syscall boundaries and caller coverage in both
+relocatable objects and final linked images. The x86 cases cover native and
+compatibility syscall wrappers, instruction metadata, malformed metadata,
+runtime function pointers and callers without compiler descriptions.
+
 The runner compiles separate translation units using the saved kernel command,
 checks that tested functions are not atomic seeds, links the candidate records,
 generates BTF and invokes resolve_btfids. It checks constructed cleanliness and
 actual membership in the sorted, unique .BTF_fmodret_ids output. Allocator
-contracts and ERR_PTR helpers participate in derivation; only syscall table
-entries terminate propagation.
+contracts and ERR_PTR helpers participate in derivation. Syscall table entries
+and global x86 syscall wrappers terminate propagation at the syscall ABI.
 
 The runner requires the built plugin, resolve_btfids, a target linker and pahole.
 ``--ld``, ``--pahole`` and ``--resolve-btfids`` override those tools. Compiler and

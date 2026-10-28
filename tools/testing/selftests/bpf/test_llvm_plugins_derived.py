@@ -15,6 +15,8 @@ import tempfile
 from test_llvm_plugins import Elf, Skip, KSFT_SKIP, FMODRET_FN_CLEAN_SEED, FMODRET_FN_DEFINED
 from test_llvm_plugins import compile_arguments, diagnostic
 
+EM_X86_64 = 62
+
 
 def run(command, build):
     result = subprocess.run(list(map(str, command)), cwd=build, text=True,
@@ -70,6 +72,116 @@ def generated_ids(path):
     return {functions[i]: flags for i, flags in pairs}
 
 
+def linked_cases(machine, ptr):
+    cases = [
+        ("syscall-dispatcher", ["TEST_DISPATCHER"], "", True),
+        ("syscall-swallowed-error", ["TEST_SWALLOW"], "", False),
+        ("non-syscall-boundary", ["TEST_NO_BOUNDARY"], "", False),
+        ("non-syscall-caller", ["TEST_BAD_CALLER"], "", False),
+    ]
+    pointer = ".quad" if ptr == 8 else ".long"
+    cases.append(("runtime-function-pointer", [],
+                  '.section .rodata,"a"\n' + pointer + ' fmodret_linked_leaf\n', False))
+    if machine != EM_X86_64:
+        return cases
+    for abi in ("X64", "X64_COMPAT", "IA32", "IA32_COMPAT"):
+        cases.append((abi + "-syscall-wrapper",
+                      ["TEST_" + abi + "_ENTRY", "TEST_NO_TABLE", "TEST_DISPATCHER"],
+                      "", True))
+    cases += [
+        ("syscall-prefix-helper", ["TEST_FAKE_ENTRY", "TEST_NO_TABLE", "TEST_DISPATCHER"],
+         "", False),
+        ("local-syscall-name", ["TEST_X64_ENTRY", "TEST_LOCAL_ENTRY", "TEST_NO_TABLE",
+                                "TEST_DISPATCHER"], "", False),
+    ]
+    for section in (".orc_unwind_ip", ".return_sites", ".call_sites",
+                    ".retpoline_sites", ".ibt_endbr_seal", ".cfi_sites",
+                    ".smp_locks", "runtime_ptr_linked"):
+        cases.append((section, [], '.section ' + section + ',"a"\n'
+                      '.long fmodret_linked_leaf - .\n', True))
+    cases += [
+        ("orc-absolute-pointer", [], '.section .orc_unwind_ip,"a"\n'
+         '.quad fmodret_linked_leaf\n', False),
+        ("orc-unaligned-offset", [], '.section .orc_unwind_ip,"a"\n'
+         '.byte 0\n.long fmodret_linked_leaf - .\n.zero 3\n', False),
+        ("static-call-site", [], '.section .static_call_sites,"a"\n'
+         '.long fmodret_linked_leaf - .\n.long 0\n', True),
+        ("static-call-key", [], '.section .static_call_sites,"a"\n'
+         '.long 0\n.long fmodret_linked_leaf - .\n', False),
+        ("alternative-site", [], '.section .altinstructions,"a"\n'
+         '.long fmodret_linked_leaf - .\n.long 0\n.long 0\n.byte 1, 1\n', True),
+        ("alternative-function-pointer", [], '.section .altinstructions,"a"\n'
+         '.long 0\n.long fmodret_linked_leaf - .\n.long 0\n.byte 1, 1\n', False),
+        ("exception-instruction", [], '.section __ex_table,"a"\n'
+         '.long fmodret_linked_leaf - .\n.long 0\n.long 0\n', True),
+        ("exception-data-pointer", [], '.section __ex_table,"a"\n'
+         '.long 0\n.long 0\n.long fmodret_linked_leaf - .\n', False),
+        ("exception-local-fixup", [], '.section __ex_table,"a"\n'
+         '.long fmodret_linked_leaf - .\n.long fmodret_linked_leaf - .\n.long 0\n',
+         (False, True)),
+        ("exception-other-function", [], '.section __ex_table,"a"\n'
+         '.long fmodret_linked_entry - .\n.long fmodret_linked_leaf - .\n.long 0\n', False),
+        ("bug-instruction", ["TEST_BUG"], '.section __bug_table,"a"\n'
+         '.long fmodret_linked_bug - .\n.long 0\n.short 0, 0\n', True),
+        ("bug-function-pointer", [], '.section __bug_table,"a"\n'
+         '.long fmodret_linked_leaf - .\n.long 0\n.short 0, 0\n', False),
+        ("undescribed-caller", [], '.text\n.globl unknown_caller\n'
+         '.type unknown_caller,@function\nunknown_caller:\n'
+         'call fmodret_linked_leaf\nret\n.size unknown_caller, . - unknown_caller\n', False),
+        ("undescribed-syscall-dispatcher", [], '.text\n.globl unknown_caller\n'
+         '.type unknown_caller,@function\nunknown_caller:\n'
+         'call fmodret_linked_entry\nmov %rax, saved_register(%rip)\nret\n'
+         '.size unknown_caller, . - unknown_caller\n'
+         '.data\nsaved_register: .quad 0\n', True),
+    ]
+    return cases
+
+
+def check_linked_case(case, number, command, fixtures, tmp, ld, pahole,
+                      resolver, build, final):
+    name, defines, assembly, expected = case
+    source = fixtures / "fmodret_linked.c"
+    obj, extra, linked = (tmp / ("linked-" + str(number) + suffix)
+                          for suffix in (".o", ".S.o", ".elf"))
+    run(command + ["-D" + d for d in defines] + ["-c", source, "-o", obj], build)
+    objects = [obj]
+    if Elf(obj).unpack("H", 18)[0] == EM_X86_64:
+        assembly += ('.text\n.globl __x86_return_thunk\n'
+                     '.type __x86_return_thunk,@function\n'
+                     '__x86_return_thunk: ret\n'
+                     '.size __x86_return_thunk, . - __x86_return_thunk\n')
+    if assembly:
+        asm = tmp / ("linked-" + str(number) + ".S")
+        asm.write_text(assembly + '.section .note.GNU-stack,"",@progbits\n')
+        run(command + ["-D__ASSEMBLY__", "-Wno-unused-command-line-argument",
+                       "-c", asm, "-o", extra], build)
+        objects.append(extra)
+    script = tmp / "linked.lds"
+    text = ("SECTIONS {\n"
+            " .BTF_fmodret_candidates 0 (INFO) : { KEEP(*(.BTF_fmodret_candidates)) }\n")
+    if final:
+        text += " .text 0x100000 : { *(.text .text.*) }\n"
+    text += (" __patchable_function_entries" + ("" if final else " 0") +
+             " : { *(__patchable_function_entries) }\n}\n")
+    script.write_text(text)
+    flags = ["--emit-relocs", "-e", "fmodret_linked_leaf"] if final else ["-r"]
+    run(ld + flags + ["-T", script, *objects, "-o", linked], build)
+    btf = tmp / "linked.btf"
+    run(pahole + ["--btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func",
+                  "--btf_encode_detached=" + str(btf), linked], build)
+    result = run([resolver, "-v", "--fmodret_error_injection", "--btf", btf, linked], build)
+    admitted = "fmodret_linked_leaf" in generated_ids(linked)
+    if isinstance(expected, tuple):
+        expected = expected[final]
+    mode = "executable" if final else "relocatable"
+    if admitted != expected:
+        print("not ok", number, mode, name, "- unexpected generated-set membership")
+        diagnostic(result.stderr)
+        return 1
+    print("ok", number, mode, name)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel-build", type=Path)
@@ -98,7 +210,7 @@ def main():
     if not ld or not pahole or not shutil.which(ld[0]) or not shutil.which(pahole[0]):
         raise Skip("target linker and pahole are required")
     command = compile_arguments(build, command_file, args.clang)
-    command += ["-g", "-fno-optimize-sibling-calls", "-fpatchable-function-entry=2"]
+    command += ["-g", "-fno-optimize-sibling-calls", "-fpatchable-function-entry=2,2"]
     groups = []
     for category in ("clean", "safe", "unsafe"):
         source = fixtures / ("fmodret_derived_" + category + ".c")
@@ -135,13 +247,15 @@ def main():
         run(pahole + ["--btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func",
                       "--btf_encode_detached=" + str(btf), linked], build)
         result = run([resolver, "-v", "--fmodret_error_injection", "--btf", btf, linked], build)
+        elf = Elf(objects[0])
+        cases = linked_cases(elf.unpack("H", 18)[0], elf.ptr)
         states = dict(re.findall(r"^fmodret function: (\S+) .*? clean=(\S+) ",
                                  result.stderr, re.M))
         admitted = generated_ids(linked)
         if ".BTF_fmodret_candidates" in Elf(linked).names:
             raise ValueError("resolved object retains candidate metadata")
         print("TAP version 13")
-        print("1.." + str(sum(len(names) for _, _, names in groups)))
+        print("1.." + str(sum(len(names) for _, _, names in groups) + 2 * len(cases)))
         number = 0
         for category, _, names in groups:
             for name in names:
@@ -164,6 +278,11 @@ def main():
                     print("ok", number, name)
         if failed:
             diagnostic(result.stderr)
+        for case in cases:
+            for final in (False, True):
+                number += 1
+                failed += check_linked_case(case, number, command, fixtures, tmp,
+                                            ld, pahole, resolver, build, final)
     return int(bool(failed))
 
 
