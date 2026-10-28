@@ -50,9 +50,10 @@ Derived-function tests
 The fixtures are split into three readable groups:
 
 * ``fmodret_derived_clean.c``: five constructed clean functions without a proved
-  syscall boundary. They must remain outside the generated permission set.
+  syscall boundary. They must not be tagged as fmod_ret targets.
 * ``fmodret_derived_safe.c``: seven constructed clean functions with a proof for
-  every negative errno in [-4095, -1]. They must enter the generated set.
+  every negative errno in [-4095, -1]. They must get the ``bpf_fmodret`` and
+  ``bpf_fmodret_auto`` BTF decl tags.
 * ``fmodret_derived_unsafe.c``: twelve rejection cases covering dirty prefixes,
   discarded errors, unknown allocators, escaping callbacks and addresses,
   unseeded recursion, and clean bodies whose callers swallow their errors.
@@ -69,7 +70,7 @@ runtime function pointers and callers without compiler descriptions.
 The runner compiles separate translation units using the saved kernel command,
 checks that tested functions are not atomic seeds, links the candidate records,
 generates BTF and invokes resolve_btfids. It checks constructed cleanliness and
-actual membership in the sorted, unique .BTF_fmodret_ids output. Allocator
+the decl tags in the BTF written by resolve_btfids. Allocator
 contracts and ERR_PTR helpers participate in derivation. Syscall table entries
 and global x86 syscall wrappers terminate propagation at the syscall ABI.
 

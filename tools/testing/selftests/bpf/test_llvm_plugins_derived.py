@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Check derived cleanliness and syscall-only fmodret admission."""
+"""Check derived cleanliness and syscall-only fmod_ret tagging."""
 import argparse
 import os
 from pathlib import Path
@@ -28,18 +28,22 @@ def run(command, build):
 
 
 def btf_functions(data):
+    """Return the functions of BTF as {type ID: name}, and its decl tags as
+    [(tag name, target type ID)]."""
     endian = "<" if data[:2] == b"\x9f\xeb" else ">"
     magic, version, _, header, start, size, strings, length = struct.unpack_from(endian + "HBB5I", data)
     if magic != 0xeb9f or version != 1:
         raise ValueError("invalid generated BTF header")
     names = data[header + strings:header + strings + length]
     offset, end, type_id = header + start, header + start + size, 1
-    result = {}
+    result, tags = {}, []
     while offset < end:
-        name, info, _ = struct.unpack_from(endian + "3I", data, offset)
+        name, info, ref = struct.unpack_from(endian + "3I", data, offset)
         kind, count = (info >> 24) & 31, info & 0xffff
         if kind == 12:
             result[type_id] = Elf.string(names, name)
+        elif kind == 17:
+            tags.append((Elf.string(names, name), ref))
         fixed = {1: 4, 2: 0, 3: 12, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0,
                  12: 0, 14: 4, 16: 0, 17: 4, 18: 0}
         variable = {4: 12, 5: 12, 6: 8, 13: 8, 15: 12, 19: 12}
@@ -53,23 +57,18 @@ def btf_functions(data):
         type_id += 1
     if offset != end:
         raise ValueError("invalid generated BTF type length")
-    return result
+    return result, tags
 
 
 def generated_ids(path):
-    ids = Path(str(path) + ".BTF_fmodret_ids")
-    if not ids.is_file():
-        return {}
-    data = ids.read_bytes()
-    endian = "<" if path.read_bytes()[5] == 1 else ">"
-    count, flags = struct.unpack_from(endian + "II", data)
-    if flags or len(data) != 8 + count * 8:
-        raise ValueError("invalid generated fmodret set")
-    pairs = [struct.unpack_from(endian + "II", data, 8 + i * 8) for i in range(count)]
-    if pairs != sorted(pairs) or len({i for i, _ in pairs}) != count:
-        raise ValueError("fmodret set is not sorted and unique")
-    functions = btf_functions(Path(str(path) + ".BTF").read_bytes())
-    return {functions[i]: flags for i, flags in pairs}
+    """Return {function name: set of fmod_ret decl tags} from the BTF which
+    resolve_btfids wrote for PATH."""
+    functions, tags = btf_functions(Path(str(path) + ".BTF").read_bytes())
+    result = {}
+    for tag, target in tags:
+        if tag.startswith("bpf_fmodret") and target in functions:
+            result.setdefault(functions[target], set()).add(tag)
+    return result
 
 
 def linked_cases(machine, ptr):
@@ -169,13 +168,13 @@ def check_linked_case(case, number, command, fixtures, tmp, ld, pahole,
     btf = tmp / "linked.btf"
     run(pahole + ["--btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func",
                   "--btf_encode_detached=" + str(btf), linked], build)
-    result = run([resolver, "-v", "--fmodret_error_injection", "--btf", btf, linked], build)
+    result = run([resolver, "-v", "--btf", btf, linked], build)
     admitted = "fmodret_linked_leaf" in generated_ids(linked)
     if isinstance(expected, tuple):
         expected = expected[final]
     mode = "executable" if final else "relocatable"
     if admitted != expected:
-        print("not ok", number, mode, name, "- unexpected generated-set membership")
+        print("not ok", number, mode, name, "- unexpected fmod_ret tags")
         diagnostic(result.stderr)
         return 1
     print("ok", number, mode, name)
@@ -246,16 +245,14 @@ def main():
         btf = tmp / "derived.btf"
         run(pahole + ["--btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func",
                       "--btf_encode_detached=" + str(btf), linked], build)
-        result = run([resolver, "-v", "--fmodret_error_injection", "--btf", btf, linked], build)
+        result = run([resolver, "-v", "--btf", btf, linked], build)
         elf = Elf(objects[0])
         cases = linked_cases(elf.unpack("H", 18)[0], elf.ptr)
         states = dict(re.findall(r"^fmodret function: (\S+) .*? clean=(\S+) ",
                                  result.stderr, re.M))
         admitted = generated_ids(linked)
-        if ".BTF_fmodret_candidates" in Elf(linked).names:
-            raise ValueError("resolved object retains candidate metadata")
         print("TAP version 13")
-        print("1.." + str(sum(len(names) for _, _, names in groups) + 2 * len(cases)))
+        print("1.." + str(sum(len(names) for _, _, names in groups) + 1 + 2 * len(cases)))
         number = 0
         for category, _, names in groups:
             for name in names:
@@ -268,14 +265,21 @@ def main():
                 elif category in ("clean", "safe") and states[name] != "constructed":
                     error = "cleanliness was not derived"
                 elif (name in admitted) != (category == "safe"):
-                    error = "unexpected generated-set membership"
-                elif name in admitted and admitted[name]:
-                    error = "inferred function has unexpected attachment flags"
+                    error = "unexpected fmod_ret tags"
+                elif name in admitted and admitted[name] != {"bpf_fmodret", "bpf_fmodret_auto"}:
+                    error = "inferred function has unexpected tags"
                 if error:
                     failed += 1
                     print("not ok", number, name, "-", error)
                 else:
                     print("ok", number, name)
+        number += 1
+        entries = sorted(n for n in admitted if n.startswith("derived_entry_"))
+        if entries:
+            failed += 1
+            print("not ok", number, "syscall entries are not tagged -", ", ".join(entries[:3]))
+        else:
+            print("ok", number, "syscall entries are not tagged")
         if failed:
             diagnostic(result.stderr)
         for case in cases:
