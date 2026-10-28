@@ -18,11 +18,13 @@
 /* Decl tags added by resolve_btfids to functions in BTF_FMODRET sets */
 #define TAG_FMODRET		"bpf_fmodret"
 #define TAG_FMODRET_SLEEPABLE	"bpf_fmodret_sleepable"
+#define TAG_FMODRET_AUTO	"bpf_fmodret_auto"
 
 #define SYS_BTF_DIR		"/sys/kernel/btf"
 
 #define F_TARGET		(1U << 0)
 #define F_SLEEPABLE		(1U << 1)
+#define F_AUTO			(1U << 2)
 
 struct fmodret_entry {
 	__u32 btf_id;
@@ -58,6 +60,8 @@ static int collect_targets(const struct btf *btf, struct fmodret_entry **targets
 			flags = F_TARGET;
 		else if (!strcmp(name, TAG_FMODRET_SLEEPABLE))
 			flags = F_SLEEPABLE;
+		else if (!strcmp(name, TAG_FMODRET_AUTO))
+			flags = F_AUTO;
 		else
 			continue;
 		if (!btf_is_func(btf__type_by_id(btf, t->type)))
@@ -100,6 +104,7 @@ static void show_target(const char *owner, const struct btf *btf,
 	const struct btf_type *t = btf__type_by_id(btf, entry->btf_id);
 	const char *name = btf__name_by_offset(btf, t->name_off);
 	bool sleepable = entry->flags & F_SLEEPABLE;
+	bool automatic = entry->flags & F_AUTO;
 
 	if (json_output) {
 		jsonw_start_object(json_wtr);
@@ -107,10 +112,11 @@ static void show_target(const char *owner, const struct btf *btf,
 		jsonw_string_field(json_wtr, "name", name);
 		jsonw_string_field(json_wtr, "owner", owner);
 		jsonw_bool_field(json_wtr, "sleepable", sleepable);
+		jsonw_bool_field(json_wtr, "auto", automatic);
 		jsonw_end_object(json_wtr);
 	} else {
-		printf("%u  %s (%s)%s\n", entry->btf_id, name, owner,
-		       sleepable ? " sleepable" : "");
+		printf("%u  %s (%s)%s%s\n", entry->btf_id, name, owner,
+		       sleepable ? " sleepable" : "", automatic ? " auto" : "");
 	}
 }
 

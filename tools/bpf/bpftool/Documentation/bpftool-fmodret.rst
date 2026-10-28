@@ -33,14 +33,16 @@ bpftool fmodret list [file *FILE*]
     List the functions declared as fmod_ret targets in the BTF of vmlinux and
     of loaded modules. Each entry contains the BTF ID of the function, its
     name and the name of the object it belongs to. Targets which sleepable
-    programs may attach to are marked **sleepable**.
+    programs may attach to are marked **sleepable**. Targets which the build
+    found safe to fail by analysing the compiler output, rather than being
+    declared in the source, are marked **auto**.
 
     The targets are the functions tagged with the **bpf_fmodret** BTF decl tag
     by the kernel build. With **file**, read the BTF from *FILE* (for
     example a vmlinux image or a **BTF** file) instead of the running kernel.
 
-    With **--json**, each entry contains **btf_id**, **name**, **owner** and
-    **sleepable** fields.
+    With **--json**, each entry contains **btf_id**, **name**, **owner**,
+    **sleepable** and **auto** fields.
 
     Only the targets declared with the tags are listed. The verifier may
     accept further functions by other rules, such as the error injection list
