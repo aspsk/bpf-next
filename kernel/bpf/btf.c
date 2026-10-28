@@ -9293,6 +9293,8 @@ enum {
 };
 
 #ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+static int btf_register_fmodret_tags(struct btf *btf);
+
 struct btf_module {
 	struct list_head list;
 	struct module *module;
@@ -9462,6 +9464,15 @@ static int btf_module_notify(struct notifier_block *nb, unsigned long op,
 			}
 			goto out;
 		}
+		/*
+		 * Do this before the BTF is visible to anyone else. A failure
+		 * is not fatal: the module loads, but without fmod_ret targets.
+		 */
+		err = btf_register_fmodret_tags(btf);
+		if (err)
+			pr_warn("failed to register fmod_ret targets of module [%s]: %d\n",
+				mod->name, err);
+
 		err = btf_alloc_id(btf);
 		if (err) {
 			btf_free(btf);
@@ -10157,6 +10168,118 @@ int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
 	return __register_btf_kfunc_id_set(hook, kset);
 }
 EXPORT_SYMBOL_GPL(register_btf_kfunc_id_set);
+
+/*
+ * Targets of fmod_ret programs are marked in BTF by resolve_btfids, see
+ * BTF_SET8_FMODRET. A "bpf_fmodret" decl tag on a function makes it a target,
+ * and "bpf_fmodret_sleepable" allows sleepable programs to attach to it. Each
+ * tag is a separate BTF type, so tags are joined by the function they mark.
+ */
+#define BTF_FMODRET_TAG			"bpf_fmodret"
+#define BTF_FMODRET_SLEEPABLE_TAG	"bpf_fmodret_sleepable"
+/* Marks an entry with the "bpf_fmodret" tag, never stored in the set */
+#define BTF_FMODRET_F_TARGET		BIT(31)
+
+/* Return the flags which decl tag T adds to the function it marks */
+static u32 btf_fmodret_tag_flags(const struct btf *btf, const struct btf_type *t)
+{
+	const struct btf_type *func;
+	const char *name;
+
+	if (!btf_type_is_decl_tag(t) || btf_type_decl_tag(t)->component_idx != -1)
+		return 0;
+	func = btf_type_by_id(btf, t->type);
+	if (!btf_type_is_func(func))
+		return 0;
+
+	name = btf_name_by_offset(btf, t->name_off);
+	if (!strcmp(name, BTF_FMODRET_TAG))
+		return BTF_FMODRET_F_TARGET;
+	if (!strcmp(name, BTF_FMODRET_SLEEPABLE_TAG))
+		return KF_SLEEPABLE;
+	return 0;
+}
+
+/* Build the set of fmod_ret targets of BTF from its decl tags */
+static int btf_register_fmodret_tags(struct btf *btf)
+{
+	u32 id, i, n, nr_types = btf_nr_types(btf), cnt = 0;
+	struct btf_kfunc_set_tab *tab;
+	struct btf_id_set8 *set;
+
+	for (id = btf_start_id(btf); id < nr_types; id++)
+		cnt += !!btf_fmodret_tag_flags(btf, btf_type_by_id(btf, id));
+	if (!cnt)
+		return 0;
+
+	set = kmalloc(struct_size(set, pairs, cnt), GFP_KERNEL | __GFP_NOWARN);
+	if (!set)
+		return -ENOMEM;
+	set->flags = 0;
+	set->cnt = 0;
+	for (id = btf_start_id(btf); id < nr_types; id++) {
+		const struct btf_type *t = btf_type_by_id(btf, id);
+		u32 flags = btf_fmodret_tag_flags(btf, t);
+
+		if (!flags)
+			continue;
+		set->pairs[set->cnt].id = t->type;
+		set->pairs[set->cnt].flags = flags;
+		set->cnt++;
+	}
+	sort(set->pairs, set->cnt, sizeof(set->pairs[0]), btf_id_cmp_func, NULL);
+
+	/* Merge the tags of one function */
+	for (i = 0, n = 0; i < set->cnt; i++) {
+		if (n && set->pairs[n - 1].id == set->pairs[i].id)
+			set->pairs[n - 1].flags |= set->pairs[i].flags;
+		else
+			set->pairs[n++] = set->pairs[i];
+	}
+	/* A sleepable tag alone does not make a target */
+	for (i = 0, set->cnt = 0; i < n; i++) {
+		if (!(set->pairs[i].flags & BTF_FMODRET_F_TARGET))
+			continue;
+		set->pairs[set->cnt].id = set->pairs[i].id;
+		set->pairs[set->cnt].flags = set->pairs[i].flags & ~BTF_FMODRET_F_TARGET;
+		set->cnt++;
+	}
+	if (!set->cnt) {
+		kfree(set);
+		return 0;
+	}
+
+	tab = btf->kfunc_set_tab;
+	if (!tab) {
+		tab = kzalloc_obj(*tab, GFP_KERNEL | __GFP_NOWARN);
+		if (!tab) {
+			kfree(set);
+			return -ENOMEM;
+		}
+		btf->kfunc_set_tab = tab;
+	}
+	if (tab->sets[BTF_KFUNC_HOOK_FMODRET]) {
+		kfree(set);
+		return -EEXIST;
+	}
+	tab->sets[BTF_KFUNC_HOOK_FMODRET] = set;
+	return 0;
+}
+
+static int __init btf_fmodret_tags_init(void)
+{
+	struct btf *btf;
+	int err;
+
+	btf = btf_get_module_btf(NULL);
+	if (IS_ERR_OR_NULL(btf))
+		return PTR_ERR_OR_ZERO(btf);
+
+	err = btf_register_fmodret_tags(btf);
+	btf_put(btf);
+	return err;
+}
+fs_initcall(btf_fmodret_tags_init);
 
 /* This function must be invoked only from initcalls/module init functions */
 int register_btf_fmodret_id_set(const struct btf_kfunc_id_set *kset)
