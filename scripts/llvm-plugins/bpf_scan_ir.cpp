@@ -8,6 +8,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -1006,6 +1007,40 @@ static bool assemblyReferences(StringRef Assembly, StringRef Name)
 	return false;
 }
 
+// EXPORT_SYMBOL() emits a record in ".export_symbol" which names the function.
+// It describes the export and is not a use of the address: remember the name
+// and take the record out of the text searched for references. A record of an
+// unknown shape stays, and its reference counts.
+static void takeExports(std::string &Assembly, StringSet<> &Exported)
+{
+	static constexpr StringLiteral Section = "\".export_symbol\"";
+	static constexpr StringLiteral Label = "__export_symbol_";
+	static constexpr StringLiteral End = ".previous";
+	size_t Pos = 0;
+
+	while ((Pos = Assembly.find(Section, Pos)) != std::string::npos) {
+		size_t Begin = Assembly.rfind(".section", Pos);
+		size_t Stop = Assembly.find(End, Pos);
+		size_t Name = StringRef::npos, Colon = StringRef::npos;
+		StringRef Record;
+
+		if (Begin != std::string::npos && Stop != std::string::npos) {
+			Stop += End.size();
+			Record = StringRef(Assembly).slice(Begin, Stop);
+			Name = Record.find(Label);
+			if (Name != StringRef::npos)
+				Colon = Record.find(':', Name);
+		}
+		if (Colon == StringRef::npos) {
+			Pos += Section.size();
+			continue;
+		}
+		Exported.insert(Record.slice(Name + Label.size(), Colon));
+		Assembly.erase(Begin, Stop - Begin);
+		Pos = Begin;
+	}
+}
+
 static const Value *callbackValue(const Value *V)
 {
 	for (unsigned Depth = 0; Depth < MaxValueDepth; Depth++) {
@@ -1087,7 +1122,8 @@ static bool addressEscapes(const Value *V, SmallPtrSetImpl<const Value *> &Seen)
 			    GV->getSection() == "_error_injection_whitelist" ||
 			    GV->getName() == "llvm.used" ||
 			    GV->getName() == "llvm.compiler.used" ||
-			    GV->getSection() == ".discard.addressable")
+			    GV->getSection() == ".discard.addressable" ||
+			    GV->getSection() == ".discard.gendwarfksyms")
 				continue;
 			return true;
 		}
@@ -1294,6 +1330,8 @@ public:
 					if (auto *Call = dyn_cast<CallBase>(&I))
 						if (auto *Asm = dyn_cast<InlineAsm>(Call->getCalledOperand()))
 							Assembly += (Twine("\n") + Asm->getAsmString()).str();
+		StringSet<> Exported;
+		takeExports(Assembly, Exported);
 		SmallVector<FunctionDescription, 32> Descriptions;
 		auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
@@ -1311,6 +1349,8 @@ public:
 				Flags |= FMODRET_FN_ESCAPED;
 			if (!Defined && !(Flags & (FMODRET_FN_ESCAPED | FMODRET_FN_ADDRESS_TAKEN)))
 				continue;
+			if (Defined && Exported.contains(F.getName()))
+				Flags |= FMODRET_FN_EXPORTED;
 			if (F.hasLocalLinkage())
 				Flags |= FMODRET_FN_LOCAL;
 			if (F.isWeakForLinker())

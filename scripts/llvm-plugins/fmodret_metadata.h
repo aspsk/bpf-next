@@ -32,7 +32,8 @@
 #define FMODRET_FN_ERRPTR (1U << 6)
 #define FMODRET_FN_RET64 (1U << 7)
 #define FMODRET_FN_ADDRESS_TAKEN (1U << 8)
-#define FMODRET_FN_FLAGS ((1U << 9) - 1)
+#define FMODRET_FN_EXPORTED (1U << 9)
+#define FMODRET_FN_FLAGS ((1U << 10) - 1)
 
 #define FMODRET_CALL_CLEAN_PREFIX (1U << 0)
 #define FMODRET_CALL_RESULT32 (1U << 1)
