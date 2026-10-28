@@ -997,10 +997,25 @@ static void record_unmodelled_reference(struct error_graph *g, size_t node,
 	}
 }
 
+static bool x86_syscall_entry(const struct error_node *n)
+{
+	static const char * const prefixes[] = {
+		"__x64_sys_", "__x64_compat_sys_", "__ia32_sys_", "__ia32_compat_sys_",
+	};
+
+	if (n->definitions != 1 || !(n->flags & FMODRET_FN_INTEGER) ||
+	    (n->flags & FMODRET_FN_LOCAL))
+		return false;
+	for (size_t i = 0; i < ARRAY_SIZE(prefixes); i++)
+		if (!strncmp(n->name, prefixes[i], strlen(prefixes[i])))
+			return true;
+	return false;
+}
+
 /* Read pointer relocations before parsing records, then audit the other ELF
  * references after the call graph exists. An unmodelled caller blocks proof.
  * In particular, assembly and objects built without the plugin are not assumed
- * to propagate errors. Actual syscall table entries are function roots;
+ * to propagate errors. Syscall entries are return-to-userspace boundaries;
  * explicit error-reporting endpoints are carried by individual call cases.
  */
 static int graph_relocations(Elf *elf, const struct elf_function_list *functions,
@@ -1026,6 +1041,9 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 	if (elf_getshdrstrndx(elf, &shstrndx))
 		return -1;
 	if (audit) {
+		if (ehdr.e_machine == EM_X86_64 || ehdr.e_machine == EM_386)
+			for (i = 0; i < g->nr_nodes; i++)
+				g->nodes[i].terminal |= x86_syscall_entry(&g->nodes[i]);
 		for (i = 0; i < 4; i++) {
 			err = get_symbol_range(elf, tables[i], NULL, &roots[i]);
 			if (err)
@@ -1684,6 +1702,8 @@ static int resolve_error_graph(struct error_graph *g,
 	all_errors(full);
 	head = tail = 0;
 	for (i = 0; i < g->nr_nodes; i++) {
+		if (g->nodes[i].terminal)
+			memcpy(g->nodes[i].good, full, sizeof(full));
 		queue[tail++] = i;
 		g->nodes[i].queued = true;
 	}
@@ -1698,8 +1718,8 @@ static int resolve_error_graph(struct error_graph *g,
 		head = (head + 1) % g->nr_nodes;
 		count--;
 		n->queued = false;
-		if (!g->audited_text || !graph_node_known(n) ||
-		    (!n->terminal && n->incoming == NO_NODE))
+		if (n->terminal || !g->audited_text || !graph_node_known(n) ||
+		    n->incoming == NO_NODE)
 			continue;
 		memcpy(next, full, sizeof(next));
 		for (e = n->incoming; e != NO_NODE; e = g->calls[e].next_in) {
