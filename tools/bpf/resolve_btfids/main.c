@@ -69,6 +69,11 @@
  *   - rewrites the prototype of KF_IMPLICIT_ARGS kfuncs.
  *
  * These kfunc annotations were historically produced by pahole.
+ *
+ * Functions found in BTF_SET8_FMODRET sets are the targets of BPF fmod_ret
+ * programs. For each of them resolve_btfids emits a "bpf_fmodret" decl tag,
+ * and "bpf_fmodret_sleepable" when KF_SLEEPABLE is set. The kernel builds
+ * the set of fmod_ret targets from these tags when it loads BTF.
  */
 
 #define  _GNU_SOURCE
@@ -197,7 +202,10 @@ struct btf_links {
 
 #define DECL_TAG_FASTCALL "bpf_fastcall"
 #define DECL_TAG_KFUNC "bpf_kfunc"
+#define DECL_TAG_FMODRET "bpf_fmodret"
+#define DECL_TAG_FMODRET_SLEEPABLE "bpf_fmodret_sleepable"
 
+#define KF_SLEEPABLE	(1 << 5)
 #define KF_FASTCALL	(1 << 12)
 #define KF_ARENA_RET	(1 << 13)
 #define KF_ARENA_ARG1	(1 << 14)
@@ -208,6 +216,7 @@ struct btf_links {
 #define PARAM_SUFFIX_ARENA "__arena"
 #define PARAM_SUFFIX_ARENA_NULLABLE "__arena__nullable"
 
+/* A function found in a BTF ID set: a kfunc or an fmod_ret target */
 struct kfunc {
 	struct rb_node rb_node;
 	const char *name;
@@ -221,6 +230,7 @@ struct btf2btf_context {
 	u32 nr_decl_tags;
 	u32 max_decl_tags;
 	struct rb_root kfuncs;
+	struct rb_root fmodrets;
 };
 
 static int verbose;
@@ -1256,16 +1266,16 @@ static int push_decl_tag_id(struct btf2btf_context *ctx, u32 decl_tag_id)
 	return 0;
 }
 
-static int push_kfunc(struct btf2btf_context *ctx, struct kfunc *kfunc)
+static int push_set_func(struct rb_root *root, const char *kind, struct kfunc *kfunc)
 {
-	struct rb_node **p = &ctx->kfuncs.rb_node;
+	struct rb_node **p = &root->rb_node;
 	struct rb_node *parent = NULL;
 	struct kfunc *k;
 
 	/*
-	 * Dedup by BTF ID: collecting the same kfunc twice is a no-op,
-	 * UNLESS the kfunc flags are inconsistent, in which case we
-	 * fail hard because it indicates a bug in a kfunc set declaration.
+	 * Dedup by BTF ID: collecting the same function twice is a no-op,
+	 * UNLESS its flags are inconsistent, in which case we fail hard
+	 * because it indicates a bug in a BTF ID set declaration.
 	 */
 	while (*p) {
 		parent = *p;
@@ -1278,8 +1288,8 @@ static int push_kfunc(struct btf2btf_context *ctx, struct kfunc *kfunc)
 		} else if (k->flags == kfunc->flags) {
 			return 0;
 		} else {
-			pr_err("ERROR: resolve_btfids: kfunc %s has inconsistent flags across BTF ID sets: 0x%x != 0x%x\n",
-			       kfunc->name, k->flags, kfunc->flags);
+			pr_err("ERROR: resolve_btfids: %s %s has inconsistent flags across BTF ID sets: 0x%x != 0x%x\n",
+			       kind, kfunc->name, k->flags, kfunc->flags);
 			return -EINVAL;
 		}
 	}
@@ -1290,7 +1300,7 @@ static int push_kfunc(struct btf2btf_context *ctx, struct kfunc *kfunc)
 
 	*k = *kfunc;
 	rb_link_node(&k->rb_node, parent, p);
-	rb_insert_color(&k->rb_node, &ctx->kfuncs);
+	rb_insert_color(&k->rb_node, root);
 
 	return 0;
 }
@@ -1344,7 +1354,12 @@ static bool is_arena_param(const struct btf *btf, const struct btf_param *param)
 	       param_name_has_suffix(name, PARAM_SUFFIX_ARENA_NULLABLE);
 }
 
-static int collect_kfuncs(struct object *obj, struct btf2btf_context *ctx)
+typedef int (*set_func_fn)(struct btf2btf_context *ctx, const char *name,
+			   u32 btf_id, u32 flags);
+
+/* Call FN for each function in the BTF ID sets which have SET_FLAG set */
+static int collect_set_funcs(struct object *obj, struct btf2btf_context *ctx,
+			     u32 set_flag, const char *kind, set_func_fn fn)
 {
 	Elf_Data *idlist = obj->efile.idlist;
 	struct btf *btf = ctx->btf;
@@ -1364,13 +1379,12 @@ static int collect_kfuncs(struct object *obj, struct btf2btf_context *ctx)
 
 		set_addr = set_id->addr[0];
 		set8 = idlist->d_buf + (set_addr - obj->efile.idlist_addr);
-		if (!(set8->flags & BTF_SET8_KFUNCS))
+		if (!(set8->flags & set_flag))
 			continue;
 
 		for (u32 i = 0; i < set_id->cnt; i++) {
 			size_t off = (char *)&set8->pairs[i] - (char *)set8;
 			const char *name = find_name_by_addr(obj, set_addr + off);
-			struct kfunc kfunc;
 			s32 func_id;
 			int err;
 
@@ -1383,24 +1397,54 @@ static int collect_kfuncs(struct object *obj, struct btf2btf_context *ctx)
 
 			func_id = btf__find_by_name_kind_own(btf, name, BTF_KIND_FUNC);
 			if (func_id < 0) {
-				pr_err("WARN: resolve_btfids: no BTF func for kfunc %s in %s\n",
-				       name, set_id->name);
+				pr_err("WARN: resolve_btfids: no BTF func for %s %s in %s\n",
+				       kind, name, set_id->name);
 				warnings++;
 				continue;
 			}
 
-			pr_debug("found kfunc %s in %s\n", name, set_id->name);
+			pr_debug("found %s %s in %s\n", kind, name, set_id->name);
 
-			kfunc.name = name;
-			kfunc.btf_id = func_id;
-			kfunc.flags = set8->pairs[i].flags;
-			err = push_kfunc(ctx, &kfunc);
+			err = fn(ctx, name, func_id, set8->pairs[i].flags);
 			if (err)
 				return err;
 		}
 	}
 
 	return 0;
+}
+
+static int push_kfunc(struct btf2btf_context *ctx, const char *name,
+		      u32 btf_id, u32 flags)
+{
+	struct kfunc kfunc = { .name = name, .btf_id = btf_id, .flags = flags };
+
+	return push_set_func(&ctx->kfuncs, "kfunc", &kfunc);
+}
+
+static int push_fmodret(struct btf2btf_context *ctx, const char *name,
+			u32 btf_id, u32 flags)
+{
+	struct kfunc fmodret = { .name = name, .btf_id = btf_id, .flags = flags };
+
+	if (flags & ~KF_SLEEPABLE) {
+		pr_err("ERROR: resolve_btfids: fmod_ret target %s has unsupported flags 0x%x\n",
+		       name, flags & ~KF_SLEEPABLE);
+		return -EINVAL;
+	}
+
+	return push_set_func(&ctx->fmodrets, "fmod_ret target", &fmodret);
+}
+
+static int collect_kfuncs(struct object *obj, struct btf2btf_context *ctx)
+{
+	return collect_set_funcs(obj, ctx, BTF_SET8_KFUNCS, "kfunc", push_kfunc);
+}
+
+static int collect_fmodrets(struct object *obj, struct btf2btf_context *ctx)
+{
+	return collect_set_funcs(obj, ctx, BTF_SET8_FMODRET, "fmod_ret target",
+				 push_fmodret);
 }
 
 static int build_btf2btf_context(struct object *obj, struct btf2btf_context *ctx)
@@ -1418,6 +1462,12 @@ static int build_btf2btf_context(struct object *obj, struct btf2btf_context *ctx
 	err = collect_kfuncs(obj, ctx);
 	if (err) {
 		pr_err("ERROR: resolve_btfids: failed to collect kfuncs from BTF\n");
+		return err;
+	}
+
+	err = collect_fmodrets(obj, ctx);
+	if (err) {
+		pr_err("ERROR: resolve_btfids: failed to collect fmod_ret targets from BTF\n");
 		return err;
 	}
 
@@ -1761,10 +1811,26 @@ static int btf2btf(struct object *obj)
 			goto out;
 	}
 
+	for (next = rb_first(&ctx.fmodrets); next; next = rb_next(next)) {
+		struct kfunc *fmodret = rb_entry(next, struct kfunc, rb_node);
+
+		err = add_decl_tag(&ctx, DECL_TAG_FMODRET, fmodret->btf_id, -1);
+		if (err)
+			goto out;
+
+		if (fmodret->flags & KF_SLEEPABLE) {
+			err = add_decl_tag(&ctx, DECL_TAG_FMODRET_SLEEPABLE,
+					   fmodret->btf_id, -1);
+			if (err)
+				goto out;
+		}
+	}
+
 	err = 0;
 out:
 	free(ctx.decl_tags);
 	free_kfuncs(&ctx.kfuncs);
+	free_kfuncs(&ctx.fmodrets);
 
 	return err;
 }
