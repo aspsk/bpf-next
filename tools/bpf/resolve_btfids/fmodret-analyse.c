@@ -1062,6 +1062,74 @@ static bool arm64_code_metadata_reference(Elf *elf, const char *name,
 			      4, ELFDATA2LSB) == 0xd4210000;
 }
 
+static bool x86_code_metadata_reference(Elf *elf, const char *name, Elf_Scn *scn,
+					const GElf_Shdr *shdr, size_t offset,
+					const GElf_Sym *sym, GElf_Sxword addend,
+					const struct elf_function_list *functions,
+					size_t node)
+{
+	static const char * const sites[] = {
+		".orc_unwind_ip", ".return_sites", ".call_sites", ".retpoline_sites",
+		".ibt_endbr_seal", ".cfi_sites", ".smp_locks",
+	};
+	Elf_Scn *code_scn = elf_getscn(elf, sym->st_shndx);
+	GElf_Addr address = sym->st_value + addend;
+	GElf_Shdr code;
+	Elf_Data *data;
+	size_t shstrndx;
+	size_t field;
+
+	if (!code_scn || !gelf_getshdr(code_scn, &code) || !(code.sh_flags & SHF_EXECINSTR))
+		return false;
+	for (size_t i = 0; i < ARRAY_SIZE(sites); i++)
+		if (!strcmp(name, sites[i]))
+			return !(shdr->sh_size % 4) && !(offset % 4);
+	if (!strncmp(name, "runtime_ptr_", 12) ||
+	    !strncmp(name, "runtime_shift_", 14) ||
+	    !strncmp(name, "runtime_mask_", 13))
+		return !(shdr->sh_size % 4) && !(offset % 4);
+	if (!strcmp(name, ".static_call_sites"))
+		return !(shdr->sh_size % 8) && !(offset % 8);
+	if (!strcmp(name, ".altinstructions")) {
+		if (shdr->sh_size % 14)
+			return false;
+		field = offset % 14;
+		if (!field)
+			return true;
+		if (field != 4 || elf_getshdrstrndx(elf, &shstrndx))
+			return false;
+		name = elf_strptr(elf, shstrndx, code.sh_name);
+		return name && !strcmp(name, ".altinstr_replacement");
+	}
+	if (!strcmp(name, "__ex_table")) {
+		GElf_Ehdr ehdr;
+
+		if (shdr->sh_size % 12)
+			return false;
+		field = offset % 12;
+		if (!field)
+			return true;
+		if (field != 4 || !gelf_getehdr(elf, &ehdr) || ehdr.e_type == ET_REL)
+			return false;
+		data = elf_getdata(scn, NULL);
+		if (!data || data->d_off || data->d_size != shdr->sh_size)
+			return false;
+		address = shdr->sh_addr + offset - 4 +
+			  (int32_t)read_elf_value((unsigned char *)data->d_buf + offset - 4,
+						 4, ELFDATA2LSB);
+		return graph_function(functions, sym->st_shndx, address, true) == node;
+	}
+	if (strcmp(name, "__bug_table") || address < code.sh_addr ||
+	    address - code.sh_addr > code.sh_size ||
+	    code.sh_size - (address - code.sh_addr) < 2)
+		return false;
+	data = elf_getdata(code_scn, NULL);
+	if (!data || data->d_off || data->d_size != code.sh_size)
+		return false;
+	return read_elf_value((unsigned char *)data->d_buf + address - code.sh_addr,
+			      2, ELFDATA2LSB) == 0x0b0f;
+}
+
 static bool described_call(const struct error_graph *g, size_t caller,
 			   size_t callee)
 {
@@ -1273,6 +1341,11 @@ static int graph_relocations(Elf *elf, const struct elf_function_list *functions
 			    arm64_code_metadata_reference(elf, name, target_scn, &target,
 							  offset, &sym, rela.r_addend, encoding,
 							  functions, node))
+				continue;
+			if (ehdr.e_machine == EM_X86_64 && type == R_X86_64_PC32 &&
+			    x86_code_metadata_reference(elf, name, target_scn,
+							&target, offset, &sym, rela.r_addend,
+							functions, node))
 				continue;
 			if (!described_call(g, caller, node))
 				record_unmodelled_reference(g, node,
