@@ -157,6 +157,7 @@ def check_linked_case(case, number, command, fixtures, tmp, ld, pahole,
         objects.append(extra)
     script = tmp / "linked.lds"
     text = ("SECTIONS {\n"
+            " /DISCARD/ : { *(.export_symbol) *(.discard.*) }\n"
             " .BTF_fmodret_candidates 0 (INFO) : { KEEP(*(.BTF_fmodret_candidates)) }\n")
     if final:
         text += " .text 0x100000 : { *(.text .text.*) }\n"
@@ -237,6 +238,7 @@ def main():
                 seeds[name] = flags
         script = tmp / "module.lds"
         script.write_text("SECTIONS {\n"
+                          " /DISCARD/ : { *(.export_symbol) *(.discard.*) }\n"
                           " .BTF_fmodret_candidates 0 (INFO) : { KEEP(*(.BTF_fmodret_candidates)) }\n"
                           " __patchable_function_entries 0 : { *(__patchable_function_entries) }\n"
                           "}\n")

@@ -38,3 +38,10 @@ FMODRET_TEST int fmodret_derived_safe_forwarded_callback(int value)
 {
 	return derived_forward(derived_seed, value);
 }
+
+/* An export alone does not make a function unsafe. */
+FMODRET_TEST int fmodret_derived_safe_exported(int value)
+{
+	return derived_seed(value);
+}
+EXPORT_SYMBOL(fmodret_derived_safe_exported);

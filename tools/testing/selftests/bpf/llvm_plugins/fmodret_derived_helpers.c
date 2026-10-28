@@ -75,6 +75,7 @@ void *derived_operations[] __used = {
 	X(fmodret_derived_safe_allocation)		\
 	X(fmodret_derived_safe_callback)		\
 	X(fmodret_derived_safe_forwarded_callback)	\
+	X(fmodret_derived_safe_exported)		\
 	X(fmodret_derived_unsafe_dirty_prefix)		\
 	X(fmodret_derived_unsafe_opaque_prefix)		\
 	X(fmodret_derived_unsafe_swallowed_result)	\

@@ -5,6 +5,7 @@
 #include <linux/compiler.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/export.h>
 #include <linux/types.h>
 
 #define FMODRET_TEST __used noinline
@@ -37,6 +38,7 @@ int fmodret_derived_safe_multihop(int value);
 int fmodret_derived_safe_allocation(int value);
 int fmodret_derived_safe_callback(int value);
 int fmodret_derived_safe_forwarded_callback(int value);
+int fmodret_derived_safe_exported(int value);
 
 int fmodret_derived_unsafe_dirty_prefix(int value);
 int fmodret_derived_unsafe_opaque_prefix(int value);

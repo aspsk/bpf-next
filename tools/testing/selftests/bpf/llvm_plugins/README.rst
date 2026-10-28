@@ -51,13 +51,16 @@ The fixtures are split into three readable groups:
 
 * ``fmodret_derived_clean.c``: five constructed clean functions without a proved
   syscall boundary. They must not be tagged as fmod_ret targets.
-* ``fmodret_derived_safe.c``: seven constructed clean functions with a proof for
+* ``fmodret_derived_safe.c``: eight constructed clean functions with a proof for
   every negative errno in [-4095, -1]. They must get the ``bpf_fmodret`` and
   ``bpf_fmodret_auto`` BTF decl tags.
 * ``fmodret_derived_unsafe.c``: twelve rejection cases covering dirty prefixes,
   discarded errors, unknown allocators, escaping callbacks and addresses,
   unseeded recursion, and clean bodies whose callers swallow their errors.
   This group includes proof limitations, not only demonstrably unsafe bodies.
+
+``fmodret_derived_safe_exported`` is exported and must still be tagged: an export
+is not a use of the address which the proof has to rule out.
 
 ``fmodret_derived_helpers.c`` supplies shared seeds, dispatchers and synthetic
 syscall table entries. None of these tests is loaded or executed.
