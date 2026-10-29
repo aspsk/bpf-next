@@ -547,7 +547,42 @@ int bpf_obj_pin_user(u32 ufd, int path_fd, const char __user *pathname)
 	return ret;
 }
 
-static void *bpf_obj_do_get(int path_fd, const char __user *pathname,
+static int bpf_obj_lookup(int path_fd, bpfptr_t pathname, struct path *path)
+{
+	char *name;
+	long len;
+	int ret;
+
+	if (!bpfptr_is_kernel(pathname))
+		return user_path_at(path_fd, pathname.user, LOOKUP_FOLLOW, path);
+
+	/* Kernel callers, i.e., loader programs, only pass paths without path_fd */
+	if (path_fd != AT_FDCWD)
+		return -EINVAL;
+
+	name = __getname();
+	if (!name)
+		return -ENOMEM;
+
+	len = strncpy_from_kernel_nofault(name, pathname.kernel, PATH_MAX);
+	/*
+	 * If len == PATH_MAX, we can't tell a path of PATH_MAX - 1 characters
+	 * from a truncated one. Treat both the same to keep the code simple
+	 */
+	if (len == PATH_MAX)
+		ret = -ENAMETOOLONG;
+	else if (len < 0)
+		ret = len;
+	else if (!name[0])
+		ret = -ENOENT;	/* as getname() for a user path */
+	else
+		ret = kern_path(name, LOOKUP_FOLLOW, path);
+
+	__putname(name);
+	return ret;
+}
+
+static void *bpf_obj_do_get(int path_fd, bpfptr_t pathname,
 			    enum bpf_type *type, int flags)
 {
 	struct inode *inode;
@@ -555,7 +590,7 @@ static void *bpf_obj_do_get(int path_fd, const char __user *pathname,
 	void *raw;
 	int ret;
 
-	ret = user_path_at(path_fd, pathname, LOOKUP_FOLLOW, &path);
+	ret = bpf_obj_lookup(path_fd, pathname, &path);
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -579,7 +614,7 @@ out:
 	return ERR_PTR(ret);
 }
 
-int bpf_obj_get_user(int path_fd, const char __user *pathname, int flags)
+int bpf_obj_get_user(int path_fd, bpfptr_t pathname, int flags)
 {
 	enum bpf_type type = BPF_TYPE_UNSPEC;
 	int f_flags;

@@ -3244,7 +3244,7 @@ static int bpf_obj_pin(const union bpf_attr *attr)
 				u64_to_user_ptr(attr->pathname));
 }
 
-static int bpf_obj_get(const union bpf_attr *attr)
+static int bpf_obj_get(const union bpf_attr *attr, bool is_kernel)
 {
 	int path_fd;
 
@@ -3257,7 +3257,7 @@ static int bpf_obj_get(const union bpf_attr *attr)
 		return -EINVAL;
 
 	path_fd = attr->file_flags & BPF_F_PATH_FD ? attr->path_fd : AT_FDCWD;
-	return bpf_obj_get_user(path_fd, u64_to_user_ptr(attr->pathname),
+	return bpf_obj_get_user(path_fd, make_bpfptr(attr->pathname, is_kernel),
 				attr->file_flags);
 }
 
@@ -6467,7 +6467,7 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size,
 		err = bpf_obj_pin(&attr);
 		break;
 	case BPF_OBJ_GET:
-		err = bpf_obj_get(&attr);
+		err = bpf_obj_get(&attr, uattr.is_kernel);
 		break;
 	case BPF_PROG_ATTACH:
 		err = bpf_prog_attach(&attr);

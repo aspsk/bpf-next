@@ -3107,7 +3107,7 @@ bool bpf_token_allow_prog_type(const struct bpf_token *token,
 			       enum bpf_attach_type attach_type);
 
 int bpf_obj_pin_user(u32 ufd, int path_fd, const char __user *pathname);
-int bpf_obj_get_user(int path_fd, const char __user *pathname, int flags);
+int bpf_obj_get_user(int path_fd, bpfptr_t pathname, int flags);
 struct inode *bpf_get_inode(struct super_block *sb, const struct inode *dir,
 			    umode_t mode);
 
