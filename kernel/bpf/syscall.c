@@ -6609,6 +6609,7 @@ BPF_CALL_3(bpf_sys_bpf, int, cmd, union bpf_attr *, attr, u32, attr_size)
 	case BPF_BTF_LOAD:
 	case BPF_LINK_CREATE:
 	case BPF_RAW_TRACEPOINT_OPEN:
+	case BPF_OBJ_GET:
 		break;
 	default:
 		return -EINVAL;
