@@ -1085,6 +1085,26 @@ LIBBPF_API int
 bpf_program__set_attach_target(struct bpf_program *prog, int attach_prog_fd,
 			       const char *attach_func_name);
 
+/**
+ * @brief **bpf_program__set_attach_target_path()** sets a BPF program,
+ * pinned at *attach_prog_path*, as the attach target of a freplace or
+ * fentry/fexit program.
+ * @param prog BPF program to configure; must be not yet loaded.
+ * @param attach_prog_path path of the pinned target program; it is opened
+ * when the program is loaded, or, if the object is used to generate a
+ * loader, when the generated loader runs.
+ * @param attach_prog_btf BTF of the target program, used to find the BTF
+ * type ID of *attach_func_name* right away. The ID is only valid for the
+ * target program with this exact BTF.
+ * @param attach_func_name target function name.
+ * @return error code; or 0 if no error occurred.
+ */
+LIBBPF_API int
+bpf_program__set_attach_target_path(struct bpf_program *prog,
+				    const char *attach_prog_path,
+				    const struct btf *attach_prog_btf,
+				    const char *attach_func_name);
+
 struct bpf_prog_assoc_struct_ops_opts; /* defined in bpf.h */
 
 /**

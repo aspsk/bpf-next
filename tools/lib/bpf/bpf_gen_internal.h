@@ -47,6 +47,8 @@ struct bpf_gen {
 	int core_relo_cnt;
 	char attach_target[128];
 	int attach_kind;
+	/* pin path of the target of the next program, owned by the program */
+	const char *attach_prog_path;
 	struct ksym_desc *ksyms;
 	__u32 nr_ksyms;
 	int fd_array;
@@ -80,6 +82,7 @@ int bpf_gen__func_ptr_map_create(struct bpf_gen *gen, const char *map_name, int 
 				 void *value, __u32 value_size, const __u32 *ptr_offs,
 				 const __u64 *ptr_vals, int ptr_cnt);
 void bpf_gen__record_attach_target(struct bpf_gen *gen, const char *name, enum bpf_attach_type type);
+void bpf_gen__record_attach_prog_path(struct bpf_gen *gen, const char *path);
 void bpf_gen__record_extern(struct bpf_gen *gen, const char *name, bool is_weak,
 			    bool is_typeless, bool is_ld64, int kind, int insn_idx);
 void bpf_gen__record_relo_core(struct bpf_gen *gen, const struct bpf_core_relo *core_relo);

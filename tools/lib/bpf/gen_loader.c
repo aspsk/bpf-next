@@ -600,6 +600,35 @@ void bpf_gen__record_attach_target(struct bpf_gen *gen, const char *attach_name,
 		gen->error = -ENOSPC;
 }
 
+void bpf_gen__record_attach_prog_path(struct bpf_gen *gen, const char *path)
+{
+	gen->attach_prog_path = path;
+}
+
+/* Open the pinned target and put its fd into the attach_prog_fd of prog_load_attr */
+static void emit_open_attach_prog(struct bpf_gen *gen, int prog_load_attr)
+{
+	int attr_size = offsetofend(union bpf_attr, path_fd);
+	int path, obj_get_attr;
+	union bpf_attr attr;
+
+	memset(&attr, 0, attr_size);
+	path = add_data(gen, gen->attach_prog_path, strlen(gen->attach_prog_path) + 1);
+	obj_get_attr = add_data(gen, &attr, attr_size);
+	pr_debug("gen: obj_get: %s\n", gen->attach_prog_path);
+
+	/* populate union bpf_attr with a pointer to the path */
+	emit_rel_store(gen, attr_field(obj_get_attr, pathname), path);
+	emit_sys_bpf(gen, BPF_OBJ_GET, obj_get_attr, attr_size);
+	debug_ret(gen, "obj_get %s", gen->attach_prog_path);
+	emit_check_err(gen);
+
+	emit2(gen, BPF_LD_IMM64_RAW_FULL(BPF_REG_0, BPF_PSEUDO_MAP_IDX_VALUE,
+					 0, 0, 0, prog_load_attr));
+	emit(gen, BPF_STX_MEM(BPF_W, BPF_REG_0, BPF_REG_7,
+			      offsetof(union bpf_attr, attach_prog_fd)));
+}
+
 static void emit_find_attach_target(struct bpf_gen *gen)
 {
 	int name, len = strlen(gen->attach_target) + 1;
@@ -1123,6 +1152,9 @@ void bpf_gen__prog_load(struct bpf_gen *gen,
 				      offsetof(union bpf_attr, attach_btf_obj_fd)));
 	}
 	emit_relos(gen, insns_off);
+	/* open the target last, so that nothing jumps to cleanup while it's open */
+	if (gen->attach_prog_path)
+		emit_open_attach_prog(gen, prog_load_attr);
 	/* emit PROG_LOAD command */
 	emit_sys_bpf(gen, BPF_PROG_LOAD, prog_load_attr, attr_size);
 	debug_ret(gen, "prog_load %s insn_cnt %d", attr.prog_name, attr.insn_cnt);
@@ -1132,6 +1164,11 @@ void bpf_gen__prog_load(struct bpf_gen *gen,
 		emit_sys_close_blob(gen,
 				    attr_field(prog_load_attr, attach_btf_obj_fd));
 		gen->attach_kind = 0;
+	}
+	/* successful or not, close the target, the program holds its own reference */
+	if (gen->attach_prog_path) {
+		emit_sys_close_blob(gen, attr_field(prog_load_attr, attach_prog_fd));
+		gen->attach_prog_path = NULL;
 	}
 	emit_check_err(gen);
 	/* remember prog_fd in the stack, if successful */

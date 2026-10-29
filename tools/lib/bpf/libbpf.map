@@ -475,4 +475,6 @@ LIBBPF_1.8.0 {
 } LIBBPF_1.7.0;
 
 LIBBPF_1.9.0 {
+	global:
+		bpf_program__set_attach_target_path;
 } LIBBPF_1.8.0;

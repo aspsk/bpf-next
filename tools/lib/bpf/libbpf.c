@@ -508,6 +508,8 @@ struct bpf_program {
 	__u32 attach_btf_obj_fd;
 	__u32 attach_btf_id;
 	__u32 attach_prog_fd;
+	/* opened as attach_prog_fd only for the duration of the load */
+	char *attach_prog_path;
 
 	void *func_info;
 	__u32 func_info_rec_size;
@@ -892,6 +894,7 @@ static void bpf_program__exit(struct bpf_program *prog)
 	zfree(&prog->sec_name);
 	zfree(&prog->insns);
 	zfree(&prog->reloc_desc);
+	zfree(&prog->attach_prog_path);
 
 	prog->nr_reloc = 0;
 	prog->insns_cnt = 0;
@@ -3779,7 +3782,7 @@ static bool prog_needs_vmlinux_btf(struct bpf_program *prog)
 	/* BPF_PROG_TYPE_TRACING programs which do not attach to other programs
 	 * also need vmlinux BTF
 	 */
-	if (prog->type == BPF_PROG_TYPE_TRACING && !prog->attach_prog_fd)
+	if (prog->type == BPF_PROG_TYPE_TRACING && !prog->attach_prog_fd && !prog->attach_prog_path)
 		return true;
 
 	return false;
@@ -9309,8 +9312,27 @@ bpf_object__load_progs(struct bpf_object *obj, int log_level)
 		if (obj->gen_loader)
 			bpf_program_record_relos(prog);
 
+		if (prog->attach_prog_path && obj->gen_loader) {
+			/* the generated loader opens the path when it runs */
+			bpf_gen__record_attach_prog_path(obj->gen_loader, prog->attach_prog_path);
+		} else if (prog->attach_prog_path) {
+			err = bpf_obj_get(prog->attach_prog_path);
+			if (err < 0) {
+				pr_warn("prog '%s': failed to open attach program '%s': %s\n",
+					prog->name, prog->attach_prog_path, errstr(err));
+				return err;
+			}
+			prog->attach_prog_fd = err;
+		}
+
 		err = bpf_object_load_prog(obj, prog, prog->insns, prog->insns_cnt,
 					   obj->license, obj->kern_version, &prog->fd);
+
+		if (prog->attach_prog_path && !obj->gen_loader) {
+			close(prog->attach_prog_fd);
+			prog->attach_prog_fd = 0;
+		}
+
 		if (err) {
 			pr_warn("prog '%s': failed to load: %s\n", prog->name, errstr(err));
 			return err;
@@ -10981,6 +11003,7 @@ int bpf_program__clone(struct bpf_program *prog, const struct bpf_prog_load_opts
 	const void *info;
 	__u32 info_cnt, info_rec_size;
 	int err, fd, prog_btf_fd;
+	int tgt_fd = -1;
 
 	if (!prog)
 		return libbpf_err(-EINVAL);
@@ -11081,8 +11104,20 @@ int bpf_program__clone(struct bpf_program *prog, const struct bpf_prog_load_opts
 	 * for RODATA maps here to avoid mutating the object's state. Callers can bind the
 	 * required maps themselves using bpf_prog_bind_map().
 	 */
+	if (!attr.attach_prog_fd && prog->attach_prog_path) {
+		tgt_fd = bpf_obj_get(prog->attach_prog_path);
+		if (tgt_fd < 0) {
+			pr_warn("prog '%s': failed to open attach program '%s': %s\n",
+				prog->name, prog->attach_prog_path, errstr(tgt_fd));
+			return libbpf_err(tgt_fd);
+		}
+		attr.attach_prog_fd = tgt_fd;
+	}
+
 	fd = bpf_prog_load(prog->type, prog->name, obj->license, prog->insns, prog->insns_cnt,
 			   &attr);
+	if (tgt_fd >= 0)
+		close(tgt_fd);
 
 	return libbpf_err(fd);
 }
@@ -15829,6 +15864,11 @@ int bpf_program__set_attach_target(struct bpf_program *prog,
 		 * the normal object/program load phase.
 		 */
 		prog->attach_prog_fd = attach_prog_fd;
+		/* The BTF ID was found for the target at the path */
+		if (prog->attach_prog_path) {
+			zfree(&prog->attach_prog_path);
+			prog->attach_btf_id = 0;
+		}
 		return 0;
 	}
 
@@ -15855,6 +15895,37 @@ int bpf_program__set_attach_target(struct bpf_program *prog,
 	prog->attach_btf_id = btf_id;
 	prog->attach_btf_obj_fd = btf_obj_fd;
 	prog->attach_prog_fd = attach_prog_fd;
+	zfree(&prog->attach_prog_path);
+	return 0;
+}
+
+int bpf_program__set_attach_target_path(struct bpf_program *prog,
+					const char *attach_prog_path,
+					const struct btf *attach_prog_btf,
+					const char *attach_func_name)
+{
+	char *path;
+	int btf_id;
+
+	if (!prog || !attach_prog_path || !attach_prog_btf || !attach_func_name)
+		return libbpf_err(-EINVAL);
+
+	if (prog->obj->state >= OBJ_LOADED)
+		return libbpf_err(-EINVAL);
+
+	btf_id = btf__find_by_name_kind(attach_prog_btf, attach_func_name, BTF_KIND_FUNC);
+	if (btf_id < 0)
+		return libbpf_err(btf_id);
+
+	path = strdup(attach_prog_path);
+	if (!path)
+		return libbpf_err(-ENOMEM);
+
+	free(prog->attach_prog_path);
+	prog->attach_prog_path = path;
+	prog->attach_btf_id = btf_id;
+	prog->attach_btf_obj_fd = 0;
+	prog->attach_prog_fd = 0;
 	return 0;
 }
 
