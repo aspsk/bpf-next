@@ -3545,11 +3545,6 @@ static inline void bpf_link_put(struct bpf_link *link)
 {
 }
 
-static inline int bpf_obj_get_user(const char __user *pathname, int flags)
-{
-	return -EOPNOTSUPP;
-}
-
 static inline bool bpf_token_capable(const struct bpf_token *token, int cap)
 {
 	return capable(cap) || (cap != CAP_SYS_ADMIN && capable(CAP_SYS_ADMIN));
