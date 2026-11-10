@@ -13,6 +13,13 @@ struct btf_id_set {
 /* This flag implies BTF_SET8 holds kfunc(s) */
 #define BTF_SET8_KFUNCS		(1 << 0)
 
+/*
+ * This flag implies BTF_SET8 holds fmod_ret targets. The KF_SLEEPABLE flag
+ * can be set per-function, specifying it will also mark the corresponding
+ * fentry/fexit sleepable.
+ */
+#define BTF_SET8_FMODRET	(1 << 1)
+
 struct btf_id_set8 {
 	u32 cnt;
 	u32 flags;
@@ -215,6 +222,12 @@ __BTF_SET8_START(name, local, BTF_SET8_KFUNCS)
 #define BTF_KFUNCS_END(name)				\
 BTF_SET8_END(name)
 
+#define BTF_FMODRET_START(name)				\
+__BTF_SET8_START(name, local, BTF_SET8_FMODRET)
+
+#define BTF_FMODRET_END(name)				\
+BTF_SET8_END(name)
+
 #else
 
 #define BTF_ID_LIST(name) static u32 __maybe_unused name[128];
@@ -231,6 +244,8 @@ BTF_SET8_END(name)
 #define BTF_SET8_END(name)
 #define BTF_KFUNCS_START(name) static struct btf_id_set8 __maybe_unused name = { .flags = BTF_SET8_KFUNCS };
 #define BTF_KFUNCS_END(name)
+#define BTF_FMODRET_START(name) static struct btf_id_set8 __maybe_unused name = { .flags = BTF_SET8_FMODRET };
+#define BTF_FMODRET_END(name)
 
 #endif /* CONFIG_DEBUG_INFO_BTF */
 
