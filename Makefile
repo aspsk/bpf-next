@@ -1257,7 +1257,8 @@ ifdef CONFIG_LD_ORPHAN_WARN
 LDFLAGS_vmlinux += --orphan-handling=$(CONFIG_LD_ORPHAN_WARN_LEVEL)
 endif
 
-# --emit-relocs is added by scripts/link-vmlinux.sh, for the final link only.
+# --emit-relocs is added by scripts/link-vmlinux.sh for the final link, and
+# for .tmp_vmlinux1 when CONFIG_CLANG_PLUGIN_BPF_SCAN_IR is enabled.
 ifneq ($(CONFIG_ARCH_VMLINUX_NEEDS_RELOCS),)
 LDFLAGS_vmlinux	+= --discard-none
 endif

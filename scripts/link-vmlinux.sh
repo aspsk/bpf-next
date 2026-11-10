@@ -89,6 +89,15 @@ vmlinux_link()
 		ldlibs=
 	fi
 
+	# resolve_btfids reads the records of bpf_scan_ir through their
+	# relocations in .tmp_vmlinux1. The later links discard the records.
+	if is_enabled CONFIG_CLANG_PLUGIN_BPF_SCAN_IR; then
+		if [ "${output}" = ".tmp_vmlinux1" ]; then
+			ldflags="${ldflags} ${wl}--emit-relocs"
+		else
+			ldflags="${ldflags} ${wl}--script=${srctree}/scripts/bpf/fmodret.lds"
+		fi
+	fi
 	ldflags="${ldflags} ${wl}--script=${objtree}/${KBUILD_LDS}"
 
 	# The kallsyms linking does not need debug symbols included.
@@ -96,7 +105,7 @@ vmlinux_link()
 		ldflags="${ldflags} ${wl}--strip-debug"
 	fi
 
-	# Only the final link actually requires the relocations.
+	# The final link requires the relocations.
 	if [ "${output}" = "${VMLINUX}" ] && is_enabled CONFIG_ARCH_VMLINUX_NEEDS_RELOCS; then
 		ldflags="${ldflags} ${wl}--emit-relocs"
 	fi
